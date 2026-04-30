@@ -355,13 +355,25 @@ def source_duration(item: dict[str, Any]) -> float:
 
 def uses_dialogue(item: dict[str, Any]) -> bool:
     audio_source = str(item.get("audio_source", "")).lower()
-    if audio_source.startswith("no dialogue"):
-        return False
-    if "no source dialogue" in audio_source:
-        return False
-    if "room tone only" in audio_source:
-        return False
-    if "music hit" in audio_source and "only" in audio_source:
+    no_dialogue_markers = (
+        "no dialogue",
+        "no source dialogue",
+        "no source audio",
+        "no new dialogue",
+        "no spoken audio",
+        "room tone only",
+        "roomtone only",
+        "music hit only",
+        "music bed only",
+        "generated music bed only",
+        "music sting",
+        "music/roomtone tail",
+        "silent generated",
+        "silent black title",
+        "silent title card",
+        "generated black title card",
+    )
+    if any(marker in audio_source for marker in no_dialogue_markers):
         return False
     return True
 
@@ -377,10 +389,22 @@ def is_title_card_segment(item: dict[str, Any]) -> bool:
             "title card",
             "title/tagline",
             "black title",
+            "generated black",
+            "cta card",
+            "outro card",
             "text-only",
             "silent title",
+            "watch the full",
         )
     )
+
+
+def should_render_title_card(item: dict[str, Any], force_first_card: bool = False) -> bool:
+    if force_first_card and not uses_dialogue(item):
+        return True
+    if not is_title_card_segment(item):
+        return False
+    return source_duration(item) <= 0.05 or not uses_dialogue(item)
 
 
 def retime_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -545,6 +569,12 @@ def needs_visual_cover(item: dict[str, Any]) -> bool:
 def build_visual_spans(item: dict[str, Any], duration: float) -> list[dict[str, Any]]:
     source_start = float(item["source_start"])
     source_end = float(item["source_end"])
+    if source_end <= source_start:
+        raise RuntimeError(
+            "Non-title-card segment has non-positive source duration. "
+            "Generated cards must use visual_source='Generated black title card.' "
+            "and audio_source='No source dialogue; silent generated title card.'"
+        )
     visual_source = str(item.get("visual_source", ""))
     cover = needs_visual_cover(item)
     ranges = extract_time_ranges(visual_source)
@@ -919,6 +949,7 @@ def render_audio_track(
     index: int,
     duration: float,
     fade_out: bool,
+    force_silent: bool = False,
 ) -> Path:
     audio_path = clip_dir / f"segment-{index:03d}.audio.m4a"
     args = [
@@ -928,7 +959,7 @@ def render_audio_track(
         "-loglevel",
         "error",
     ]
-    if uses_dialogue(item):
+    if uses_dialogue(item) and not force_silent:
         args.extend(
             [
                 "-ss",
@@ -1094,10 +1125,12 @@ def render_segment(
         index=index,
         duration=duration,
         fade_out=last_segment,
+        force_silent=black_title_card,
     )
     segment_path = clip_dir / f"segment-{index:03d}.mp4"
     mux_video_audio(video_track, audio_track, segment_path)
-    audio_start = None if not uses_dialogue(item) else float(item["source_start"])
+    uses_source_dialogue = uses_dialogue(item) and not black_title_card
+    audio_start = None if not uses_source_dialogue else float(item["source_start"])
     separated = any(
         audio_start is None
         or span["source_start"] is None
@@ -1110,7 +1143,7 @@ def render_segment(
         "audio_source_end": None if audio_start is None else audio_start + duration,
         "visual_spans": visual_spans,
         "separated_audio_video": separated,
-        "silent_audio": not uses_dialogue(item),
+        "silent_audio": not uses_source_dialogue,
         "multiple_visual_cuts": len(visual_spans) > 1,
         "black_title_card": black_title_card,
         "foreground_scale": foreground_scale,
@@ -1377,10 +1410,9 @@ def render_clip(
             width=width,
             height=height,
             burn_captions=burn_captions,
-            black_title_card=(
-                index == 1
-                and not uses_dialogue(item)
-                and (use_black_title_card or is_title_card_segment(item))
+            black_title_card=should_render_title_card(
+                item,
+                force_first_card=index == 1 and use_black_title_card,
             ),
             foreground_scale=foreground_scale,
             internal_visual_transition_duration=internal_visual_transition_duration,
@@ -1630,7 +1662,7 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
                 "Separates dialogue audio from visual B-roll when visual_source provides usable time cues.",
                 "Builds multi-cut B-roll segments from parsed visual ranges and anchors.",
                 "Can repair planned silent leads by borrowing immediate narration from the following beat.",
-                "Can replace selected first silent beats with baked-in black title cards.",
+                "Can render silent generated title, hook, and CTA beats as baked-in black title cards.",
                 "Can render short audio/video crossfades between planned segments.",
                 "Always applies a final video fade to black after assembling the full clip.",
                 "Can render short visual dissolves between internal multi-cut B-roll spans.",

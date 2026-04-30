@@ -931,6 +931,8 @@ def build_task_prompt() -> str:
             "Use the same standards reflected in the human feedback:",
             "- If there is no clear payoff, the clip is probably bad.",
             "- The payoff should be the hook and should usually be the first spoken beat after a title/tagline card.",
+            "- The first spoken beat must still be a clean sentence or complete thought. Flag it if the SRT/audio starts with a connective like 'but', 'and', or 'so' and the missing prior context is not supplied before it.",
+            "- Flag titles, overlays, and captions that overstate or change the source claim, especially when a title turns an interpretation into a literal factual claim.",
             "- A black title card is better than several seconds of silent source video before audio starts.",
             "- The opening should not cut into a sentence in a way that makes it confusing.",
             "- Do not show a talking head while unrelated narration or a different speaker is playing.",
