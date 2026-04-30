@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+.env
+.env.*
+!.env.example
+transcripts/
+openai-runs/
+renders/
+video-evidence/
+visual-index/
+*.draft.mp4
+*.draft.subtitled.mp4
+*.draft.srt

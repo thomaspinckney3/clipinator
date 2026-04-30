@@ -1,0 +1,28 @@
+[project]
+name = "video-clip-extractor"
+version = "0.1.0"
+description = "Pipeline experiments for extracting interesting clips from videos."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+transcribe-video = "extractor.transcribe:main"
+qa-transcript = "extractor.qa_transcript:main"
+plan-clip-ads = "extractor.plan_clip_ads:main"
+preprocess-video = "extractor.preprocess_video:main"
+openai-stage1 = "extractor.openai_stage1:main"
+openai-stage2 = "extractor.openai_stage2:main"
+openai-stage3 = "extractor.openai_stage3:main"
+openai-stage4-review = "extractor.openai_stage4_review:main"
+openai-stage5-reedit = "extractor.openai_stage5_reedit:main"
+render-stage3 = "extractor.render_stage3:main"
+video-api-probe = "extractor.video_api_probe:main"
+visual-index = "extractor.visual_index:main"
+extract-clips = "extractor.run_pipeline:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

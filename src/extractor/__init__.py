@@ -1,0 +1,2 @@
+"""Video clip extraction experiments."""
+
