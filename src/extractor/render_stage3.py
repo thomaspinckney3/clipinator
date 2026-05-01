@@ -24,6 +24,7 @@ DEFAULT_FOREGROUND_BRIGHTNESS = 0.0
 DEFAULT_FOREGROUND_CONTRAST = 1.0
 DEFAULT_FOREGROUND_SATURATION = 1.0
 FINAL_VIDEO_FADE_OUT_DURATION = 0.6
+MIN_TITLE_CARD_SECONDS = 4.0
 
 TITLE_CARD_FONT = {
     "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
@@ -405,6 +406,114 @@ def should_render_title_card(item: dict[str, Any], force_first_card: bool = Fals
     if not is_title_card_segment(item):
         return False
     return source_duration(item) <= 0.05 or not uses_dialogue(item)
+
+
+def normalize_first_title_card_duration(
+    clip: dict[str, Any],
+    min_seconds: float = MIN_TITLE_CARD_SECONDS,
+) -> tuple[dict[str, Any], bool, float]:
+    timeline = sorted(clip.get("timeline", []), key=lambda item: int(item.get("order", 0)))
+    if not timeline:
+        return clip, False, 0.0
+    first = timeline[0]
+    if not should_render_title_card(first):
+        return clip, False, 0.0
+
+    duration = timeline_duration(first)
+    if duration >= min_seconds:
+        return clip, False, 0.0
+
+    adjusted = deepcopy(clip)
+    adjusted_timeline: list[dict[str, Any]] = []
+    delta = min_seconds - duration
+    original_start = float(first["screen_time_start"])
+    original_end = float(first["screen_time_end"])
+    for index, item in enumerate(timeline):
+        copied = dict(item)
+        if index == 0:
+            copied["screen_time_end"] = round(float(copied["screen_time_end"]) + delta, 3)
+        else:
+            copied["screen_time_start"] = round(float(copied["screen_time_start"]) + delta, 3)
+            copied["screen_time_end"] = round(float(copied["screen_time_end"]) + delta, 3)
+        adjusted_timeline.append(copied)
+    adjusted["timeline"] = adjusted_timeline
+
+    adjusted_captions: list[dict[str, Any]] = []
+    for item in adjusted.get("caption_plan", []) or []:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        raw_start = copied.get("start_offset", copied.get("start"))
+        raw_end = copied.get("end_offset", copied.get("end"))
+        if raw_start is not None and raw_end is not None:
+            start = float(raw_start)
+            end = float(raw_end)
+            if start >= original_end - 0.001:
+                start += delta
+                end += delta
+            elif start >= original_start - 0.001 and end <= original_end + 0.001:
+                end += delta
+            elif start < original_end < end:
+                end += delta
+
+            if "start_offset" in copied or "end_offset" in copied:
+                copied["start_offset"] = round(start, 3)
+                copied["end_offset"] = round(end, 3)
+            else:
+                copied["start"] = round(start, 3)
+                copied["end"] = round(end, 3)
+        adjusted_captions.append(copied)
+    adjusted["caption_plan"] = adjusted_captions
+    return adjusted, True, delta
+
+
+def normalize_first_title_card_text(clip: dict[str, Any]) -> tuple[dict[str, Any], bool, str]:
+    concept_title = str(clip.get("concept_title", "")).strip()
+    if not concept_title:
+        return clip, False, ""
+
+    timeline = sorted(clip.get("timeline", []), key=lambda item: int(item.get("order", 0)))
+    if not timeline:
+        return clip, False, ""
+
+    first = timeline[0]
+    if not should_render_title_card(first):
+        return clip, False, ""
+
+    original_text = str(first.get("caption_or_overlay", "")).strip()
+    if original_text == concept_title:
+        return clip, False, ""
+
+    adjusted = deepcopy(clip)
+    adjusted_timeline: list[dict[str, Any]] = []
+    first_start = float(first["screen_time_start"])
+    first_end = float(first["screen_time_end"])
+    for index, item in enumerate(timeline):
+        copied = dict(item)
+        if index == 0:
+            copied["caption_or_overlay"] = concept_title
+        adjusted_timeline.append(copied)
+    adjusted["timeline"] = adjusted_timeline
+
+    adjusted_captions: list[dict[str, Any]] = []
+    first_caption_updated = False
+    for item in adjusted.get("caption_plan", []) or []:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        raw_start = copied.get("start_offset", copied.get("start"))
+        raw_end = copied.get("end_offset", copied.get("end"))
+        if raw_start is not None and raw_end is not None:
+            start = float(raw_start)
+            end = float(raw_end)
+            inside_first_card = start >= first_start - 0.001 and end <= first_end + 0.001
+            starts_first_card = not first_caption_updated and start <= first_start + 0.001
+            if inside_first_card or starts_first_card:
+                copied["text"] = concept_title
+                first_caption_updated = True
+        adjusted_captions.append(copied)
+    adjusted["caption_plan"] = adjusted_captions
+    return adjusted, True, original_text
 
 
 def retime_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1156,8 +1265,61 @@ def render_segment(
     }
 
 
-def concat_segments(segment_paths: list[Path], output_path: Path) -> None:
-    concat_media(segment_paths, output_path)
+def concat_segments(segment_paths: list[Path], output_path: Path, width: int, height: int) -> None:
+    if not segment_paths:
+        raise RuntimeError("Cannot concatenate an empty segment list.")
+
+    args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    for path in segment_paths:
+        args.extend(["-i", str(path)])
+
+    filters: list[str] = []
+    for index in range(len(segment_paths)):
+        filters.append(
+            f"[{index}:v]fps=30,scale={width}:{height},setsar=1,"
+            f"format=yuv420p,setpts=PTS-STARTPTS[v{index}]"
+        )
+        filters.append(
+            f"[{index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"asetpts=PTS-STARTPTS[a{index}]"
+        )
+
+    if len(segment_paths) == 1:
+        video_out = "v0"
+        audio_out = "a0"
+    else:
+        concat_inputs = "".join(f"[v{index}][a{index}]" for index in range(len(segment_paths)))
+        filters.append(f"{concat_inputs}concat=n={len(segment_paths)}:v=1:a=1[vout][aout]")
+        video_out = "vout"
+        audio_out = "aout"
+
+    args.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{video_out}]",
+            "-map",
+            f"[{audio_out}]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+    run_command(args)
+    validate_av_stream_lengths(output_path)
 
 
 def concat_segments_with_crossfade(
@@ -1168,7 +1330,7 @@ def concat_segments_with_crossfade(
     height: int,
 ) -> None:
     if len(segment_paths) < 2 or transition_duration <= 0:
-        concat_segments(segment_paths, output_path)
+        concat_segments(segment_paths, output_path, width=width, height=height)
         return
 
     summaries = [ffprobe_summary(path) for path in segment_paths]
@@ -1186,7 +1348,7 @@ def concat_segments_with_crossfade(
         *[max(0.0, (duration - 0.05) / 2) for duration in all_durations],
     )
     if usable_transition <= 0.01:
-        concat_segments(segment_paths, output_path)
+        concat_segments(segment_paths, output_path, width=width, height=height)
         return
 
     args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
@@ -1391,6 +1553,8 @@ def render_clip(
     foreground_contrast: float,
     foreground_saturation: float,
 ) -> dict[str, Any]:
+    clip, title_card_text_normalized, title_card_original_text = normalize_first_title_card_text(clip)
+    clip, title_card_duration_normalized, title_card_duration_delta = normalize_first_title_card_duration(clip)
     clip_id = safe_name(str(clip["clip_id"]))
     clip_dir = output_dir / "_work" / clip_id
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -1493,6 +1657,10 @@ def render_clip(
             | ({"video_fade_to_black"} if final_video_fade_out_duration > 0 else set())
         ),
         "silent_lead_repaired": silent_lead_repaired,
+        "title_card_text_normalized": title_card_text_normalized,
+        "title_card_original_text": title_card_original_text,
+        "title_card_duration_normalized": title_card_duration_normalized,
+        "title_card_duration_delta": round(title_card_duration_delta, 3),
         "transition_duration": transition_duration,
         "final_video_fade_out_duration": final_video_fade_out_duration,
         "internal_visual_transition_duration": internal_visual_transition_duration,

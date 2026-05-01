@@ -40,7 +40,7 @@ from extractor.openai_stage3 import STAGE3_SCHEMA
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
-DEFAULT_MAX_OUTPUT_TOKENS = 18_000
+DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 
 DEVELOPER_INSTRUCTIONS = (
@@ -305,7 +305,15 @@ def build_task_prompt(
             "Do not produce a one-off patch for the current example. Express fixes as general edit decisions driven by critique categories and evidence.",
             "Hard editorial rules:",
             "- If there is no clear payoff, reject or defer the clip instead of trying to rescue it with captions or faster cuts.",
+            "- Preserve portfolio diversity. Do not keep multiple clips with the same named object, prop, demo type, or audience promise when a strong distinct candidate is available in the supplied Stage 3/critique/source evidence.",
+            "- If Stage 4 flags redundant selected hooks, replace or defer the weaker duplicate rather than retitling it.",
             "- Every revised clip ad should open with a short, intentional title/tagline card unless the visual action itself is the payoff.",
+            "- Title/tagline cards are ad headlines, not summaries. Make concept_title and the first rendered caption_or_overlay short, concrete, and punchy: target 3-7 words, with a soft cap of 9 words or about 55 characters unless a source quote or essential number forces more.",
+            "- Title/tagline cards must be understandable to a cold viewer before source audio starts. Rewrite cryptic shorthand, unexplained numbers, ambiguous either/or phrases, insider labels, vague hype, and wordy institutional summaries into a concrete subject plus surprising payoff.",
+            "- Put extra explanatory context in opening_hook.visual as a small subtitle or in the first spoken beat, not in the main title-card caption_or_overlay.",
+            "- The first generated title card's caption_or_overlay should normally be identical to concept_title. If Stage 4 says concept_title is clearer than the visible title card, rewrite concept_title itself into the shortest clear title-card text and use that same text as caption_or_overlay.",
+            "- Use sentence case for title/tagline cards. Do not preserve multi-word all-caps cards except acronyms or one intentionally emphasized word.",
+            "- Title/tagline cards should normally last 4-5 seconds so the viewer can read and understand the hook. Do not preserve a 1-2 second title flash.",
             "- For any generated title, hook, or CTA card, set source_start and source_end to 0, visual_source exactly to 'Generated black title card.', and audio_source to 'No source dialogue; silent generated title card.' This is the renderer contract; do not use source_start=0 footage as a fake card.",
             "- The payoff or surprising line should be the first spoken beat after the title/tagline card whenever it can open cleanly.",
             "- Do not put a payoff line first if it begins with a connective such as 'but', 'and', or 'so', depends on prior context, or sounds like a mid-sentence start. Include the setup before it or reject/defer the clip.",
@@ -807,13 +815,40 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
 
     response_dict = response.model_dump(mode="json") if hasattr(response, "model_dump") else {}
     output_text = response_output_text(response, response_dict)
+    usage = usage_dict(response_dict)
+    cost = actual_cost(usage, pricing)
     try:
         parsed_output = json.loads(output_text)
     except json.JSONDecodeError as exc:
+        write_json(run_dir / "raw-response.json", response_dict)
+        (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
+        write_json(
+            run_dir / "usage-and-cost.json",
+            {
+                "api_call_made": True,
+                "cache": {
+                    "hit": False,
+                    "stored": False,
+                    "key": local_cache_key if entry_dir else None,
+                    "entry_dir": str(entry_dir) if entry_dir else None,
+                },
+                "usage": usage,
+                "cost": cost,
+                "pricing": {
+                    "input_usd_per_million": pricing.input_usd_per_million,
+                    "cached_input_usd_per_million": pricing.cached_input_usd_per_million,
+                    "output_usd_per_million": pricing.output_usd_per_million,
+                },
+                "parse_error": str(exc),
+            },
+        )
+        print(
+            f"Actual token usage: input={cost['input_tokens']}, "
+            f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
+        )
+        print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
         raise RuntimeError(f"Model output was not valid JSON. Raw response saved to {run_dir}") from exc
 
-    usage = usage_dict(response_dict)
-    cost = actual_cost(usage, pricing)
     usage_and_cost = {
         "api_call_made": True,
         "cache": {

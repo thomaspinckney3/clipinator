@@ -351,10 +351,20 @@ def build_task_prompt(
             f"Assume a default target of {target_seconds} seconds and {target_aspect_ratio} vertical delivery unless a clip clearly needs a different duration.",
             "This is not a render request. Produce editor-facing instructions that could drive a later FFmpeg/Premiere/Resolve assembly step.",
             "Each clip plan must specify the opening hook, source in/out ranges, audio strategy, visual strategy, B-roll coverage, captions/overlays, and verification steps.",
+            "Treat the Stage 2 cross-angle ranking as the default selection order. Only skip a higher-ranked candidate for a lower-ranked one when the higher-ranked candidate has a concrete defect such as no clear payoff, unusable visual proof, severe transcript risk, or topic duplication. Record skipped strong candidates in deferred_candidates with the specific reason.",
+            "The selected clips should work as a diverse portfolio advertising the full video. Avoid choosing multiple clips with the same named object, prop, demo type, or audience promise when a strong distinct candidate is available. For example, do not choose two bunny-centered clips over a high-ranked falling-picture puzzle unless the picture clip fails a specific visual/audio check.",
+            "Prefer the strongest distinct story over a second variation on an already selected motif. A lower-ranked candidate that repeats the same object or hook family must be clearly better than the higher-ranked distinct alternative, not merely easier to title.",
             "Only create a clip plan when there is a clear payoff. A missing or weak payoff is a rejection signal; put that candidate in deferred_candidates instead of trying to rescue it with pacing, captions, or B-roll.",
             "Default story order: title/tagline card first, then the strongest payoff or surprise line as the first spoken beat, then supporting context. The payoff is the hook; do not bury it at the end when it can cleanly open the clip.",
             "Only move a payoff line to the first spoken beat if that source line is syntactically and semantically self-contained. If it starts with a connective such as 'but', 'and', or 'so', depends on prior context, or would sound like a mid-sentence start, either include the needed setup before it or defer the candidate.",
             "Every planned clip ad should open with a short, intentional title/tagline card unless the visual action itself is the payoff. For interview, narration, or explanation-led hooks, use a black title card first; do not replace it with source video just because dialogue can start immediately.",
+            "Title/tagline cards are ad headlines, not summaries. Make concept_title and the first rendered caption_or_overlay short, concrete, and punchy: target 3-7 words, with a soft cap of 9 words or about 55 characters unless a source quote or essential number forces more.",
+            "A cold viewer still needs to understand the promise before source audio plays. Use a concrete subject plus a surprising payoff, but do not explain the whole clip in the title. Put extra context in opening_hook.visual as a small subtitle or in the following spoken beat, not in caption_or_overlay.",
+            "Prefer specific high-curiosity wording like 'Moon hammers are custom-built', 'Ancient Rome had takeout', 'One cut reveals MIT', or 'Rejected 30 times, then NASA'. Avoid long institutional or academic summary titles like 'NASA has to preserve future Moon samples for decades of science'.",
+            "Do not use cryptic shorthand, unexplained numbers, ambiguous binaries, insider labels, or source-specific abbreviations. If a short accurate title cannot be written without sounding vague, defer the candidate.",
+            "The first generated title card's caption_or_overlay should normally be identical to concept_title. If it differs, it must be a clearer sentence-case variant, not a vaguer slogan. Do not make concept_title clearer than the rendered title card.",
+            "Use sentence case for title/tagline cards. Do not use all caps except acronyms or one intentionally emphasized word.",
+            "Title/tagline card duration should normally be 4-5 seconds. Do not use a 1-2 second title flash unless the visual action itself immediately explains the hook.",
             "For any generated title, hook, or CTA card, set source_start and source_end to 0, visual_source exactly to 'Generated black title card.', and audio_source to 'No source dialogue; silent generated title card.' Do not describe it as a music bed only or source roomtone; the renderer treats that as ambiguous.",
             "Title, overlay, and caption wording must preserve the source claim. Do not compress 'the next words were about science' into the false literal claim 'the next words were science'; distinguish narrator interpretation from the actual quoted words.",
             "If the payoff occurs later in the source than its setup, jump to the payoff first, then cut back to the setup/context. Make this chronology shift explicit in the edit_action and cover it with B-roll when needed.",
@@ -896,13 +906,40 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
 
     response_dict = response.model_dump(mode="json") if hasattr(response, "model_dump") else {}
     output_text = response_output_text(response, response_dict)
+    usage = usage_dict(response_dict)
+    cost = actual_cost(usage, pricing)
     try:
         parsed_output = json.loads(output_text)
     except json.JSONDecodeError as exc:
+        write_json(run_dir / "raw-response.json", response_dict)
+        (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
+        write_json(
+            run_dir / "usage-and-cost.json",
+            {
+                "api_call_made": True,
+                "cache": {
+                    "hit": False,
+                    "stored": False,
+                    "key": local_cache_key if entry_dir else None,
+                    "entry_dir": str(entry_dir) if entry_dir else None,
+                },
+                "usage": usage,
+                "cost": cost,
+                "pricing": {
+                    "input_usd_per_million": pricing.input_usd_per_million,
+                    "cached_input_usd_per_million": pricing.cached_input_usd_per_million,
+                    "output_usd_per_million": pricing.output_usd_per_million,
+                },
+                "parse_error": str(exc),
+            },
+        )
+        print(
+            f"Actual token usage: input={cost['input_tokens']}, "
+            f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
+        )
+        print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
         raise RuntimeError(f"Model output was not valid JSON. Raw response saved to {run_dir}") from exc
 
-    usage = usage_dict(response_dict)
-    cost = actual_cost(usage, pricing)
     usage_and_cost = {
         "api_call_made": True,
         "cache": {
