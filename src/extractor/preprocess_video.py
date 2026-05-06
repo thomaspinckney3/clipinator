@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,9 +16,19 @@ from typing import Any
 
 
 DEFAULT_OUTPUT_DIR = Path("video-evidence")
-DEFAULT_FRAME_INTERVAL_SECONDS = 10.0
+DEFAULT_FRAME_INTERVAL_SECONDS = 1.0
 DEFAULT_FRAME_WIDTH = 480
-DEFAULT_CONTACT_SHEET_COLUMNS = 5
+DEFAULT_CONTACT_SHEET_FRAME_WIDTH = 180
+DEFAULT_CONTACT_SHEET_COLUMNS = 12
+DEFAULT_WINDOW_SHEET_SECONDS = 60.0
+DEFAULT_WINDOW_SHEET_FRAME_WIDTH = 240
+DEFAULT_WINDOW_SHEET_COLUMNS = 10
+SHEET_PADDING_PIXELS = 8
+SHEET_MARGIN_PIXELS = 8
+DEFAULT_FFMPEG_BIN = "auto"
+HOMEBREW_FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
+DEFAULT_FFMPEG_HWACCEL = "auto"
+FFMPEG_HWACCEL_CHOICES = ("auto", "none", "videotoolbox")
 DEFAULT_SCENE_THRESHOLD = 0.35
 DEFAULT_MAX_SCENES = 80
 DEFAULT_SILENCE_NOISE_DB = -35
@@ -41,6 +53,71 @@ class FrameSample:
 def require_command(name: str) -> None:
     if shutil.which(name) is None:
         raise RuntimeError(f"Required command not found on PATH: {name}")
+
+
+def resolve_ffmpeg_bin(value: str | Path | None) -> str:
+    raw_value = str(value or DEFAULT_FFMPEG_BIN)
+    if raw_value == "auto":
+        if HOMEBREW_FFMPEG_FULL.exists():
+            return str(HOMEBREW_FFMPEG_FULL)
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        raise RuntimeError("Required command not found on PATH: ffmpeg")
+
+    expanded = Path(raw_value).expanduser()
+    if expanded.parent != Path(".") or "/" in raw_value:
+        if not expanded.exists():
+            raise RuntimeError(f"Required ffmpeg binary not found: {expanded}")
+        return str(expanded)
+
+    found = shutil.which(raw_value)
+    if found is None:
+        raise RuntimeError(f"Required command not found on PATH: {raw_value}")
+    return found
+
+
+def ffmpeg_supports_filter(ffmpeg_bin: str, name: str) -> bool:
+    result = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-filters"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return re.search(rf"\b{name}\b", f"{result.stdout}\n{result.stderr}") is not None
+
+
+def ffmpeg_supports_hwaccel(ffmpeg_bin: str, name: str) -> bool:
+    result = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-hwaccels"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return name in f"{result.stdout}\n{result.stderr}".split()
+
+
+def resolve_ffmpeg_hwaccel(value: str, ffmpeg_bin: str | None = None) -> str | None:
+    if value == "none":
+        return None
+    if value == "auto":
+        resolved_bin = ffmpeg_bin or resolve_ffmpeg_bin("auto")
+        if platform.system() == "Darwin" and ffmpeg_supports_hwaccel(
+            resolved_bin, "videotoolbox"
+        ):
+            return "videotoolbox"
+        return None
+    if value not in FFMPEG_HWACCEL_CHOICES:
+        choices = ", ".join(FFMPEG_HWACCEL_CHOICES)
+        raise ValueError(f"Unknown ffmpeg hwaccel {value!r}; choose one of: {choices}.")
+    return value
+
+
+def ffmpeg_hwaccel_input_args(value: str | None) -> list[str]:
+    resolved = resolve_ffmpeg_hwaccel(value or "none")
+    return ["-hwaccel", resolved] if resolved else []
 
 
 def run_command(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -113,11 +190,86 @@ def media_summary(probe: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def frame_available_duration(
+    frame_samples: list[FrameSample],
+    interval_seconds: float,
+    container_duration: float,
+) -> float | None:
+    if not frame_samples:
+        return None
+    decoded_duration = frame_samples[-1].timestamp + interval_seconds
+    if container_duration > 0:
+        decoded_duration = min(container_duration, decoded_duration)
+    return max(0.0, decoded_duration)
+
+
+def transcript_available_duration(path: Path | None) -> float | None:
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    source = data.get("source", {}) if isinstance(data, dict) else {}
+    for key in ("effective_duration_seconds", "duration_seconds"):
+        value = source.get(key)
+        if value is None:
+            continue
+        try:
+            duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            return duration
+    return None
+
+
+def media_availability(
+    container_duration: float,
+    frame_samples: list[FrameSample],
+    interval_seconds: float,
+    transcript_path: Path | None,
+) -> dict[str, Any]:
+    tolerance = max(2.0, interval_seconds * 2)
+    effective_duration = container_duration
+    truncated = False
+    sources: dict[str, float] = {"container": round(container_duration, 3)}
+
+    visual_duration = frame_available_duration(
+        frame_samples=frame_samples,
+        interval_seconds=interval_seconds,
+        container_duration=container_duration,
+    )
+    if visual_duration is not None:
+        sources["decoded_video"] = round(visual_duration, 3)
+        if container_duration - visual_duration > tolerance:
+            truncated = True
+            effective_duration = min(effective_duration, visual_duration)
+
+    transcript_duration = transcript_available_duration(transcript_path)
+    if transcript_duration is not None:
+        sources["transcript"] = round(transcript_duration, 3)
+        if container_duration - transcript_duration > tolerance:
+            truncated = True
+            effective_duration = min(effective_duration, transcript_duration)
+
+    if effective_duration <= 0 and visual_duration is not None:
+        effective_duration = visual_duration
+    return {
+        "effective_duration_seconds": round(effective_duration, 3),
+        "container_duration_seconds": round(container_duration, 3),
+        "truncated": truncated,
+        "duration_sources": sources,
+    }
+
+
 def safe_stem(path: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", path.stem).strip("-")
 
 
 def frame_timestamps(duration: float, interval_seconds: float) -> list[float]:
+    if interval_seconds <= 0:
+        raise RuntimeError("--frame-interval-seconds must be > 0")
     if duration <= 0:
         return []
     timestamps = [0.0]
@@ -130,25 +282,105 @@ def frame_timestamps(duration: float, interval_seconds: float) -> list[float]:
     return timestamps
 
 
+def fps_expression(frame_interval_seconds: float) -> str:
+    fps = 1.0 / frame_interval_seconds
+    if abs(fps - round(fps)) < 0.000001:
+        return str(int(round(fps)))
+    return f"{fps:.6f}"
+
+
+def sampled_frame_path(frame_dir: Path, index: int, timestamp: float) -> Path:
+    return frame_dir / f"frame-{index:04d}-{timestamp:09.3f}s.jpg"
+
+
+def existing_frame_samples(frame_dir: Path, interval_seconds: float) -> list[FrameSample]:
+    samples: list[FrameSample] = []
+    for frame_path in sorted(frame_dir.glob("frame-*.jpg")):
+        match = re.match(r"frame-(\d+)-([0-9.]+)s\.jpg$", frame_path.name)
+        if not match:
+            continue
+        index = int(match.group(1))
+        timestamp = float(match.group(2))
+        if abs(timestamp - index * interval_seconds) > max(0.01, interval_seconds * 0.01):
+            return []
+        samples.append(FrameSample(index=index, timestamp=timestamp, path=frame_path))
+    if not samples:
+        return []
+    if [sample.index for sample in samples] != list(range(len(samples))):
+        return []
+    return samples
+
+
 def extract_frame_samples(
     video_path: Path,
     frame_dir: Path,
     duration: float,
     interval_seconds: float,
     frame_width: int,
+    ffmpeg_bin: str,
+    ffmpeg_hwaccel: str | None,
 ) -> list[FrameSample]:
     frame_dir.mkdir(parents=True, exist_ok=True)
+    reusable_samples = existing_frame_samples(frame_dir, interval_seconds)
+    if reusable_samples:
+        return reusable_samples
+
+    for stale_frame in frame_dir.glob("frame-*.jpg"):
+        stale_frame.unlink()
+
+    if abs(interval_seconds - 1.0) < 0.000001:
+        result = run_command(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                *ffmpeg_hwaccel_input_args(ffmpeg_hwaccel),
+                "-i",
+                str(video_path),
+                "-vf",
+                f"fps={fps_expression(interval_seconds)},scale={frame_width}:-2",
+                "-q:v",
+                "3",
+                "-pix_fmt",
+                "yuvj420p",
+                "-strict",
+                "unofficial",
+                "-start_number",
+                "0",
+                str(frame_dir / "frame-tmp-%06d.jpg"),
+            ],
+            check=False,
+        )
+        temp_frames = sorted(frame_dir.glob("frame-tmp-*.jpg"))
+        if result.returncode != 0 and not temp_frames:
+            raise RuntimeError(result.stderr.strip() or "ffmpeg failed to extract frames")
+        if result.returncode != 0:
+            print(
+                "warning: ffmpeg returned an error during frame extraction; "
+                "continuing with decoded frames."
+            )
+        samples: list[FrameSample] = []
+        for index, temp_path in enumerate(temp_frames):
+            timestamp = min(duration, index * interval_seconds)
+            frame_path = sampled_frame_path(frame_dir, index, timestamp)
+            temp_path.rename(frame_path)
+            samples.append(FrameSample(index=index, timestamp=timestamp, path=frame_path))
+        return samples
+
     samples: list[FrameSample] = []
     for index, timestamp in enumerate(frame_timestamps(duration, interval_seconds)):
-        frame_path = frame_dir / f"frame-{index:04d}-{timestamp:09.3f}s.jpg"
+        frame_path = sampled_frame_path(frame_dir, index, timestamp)
         args = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-y",
             "-hide_banner",
             "-loglevel",
             "error",
             "-ss",
             f"{timestamp:.3f}",
+            *ffmpeg_hwaccel_input_args(ffmpeg_hwaccel),
             "-i",
             str(video_path),
             "-frames:v",
@@ -159,50 +391,241 @@ def extract_frame_samples(
             "3",
             str(frame_path),
         ]
-        run_command(args)
+        try:
+            run_command(args)
+        except subprocess.CalledProcessError:
+            if samples:
+                print(
+                    f"warning: stopping frame extraction at {timestamp:.3f}s; "
+                    "source appears truncated or unreadable."
+                )
+                break
+            raise
+        if not frame_path.exists() or frame_path.stat().st_size == 0:
+            if samples:
+                print(
+                    f"warning: stopping frame extraction at {timestamp:.3f}s; "
+                    "ffmpeg produced no frame for the next timestamp."
+                )
+                break
+            raise RuntimeError(f"ffmpeg produced no frame: {frame_path}")
         samples.append(FrameSample(index=index, timestamp=timestamp, path=frame_path))
     return samples
 
 
+def quote_drawtext_path(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def label_text(sample: FrameSample) -> str:
+    return f"{sample.index:04d}  {format_time(sample.timestamp)}"
+
+
+def create_labeled_frame(
+    ffmpeg_bin: str,
+    sample: FrameSample,
+    output_path: Path,
+    frame_width: int,
+    label_file: Path,
+) -> None:
+    label_file.write_text(label_text(sample), encoding="utf-8")
+    font_size = max(12, min(26, round(frame_width * 0.07)))
+    label_height = max(24, font_size + 12)
+    filter_expr = (
+        f"scale={frame_width}:-2,"
+        f"drawbox=x=0:y=ih-{label_height}:w=iw:h={label_height}:"
+        "color=black@0.68:t=fill,"
+        f"drawtext=textfile='{quote_drawtext_path(label_file)}':"
+        f"x=8:y=h-th-6:fontsize={font_size}:fontcolor=white:"
+        "borderw=1:bordercolor=black"
+    )
+    run_command(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(sample.path),
+            "-vf",
+            filter_expr,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            str(output_path),
+        ]
+    )
+
+
+def sheet_frame_entries(
+    frame_samples: list[FrameSample],
+    root: Path,
+    columns: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **sample.to_dict(root),
+            "sheet_row": index // columns,
+            "sheet_column": index % columns,
+            "label": label_text(sample),
+        }
+        for index, sample in enumerate(frame_samples)
+    ]
+
+
 def create_contact_sheet(
+    ffmpeg_bin: str,
     frame_samples: list[FrameSample],
     output_path: Path,
     columns: int,
     frame_width: int,
-) -> Path | None:
+    root: Path,
+    sheet_id: str,
+    title: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not frame_samples:
         return None
     rows = math.ceil(len(frame_samples) / columns)
-    # Re-read the sampled frames at a steady cadence and tile them into one sheet.
-    pattern = frame_samples[0].path.parent / "frame-*.jpg"
-    args = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-pattern_type",
-        "glob",
-        "-i",
-        str(pattern),
-        "-vf",
-        f"scale={frame_width}:-2,tile={columns}x{rows}:padding=8:margin=8",
-        "-frames:v",
-        "1",
-        "-q:v",
-        "3",
-        str(output_path),
-    ]
-    run_command(args)
-    return output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if len(frame_samples) > 1:
+        label_interval = max(0.001, frame_samples[1].timestamp - frame_samples[0].timestamp)
+    else:
+        label_interval = 1.0
+    label_start = frame_samples[0].timestamp
+    label_index_offset = frame_samples[0].index
+    font_size = max(12, min(26, round(frame_width * 0.07)))
+    label_height = max(24, font_size + 12)
+    filter_expr = (
+        f"scale={frame_width}:-2,"
+        f"setpts=PTS+{label_start:.6f}/TB,"
+        f"drawbox=x=0:y=ih-{label_height}:w=iw:h={label_height}:"
+        "color=black@0.68:t=fill,"
+        f"drawtext=text='%{{eif\\:n+{label_index_offset}\\:d}} %{{pts\\:hms}}':"
+        f"x=8:y=h-th-6:fontsize={font_size}:fontcolor=white:"
+        "borderw=1:bordercolor=black,"
+        f"tile={columns}x{rows}:"
+        f"padding={SHEET_PADDING_PIXELS}:margin={SHEET_MARGIN_PIXELS}"
+    )
+    with tempfile.TemporaryDirectory(prefix="extractor-sheet-") as temp_name:
+        temp_dir = Path(temp_name)
+        input_dir = temp_dir / "frames"
+        input_dir.mkdir()
+        for index, sample in enumerate(frame_samples):
+            (input_dir / f"frame-{index:06d}.jpg").symlink_to(sample.path)
+        run_command(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-framerate",
+                fps_expression(label_interval),
+                "-start_number",
+                "0",
+                "-i",
+                str(input_dir / "frame-%06d.jpg"),
+                "-vf",
+                filter_expr,
+                "-frames:v",
+                "1",
+                "-q:v",
+                "3",
+                str(output_path),
+            ]
+        )
+    payload: dict[str, Any] = {
+        "sheet_id": sheet_id,
+        "title": title,
+        "path": relative_to_root(output_path, root),
+        "columns": columns,
+        "rows": rows,
+        "cell_width": frame_width,
+        "frame_count": len(frame_samples),
+        "labeled": True,
+        "read_order": (
+            "Frames read left-to-right, top-to-bottom. Each cell is labeled "
+            "with frame index and source timecode."
+        ),
+        "frames": sheet_frame_entries(frame_samples, root, columns),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
-def detect_scene_changes(video_path: Path, threshold: float, max_scenes: int) -> list[dict[str, Any]]:
+def create_window_sheets(
+    ffmpeg_bin: str,
+    frame_samples: list[FrameSample],
+    output_root: Path,
+    video_root: Path,
+    duration: float,
+    sheet_seconds: float,
+    columns: int,
+    frame_width: int,
+) -> list[dict[str, Any]]:
+    if sheet_seconds <= 0:
+        raise RuntimeError("--window-sheet-seconds must be > 0")
+    sheets_dir = video_root / "sheets"
+    if sheets_dir.exists():
+        shutil.rmtree(sheets_dir)
+    sheets_dir.mkdir(parents=True, exist_ok=True)
+
+    sheets: list[dict[str, Any]] = []
+    start = 0.0
+    window_index = 0
+    while start < duration:
+        end = min(duration, start + sheet_seconds)
+        window_frames = [
+            sample for sample in frame_samples if start <= sample.timestamp < end
+        ]
+        if window_frames:
+            display_range = f"{format_time(start)}-{format_time(end)}"
+            sheet_id = f"window-{window_index:03d}-{start:06.1f}s-{end:06.1f}s"
+            output_path = sheets_dir / f"{sheet_id}.jpg"
+            sheet = create_contact_sheet(
+                ffmpeg_bin=ffmpeg_bin,
+                frame_samples=window_frames,
+                output_path=output_path,
+                columns=columns,
+                frame_width=frame_width,
+                root=output_root,
+                sheet_id=sheet_id,
+                title=f"Window {window_index:03d}: {display_range}",
+                extra={
+                    "kind": "window",
+                    "window_index": window_index,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "display_range": display_range,
+                },
+            )
+            if sheet:
+                sheets.append(sheet)
+        start += sheet_seconds
+        window_index += 1
+    return sheets
+
+
+def detect_scene_changes(
+    video_path: Path,
+    threshold: float,
+    max_scenes: int,
+    ffmpeg_bin: str,
+    ffmpeg_hwaccel: str | None,
+    duration_limit: float | None,
+) -> list[dict[str, Any]]:
+    limit_args = ["-t", f"{max(0.001, duration_limit):.3f}"] if duration_limit else []
     args = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-hide_banner",
         "-loglevel",
         "info",
+        *ffmpeg_hwaccel_input_args(ffmpeg_hwaccel),
+        *limit_args,
         "-i",
         str(video_path),
         "-vf",
@@ -232,16 +655,21 @@ def detect_silence(
     video_path: Path,
     noise_db: int,
     min_duration: float,
+    ffmpeg_bin: str,
+    duration_limit: float | None,
 ) -> list[dict[str, Any]]:
+    limit_args = ["-t", f"{max(0.001, duration_limit):.3f}"] if duration_limit else []
     args = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-hide_banner",
         "-loglevel",
         "info",
+        *limit_args,
         "-i",
         str(video_path),
         "-af",
         f"silencedetect=noise={noise_db}dB:d={min_duration}",
+        "-vn",
         "-f",
         "null",
         "-",
@@ -292,6 +720,8 @@ def write_markdown(path: Path, manifest: dict[str, Any]) -> None:
         "## Media",
         "",
         f"- Duration: `{format_time(manifest['media']['duration_seconds'])}`",
+        f"- Container duration: `{format_time(manifest['media'].get('container_duration_seconds', manifest['media']['duration_seconds']))}`",
+        f"- Truncated: `{manifest['media'].get('truncated', False)}`",
         f"- Video: `{manifest['media']['video']['width']}x{manifest['media']['video']['height']}` `{manifest['media']['video']['codec']}`",
         f"- Audio: `{manifest['media']['audio']['codec']}` `{manifest['media']['audio']['channels']}` channel(s)",
         "",
@@ -299,10 +729,36 @@ def write_markdown(path: Path, manifest: dict[str, Any]) -> None:
         "",
         f"- Contact sheet: `{manifest['visual']['contact_sheet']}`",
         f"- Frame directory: `{manifest['visual']['frame_directory']}`",
+        f"- Frame interval: `{manifest['visual']['frame_interval_seconds']}s`",
+        f"- Frame width: `{manifest['visual']['frame_width']}px`",
+        f"- Contact sheet cell width: `{manifest['visual']['contact_sheet_frame_width']}px`",
+        f"- Window sheets: `{len(manifest['visual']['window_sheets'])}`",
+        f"- Window sheet seconds: `{manifest['visual']['window_sheet_seconds']}s`",
+        f"- Window sheet cell width: `{manifest['visual']['window_sheet_frame_width']}px`",
+        f"- FFmpeg binary: `{manifest['visual']['ffmpeg_bin']}`",
+        f"- FFmpeg hardware decode: `{manifest['visual']['ffmpeg_hwaccel']}`",
+        "",
+        "## LLM Sheet Guidance",
+        "",
+        "- Use the overview sheet for broad visual scanning.",
+        "- Use the labeled window sheets for precise timestamp grounding.",
+        "- Each sheet cell shows `frame_index timecode`; manifest sheet metadata maps cells to timestamps.",
+        "",
+        "## Window Sheets",
+        "",
+    ]
+    for sheet in manifest["visual"]["window_sheets"][:20]:
+        lines.append(
+            f"- `{sheet['display_range']}` -> `{sheet['path']}` "
+            f"({sheet['frame_count']} frames)"
+        )
+    if len(manifest["visual"]["window_sheets"]) > 20:
+        lines.append(f"- ... {len(manifest['visual']['window_sheets']) - 20} more")
+    lines.extend([
         "",
         "## Scene Changes",
         "",
-    ]
+    ])
     for scene in manifest["visual"]["scene_changes"][:20]:
         lines.append(f"- `{scene['display_time']}`")
     if len(manifest["visual"]["scene_changes"]) > 20:
@@ -359,34 +815,83 @@ def preprocess_video(video_path: Path, args: argparse.Namespace) -> dict[str, An
     video_root = output_root / safe_stem(video_path)
     frame_dir = video_root / "frames"
     video_root.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = resolve_ffmpeg_bin(args.ffmpeg_bin)
+    if not ffmpeg_supports_filter(ffmpeg_bin, "drawtext"):
+        raise RuntimeError(
+            f"{ffmpeg_bin} does not support the drawtext filter. "
+            "Install ffmpeg-full or pass --ffmpeg-bin to a drawtext-enabled ffmpeg."
+        )
+    resolved_hwaccel = resolve_ffmpeg_hwaccel(args.ffmpeg_hwaccel, ffmpeg_bin) or "none"
 
     probe = ffprobe_json(video_path)
     media = media_summary(probe)
-    duration = float(media["duration_seconds"])
+    container_duration = float(media["duration_seconds"])
     frame_samples = extract_frame_samples(
         video_path=video_path,
         frame_dir=frame_dir,
-        duration=duration,
+        duration=container_duration,
         interval_seconds=args.frame_interval_seconds,
         frame_width=args.frame_width,
+        ffmpeg_bin=ffmpeg_bin,
+        ffmpeg_hwaccel=resolved_hwaccel,
     )
+    availability = media_availability(
+        container_duration=container_duration,
+        frame_samples=frame_samples,
+        interval_seconds=args.frame_interval_seconds,
+        transcript_path=args.transcript,
+    )
+    duration = float(availability["effective_duration_seconds"])
+    media["container_duration_seconds"] = availability["container_duration_seconds"]
+    media["effective_duration_seconds"] = availability["effective_duration_seconds"]
+    media["duration_seconds"] = availability["effective_duration_seconds"]
+    media["truncated"] = availability["truncated"]
+    media["duration_sources"] = availability["duration_sources"]
+    media["video"]["effective_duration_seconds"] = availability["effective_duration_seconds"]
+    media["audio"]["effective_duration_seconds"] = availability["effective_duration_seconds"]
     contact_sheet_path = video_root / "contact-sheet.jpg"
-    create_contact_sheet(
+    overview_sheet = create_contact_sheet(
+        ffmpeg_bin=ffmpeg_bin,
         frame_samples=frame_samples,
         output_path=contact_sheet_path,
         columns=args.contact_sheet_columns,
         frame_width=args.contact_sheet_frame_width,
+        root=output_root,
+        sheet_id="overview",
+        title="Full video overview",
+        extra={
+            "kind": "overview",
+            "start": 0.0,
+            "end": round(duration, 3),
+            "display_range": f"{format_time(0)}-{format_time(duration)}",
+            "container_end": round(container_duration, 3),
+        },
+    )
+    window_sheets = create_window_sheets(
+        ffmpeg_bin=ffmpeg_bin,
+        frame_samples=frame_samples,
+        output_root=output_root,
+        video_root=video_root,
+        duration=duration,
+        sheet_seconds=args.window_sheet_seconds,
+        columns=args.window_sheet_columns,
+        frame_width=args.window_sheet_frame_width,
     )
 
     scene_changes = [] if args.skip_scene_detection else detect_scene_changes(
         video_path=video_path,
         threshold=args.scene_threshold,
         max_scenes=args.max_scenes,
+        ffmpeg_bin=ffmpeg_bin,
+        ffmpeg_hwaccel=resolved_hwaccel,
+        duration_limit=duration,
     )
     silences = [] if args.skip_audio_analysis else detect_silence(
         video_path=video_path,
         noise_db=args.silence_noise_db,
         min_duration=args.silence_min_duration,
+        ffmpeg_bin=ffmpeg_bin,
+        duration_limit=duration,
     )
 
     manifest = {
@@ -402,8 +907,20 @@ def preprocess_video(video_path: Path, args: argparse.Namespace) -> dict[str, An
         "visual": {
             "frame_interval_seconds": args.frame_interval_seconds,
             "frame_width": args.frame_width,
+            "contact_sheet_frame_width": args.contact_sheet_frame_width,
+            "contact_sheet_columns": args.contact_sheet_columns,
+            "window_sheet_seconds": args.window_sheet_seconds,
+            "window_sheet_frame_width": args.window_sheet_frame_width,
+            "window_sheet_columns": args.window_sheet_columns,
+            "ffmpeg_bin": ffmpeg_bin,
+            "ffmpeg_hwaccel": resolved_hwaccel,
+            "container_duration_seconds": round(container_duration, 3),
+            "effective_duration_seconds": round(duration, 3),
+            "truncated": bool(availability["truncated"]),
             "frame_directory": relative_to_root(frame_dir, output_root),
             "contact_sheet": relative_to_root(contact_sheet_path, output_root),
+            "overview_sheet": overview_sheet,
+            "window_sheets": window_sheets,
             "sampled_frames": [sample.to_dict(output_root) for sample in frame_samples],
             "scene_detection": {
                 "threshold": args.scene_threshold,
@@ -428,7 +945,7 @@ def preprocess_video(video_path: Path, args: argparse.Namespace) -> dict[str, An
                 "this manifest JSON",
                 "transcript JSON or compact transcript timeline",
                 "QA report",
-                "sampled frame references with identical detail setting",
+                "labeled overview and window sheet metadata",
             ],
             "variable_suffix_items": [
                 "stage-specific task",
@@ -457,10 +974,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--transcript", type=Path, default=None)
     parser.add_argument("--transcript-dir", type=Path, default=None)
-    parser.add_argument("--frame-interval-seconds", type=float, default=DEFAULT_FRAME_INTERVAL_SECONDS)
-    parser.add_argument("--frame-width", type=int, default=DEFAULT_FRAME_WIDTH)
-    parser.add_argument("--contact-sheet-frame-width", type=int, default=320)
-    parser.add_argument("--contact-sheet-columns", type=int, default=DEFAULT_CONTACT_SHEET_COLUMNS)
+    parser.add_argument(
+        "--frame-interval-seconds",
+        type=float,
+        default=DEFAULT_FRAME_INTERVAL_SECONDS,
+        help="Seconds between sampled evidence frames.",
+    )
+    parser.add_argument(
+        "--frame-width",
+        type=int,
+        default=DEFAULT_FRAME_WIDTH,
+        help="Downscaled sampled frame width in pixels.",
+    )
+    parser.add_argument(
+        "--contact-sheet-frame-width",
+        type=int,
+        default=DEFAULT_CONTACT_SHEET_FRAME_WIDTH,
+        help="Downscaled width for each cell in the overview contact sheet.",
+    )
+    parser.add_argument(
+        "--contact-sheet-columns",
+        type=int,
+        default=DEFAULT_CONTACT_SHEET_COLUMNS,
+        help="Number of columns in the overview contact sheet.",
+    )
+    parser.add_argument(
+        "--window-sheet-seconds",
+        type=float,
+        default=DEFAULT_WINDOW_SHEET_SECONDS,
+        help="Seconds covered by each labeled LLM window sheet.",
+    )
+    parser.add_argument(
+        "--window-sheet-frame-width",
+        type=int,
+        default=DEFAULT_WINDOW_SHEET_FRAME_WIDTH,
+        help="Downscaled width for each cell in labeled LLM window sheets.",
+    )
+    parser.add_argument(
+        "--window-sheet-columns",
+        type=int,
+        default=DEFAULT_WINDOW_SHEET_COLUMNS,
+        help="Number of columns in labeled LLM window sheets.",
+    )
+    parser.add_argument(
+        "--ffmpeg-bin",
+        default=DEFAULT_FFMPEG_BIN,
+        help=(
+            "ffmpeg executable. Use auto to prefer "
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg when present."
+        ),
+    )
+    parser.add_argument(
+        "--ffmpeg-hwaccel",
+        choices=FFMPEG_HWACCEL_CHOICES,
+        default=DEFAULT_FFMPEG_HWACCEL,
+        help="Hardware decode mode for video frame extraction and scene detection.",
+    )
     parser.add_argument("--scene-threshold", type=float, default=DEFAULT_SCENE_THRESHOLD)
     parser.add_argument("--max-scenes", type=int, default=DEFAULT_MAX_SCENES)
     parser.add_argument("--silence-noise-db", type=int, default=DEFAULT_SILENCE_NOISE_DB)
@@ -475,7 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        require_command("ffmpeg")
+        resolve_ffmpeg_bin(args.ffmpeg_bin)
         require_command("ffprobe")
         if args.transcript and len(args.videos) > 1:
             raise RuntimeError("--transcript can only be used with one video. Use --transcript-dir for batches.")

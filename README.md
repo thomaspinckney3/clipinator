@@ -47,21 +47,36 @@ Put local config and API keys in `.env`:
 
 ```bash
 OPENAI_API_KEY=sk-...
+ELEVENLABS_API_KEY=...
+OPENAI_RESPONSE_CACHE_MODE=strict
+TRANSCRIBE_PROVIDER=openai
 TRANSCRIBE_MODEL=whisper-1
+TRANSCRIBE_OPENAI_MODEL=whisper-1
+TRANSCRIBE_ELEVENLABS_MODEL=scribe_v2
 TRANSCRIBE_LANGUAGE=en
 TRANSCRIBE_OUTPUT_DIR=/Volumes/t9/extract/transcripts
 TRANSCRIBE_PROMPT=NASA general-audience video about Artemis, astronauts, moon rocks, space exploration, scientific instruments, and training.
 TRANSCRIBE_AUDIO_BITRATE_KBPS=64
 TRANSCRIBE_MAX_UPLOAD_MB=24
 TRANSCRIBE_WHISPER_1_USD_PER_MINUTE=0.006
+TRANSCRIBE_ELEVENLABS_USD_PER_HOUR=0.40
 TRANSCRIBE_CHUNK_SECONDS=
 ```
 
 `.env` is ignored by git. `.env.example` is the shareable template.
 
-## Transcribe With OpenAI Whisper
+## Transcribe With OpenAI Whisper Or ElevenLabs Scribe
 
-The first transcription backend uses OpenAI `whisper-1` because it supports `verbose_json` with word and segment timestamps. The CLI extracts compressed mono MP3 chunks from each video, keeps chunks below the upload limit, transcribes them, offsets timestamps back to the full video timeline, and writes normalized JSON plus SRT.
+The default transcription backend uses OpenAI `whisper-1` because it supports
+`verbose_json` with word and segment timestamps. The CLI extracts compressed
+mono MP3 chunks from each video, keeps chunks below the upload limit,
+transcribes them, offsets timestamps back to the full video timeline, and writes
+normalized JSON plus SRT.
+
+ElevenLabs Scribe is available with `--provider elevenlabs`. It uses the same
+audio-only upload path: the source video is never uploaded directly, only the
+extracted MP3 chunks. Scribe word timestamps are normalized into the same JSON
+contract used by downstream clip selection.
 
 Dry-run the downloaded NASA videos:
 
@@ -84,6 +99,14 @@ PYTHONPATH=src python -m extractor.transcribe /Volumes/t9/extract/*.mp4 \
   --approve-api-cost 0.20
 ```
 
+Run the same transcription step with ElevenLabs Scribe:
+
+```bash
+PYTHONPATH=src python -m extractor.transcribe /Volumes/t9/extract/*.mp4 \
+  --provider elevenlabs \
+  --approve-api-cost 0.20
+```
+
 The CLI refuses non-dry-run API calls unless `--approve-api-cost` is provided.
 Use the estimate first, then pass a cap at or above that estimate.
 
@@ -93,6 +116,14 @@ Expected outputs per input video:
 <video-stem>.whisper-1.json
 <video-stem>.whisper-1.srt
 raw/<video-stem>.chunk-000.whisper-1.json
+```
+
+ElevenLabs outputs include the provider in the filename:
+
+```text
+<video-stem>.elevenlabs-scribe_v2.json
+<video-stem>.elevenlabs-scribe_v2.srt
+raw/<video-stem>.elevenlabs-scribe_v2.chunk-000.json
 ```
 
 The normalized JSON is the stable downstream contract for clip selection.
@@ -122,6 +153,18 @@ The manifest includes media metadata, sampled frame references, scene-change
 timestamps, silence regions, transcript QA summary, and guidance for building a
 stable prompt-cache prefix.
 
+Preprocessing samples evidence frames every `1s` by default. Frames are
+downscaled to `480px` wide, and the overview contact sheet uses smaller `180px`
+cells with 12 columns, so 4K source videos do not produce 4K prompt images. The
+preprocessor also writes labeled 60-second window sheets in `sheets/window-*.jpg`;
+each cell is stamped with `frame_index timecode`, and the manifest maps every
+cell back to the source timestamp.
+
+`--ffmpeg-bin auto` prefers `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` when it
+exists so the sheet generator can use `drawtext`. On macOS,
+`--ffmpeg-hwaccel auto` uses VideoToolbox hardware decode when the selected
+ffmpeg binary supports it.
+
 ## Self-Contained Pipeline
 
 For system tests, use the single-entry pipeline rather than manually assembling
@@ -131,10 +174,24 @@ intermediate artifacts. The only required input is the video file:
 extract-clips /path/to/video.mp4 --approve-api-cost 25.00
 ```
 
-The wrapper creates a run directory next to the input video and runs:
+Use ElevenLabs for the transcription stage and OpenAI for later planning stages:
+
+```bash
+extract-clips /path/to/video.mp4 \
+  --transcribe-provider elevenlabs \
+  --approve-api-cost 25.00
+```
+
+The wrapper creates one artifact directory per input file, next to the source
+video and named after the input file stem. That directory holds transcripts,
+local evidence, visual indexes, renders, OpenAI run outputs, and the local
+response cache at `openai-runs/_response-cache`. Re-running the same input
+resumes from that directory unless `--force` or a distinct `--run-id` is used.
+
+It runs:
 
 ```text
-video -> whisper-1 transcript -> local evidence -> stage 1 -> stage 2
+video -> provider transcript -> local evidence -> stage 1 -> stage 2
 -> dense visual index from stage 2 candidates -> stage 3 -> render
 -> stage 4 critique -> stage 5 re-edit -> final render
 ```
@@ -143,6 +200,25 @@ It performs a dry-run cost estimate before each API stage and spends from the
 single `--approve-api-cost` cap. If the cap is omitted, the pipeline stops before
 the first uncached API call and prints the required estimate. Local response
 caches are still honored by the individual OpenAI stage commands.
+
+`--frame-interval-seconds` controls both preprocessing evidence frames and the
+dense visual index. By default the pipeline samples local frames every `1s`,
+stores downscaled frame JPEGs at `480px` wide, and builds the preprocessing
+overview contact sheet with `180px` cells. The pipeline also forwards
+`--ffmpeg-bin auto` and `--ffmpeg-hwaccel auto` into local frame extraction,
+visual indexing, and rendering, which resolves to ffmpeg-full plus VideoToolbox
+on supported Macs.
+
+OpenAI stage cache keys include a hash of the LLM query inputs and, by default,
+hashes of the stage source files that produced and parse that query. Set
+`OPENAI_RESPONSE_CACHE_MODE=query-only` or pass `--cache-mode query-only` to reuse
+a response when the query is unchanged but stage code has moved on.
+
+If an input MP4 is truncated, the pipeline keeps the decodable prefix instead of
+failing or planning against misleading container metadata. Audio extraction
+records the actual extracted duration, preprocessing records both container and
+effective decoded duration, and downstream OpenAI stages receive a transcript
+clipped to the usable video duration.
 
 ## Dense Visual Indexing
 

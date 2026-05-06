@@ -12,7 +12,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from extractor.preprocess_video import format_time
+from extractor.preprocess_video import (
+    DEFAULT_FFMPEG_BIN,
+    DEFAULT_FFMPEG_HWACCEL,
+    FFMPEG_HWACCEL_CHOICES,
+    ffmpeg_hwaccel_input_args,
+    format_time,
+    resolve_ffmpeg_bin,
+    resolve_ffmpeg_hwaccel,
+)
 
 
 DEFAULT_OUTPUT_DIR = Path("visual-index")
@@ -98,12 +106,32 @@ def fps_expression(frame_interval_seconds: float) -> str:
     return f"{fps:.6f}"
 
 
+def frames_available_duration(
+    frames: list[IndexedFrame],
+    frame_interval_seconds: float,
+    container_duration: float,
+) -> tuple[float, bool]:
+    if not frames:
+        return 0.0, container_duration > 0
+    decoded_duration = frames[-1].timestamp + frame_interval_seconds
+    if container_duration > 0:
+        decoded_duration = min(container_duration, decoded_duration)
+    tolerance = max(2.0, frame_interval_seconds * 2)
+    truncated = container_duration - decoded_duration > tolerance
+    return (
+        round(decoded_duration if truncated else container_duration, 3),
+        truncated,
+    )
+
+
 def extract_frames(
     video_path: Path,
     frames_dir: Path,
     duration: float,
     frame_interval_seconds: float,
     frame_width: int,
+    ffmpeg_bin: str,
+    ffmpeg_hwaccel: str | None,
     force: bool,
 ) -> list[IndexedFrame]:
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -114,13 +142,14 @@ def extract_frames(
         existing_frames = []
 
     if not existing_frames:
-        run_command(
+        result = subprocess.run(
             [
-                "ffmpeg",
+                ffmpeg_bin,
                 "-y",
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                *ffmpeg_hwaccel_input_args(ffmpeg_hwaccel),
                 "-i",
                 str(video_path),
                 "-vf",
@@ -134,8 +163,20 @@ def extract_frames(
                 "-start_number",
                 "0",
                 str(frames_dir / "frame-%06d.jpg"),
-            ]
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        frame_paths = sorted(frames_dir.glob("frame-*.jpg"))
+        if result.returncode != 0 and not frame_paths:
+            raise RuntimeError(result.stderr.strip() or "ffmpeg failed to extract frames")
+        if result.returncode != 0:
+            print(
+                "warning: ffmpeg returned an error during frame extraction; "
+                "continuing with decoded frames."
+            )
 
     frame_paths = sorted(frames_dir.glob("frame-*.jpg"))
     frames: list[IndexedFrame] = []
@@ -384,14 +425,23 @@ def build_visual_index(args: argparse.Namespace) -> dict[str, Any]:
     frames_dir = video_root / "frames"
     sheets_dir = video_root / "sheets"
     sheets_dir.mkdir(parents=True, exist_ok=True)
-    duration = ffprobe_duration(video_path)
+    container_duration = ffprobe_duration(video_path)
+    ffmpeg_bin = resolve_ffmpeg_bin(args.ffmpeg_bin)
+    resolved_hwaccel = resolve_ffmpeg_hwaccel(args.ffmpeg_hwaccel, ffmpeg_bin) or "none"
     frames = extract_frames(
         video_path=video_path,
         frames_dir=frames_dir,
-        duration=duration,
+        duration=container_duration,
         frame_interval_seconds=args.frame_interval_seconds,
         frame_width=args.frame_width,
+        ffmpeg_bin=ffmpeg_bin,
+        ffmpeg_hwaccel=resolved_hwaccel,
         force=args.force,
+    )
+    duration, truncated = frames_available_duration(
+        frames=frames,
+        frame_interval_seconds=args.frame_interval_seconds,
+        container_duration=container_duration,
     )
     periodic_sheets = create_periodic_sheets(
         frames=frames,
@@ -419,10 +469,15 @@ def build_visual_index(args: argparse.Namespace) -> dict[str, Any]:
             "filename": video_path.name,
             "stem": safe_name(video_path.stem),
             "duration_seconds": round(duration, 3),
+            "effective_duration_seconds": round(duration, 3),
+            "container_duration_seconds": round(container_duration, 3),
+            "truncated": truncated,
             "display_duration": format_time(duration),
         },
         "frame_interval_seconds": args.frame_interval_seconds,
         "frame_width": args.frame_width,
+        "ffmpeg_bin": ffmpeg_bin,
+        "ffmpeg_hwaccel": resolved_hwaccel,
         "frame_count": len(frames),
         "frames_dir": relative_to_root(frames_dir, output_root),
         "frames": [frame.to_dict(output_root) for frame in frames],
@@ -449,6 +504,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage2-output", type=Path, default=None)
     parser.add_argument("--frame-interval-seconds", type=float, default=DEFAULT_FRAME_INTERVAL_SECONDS)
     parser.add_argument("--frame-width", type=int, default=DEFAULT_FRAME_WIDTH)
+    parser.add_argument(
+        "--ffmpeg-bin",
+        default=DEFAULT_FFMPEG_BIN,
+        help=(
+            "ffmpeg executable. Use auto to prefer "
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg when present."
+        ),
+    )
+    parser.add_argument(
+        "--ffmpeg-hwaccel",
+        choices=FFMPEG_HWACCEL_CHOICES,
+        default=DEFAULT_FFMPEG_HWACCEL,
+        help="Hardware decode mode for frame extraction.",
+    )
     parser.add_argument("--sheet-seconds", type=float, default=DEFAULT_SHEET_SECONDS)
     parser.add_argument("--sheet-columns", type=int, default=DEFAULT_SHEET_COLUMNS)
     parser.add_argument("--candidate-pad-seconds", type=float, default=DEFAULT_CANDIDATE_PAD_SECONDS)
@@ -462,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        require_command("ffmpeg")
+        resolve_ffmpeg_bin(args.ffmpeg_bin)
         require_command("ffprobe")
         manifest = build_visual_index(args)
         print(manifest["video"]["filename"])

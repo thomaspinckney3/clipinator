@@ -12,13 +12,33 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from extractor.preprocess_video import safe_stem
-from extractor.transcribe import load_env_file
+from extractor import stage_cache
+from extractor.preprocess_video import (
+    DEFAULT_FFMPEG_BIN,
+    DEFAULT_FFMPEG_HWACCEL,
+    DEFAULT_WINDOW_SHEET_COLUMNS,
+    DEFAULT_WINDOW_SHEET_FRAME_WIDTH,
+    DEFAULT_WINDOW_SHEET_SECONDS,
+    FFMPEG_HWACCEL_CHOICES,
+    resolve_ffmpeg_bin,
+    resolve_ffmpeg_hwaccel,
+    safe_stem,
+)
+from extractor.transcribe import (
+    TRANSCRIBE_PROVIDER_CHOICES,
+    load_env_file,
+    resolve_transcribe_model,
+    resolve_transcribe_provider,
+    transcript_file_stem,
+    write_srt,
+)
 
 
 DEFAULT_ENV_FILE = Path(".env")
-DEFAULT_TRANSCRIBE_MODEL = "whisper-1"
 DEFAULT_FRAME_INTERVAL_SECONDS = 1.0
+DEFAULT_FRAME_WIDTH = 480
+DEFAULT_CONTACT_SHEET_FRAME_WIDTH = 180
+DEFAULT_CONTACT_SHEET_COLUMNS = 12
 
 
 @dataclass
@@ -80,6 +100,8 @@ class PipelinePaths:
     run_root: Path
     stem: str
     run_id_base: str
+    transcribe_provider: str
+    transcribe_model: str
 
     @property
     def transcript_dir(self) -> Path:
@@ -87,7 +109,21 @@ class PipelinePaths:
 
     @property
     def transcript_json(self) -> Path:
-        return self.transcript_dir / f"{self.stem}.{DEFAULT_TRANSCRIBE_MODEL}.json"
+        stem = transcript_file_stem(
+            self.stem,
+            self.transcribe_provider,
+            self.transcribe_model,
+        )
+        return self.transcript_dir / f"{stem}.json"
+
+    @property
+    def available_transcript_json(self) -> Path:
+        stem = transcript_file_stem(
+            self.stem,
+            self.transcribe_provider,
+            self.transcribe_model,
+        )
+        return self.transcript_dir / f"{stem}.available.json"
 
     @property
     def video_evidence_dir(self) -> Path:
@@ -104,6 +140,10 @@ class PipelinePaths:
     @property
     def openai_runs_dir(self) -> Path:
         return self.run_root / "openai-runs"
+
+    @property
+    def response_cache_dir(self) -> Path:
+        return self.openai_runs_dir / "_response-cache"
 
     @property
     def visual_index_dir(self) -> Path:
@@ -178,8 +218,13 @@ def utc_timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def default_run_root(video: Path, timestamp: str) -> Path:
-    return video.parent / f"full-pipeline-{safe_stem(video)}-{timestamp}"
+def safe_run_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    return cleaned.strip(".-") or "run"
+
+
+def default_run_root(video: Path) -> Path:
+    return video.parent / safe_stem(video)
 
 
 def command_text(args: list[str]) -> str:
@@ -248,6 +293,14 @@ def approved_cap_for_stage(estimate_usd: float) -> str:
     return f"{estimate_usd + 0.01:.6f}"
 
 
+def cache_mode_args(args: argparse.Namespace) -> list[str]:
+    return ["--cache-mode", args.cache_mode] if args.cache_mode else []
+
+
+def response_cache_args(paths: PipelinePaths) -> list[str]:
+    return ["--cache-dir", str(paths.response_cache_dir)]
+
+
 def run_api_step(
     state: PipelineState,
     label: str,
@@ -300,8 +353,10 @@ def run_transcription(state: PipelineState, paths: PipelinePaths, args: argparse
         str(args.env_file),
         "--output-dir",
         str(paths.transcript_dir),
+        "--provider",
+        paths.transcribe_provider,
         "--model",
-        DEFAULT_TRANSCRIBE_MODEL,
+        paths.transcribe_model,
     ]
     actual_base = [*base, *(["--force"] if args.force else [])]
     estimate = run_command("transcribe estimate", [*base, "--estimate-cost"], capture=True)
@@ -326,6 +381,86 @@ def run_local_step(label: str, command: list[str], expected_output: Path, force:
     ensure_file(expected_output, label)
 
 
+def paths_match(left: str | None, right: Path) -> bool:
+    if not left:
+        return False
+    try:
+        return Path(left).expanduser().resolve() == right.expanduser().resolve()
+    except (OSError, TypeError):
+        return False
+
+
+def numbers_match(left: Any, right: float, tolerance: float = 0.000001) -> bool:
+    try:
+        return abs(float(left) - right) <= tolerance
+    except (TypeError, ValueError):
+        return False
+
+
+def manifest_sheet_paths_exist(manifest_path: Path, manifest: dict[str, Any]) -> bool:
+    root = manifest_path.parent.parent
+    for collection_name in ("periodic_sheets", "candidate_sheets"):
+        for sheet in manifest.get(collection_name, []) or []:
+            sheet_path = sheet.get("path") if isinstance(sheet, dict) else None
+            if not sheet_path:
+                continue
+            path = Path(str(sheet_path))
+            if not path.is_absolute():
+                path = root / path
+            if not path.exists():
+                return False
+    return True
+
+
+def visual_index_rebuild_decision(
+    paths: PipelinePaths,
+    args: argparse.Namespace,
+) -> tuple[bool, bool, str | None]:
+    """Return (rebuild, force_frame_extraction, reason)."""
+    if args.force:
+        return True, True, "--force requested"
+
+    manifest_path = paths.visual_index_manifest
+    if not manifest_path.exists():
+        return True, True, "missing visual-index manifest"
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True, True, "invalid visual-index manifest"
+
+    video_info = manifest.get("video", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(video_info, dict) or not paths_match(video_info.get("path"), paths.video):
+        return True, True, "source video changed"
+
+    if not paths_match(manifest.get("stage2_output"), paths.stage2_output):
+        return True, False, "stage2 output path changed"
+
+    if not numbers_match(manifest.get("frame_interval_seconds"), args.frame_interval_seconds):
+        return True, True, "frame interval changed"
+
+    if not numbers_match(manifest.get("frame_width"), float(args.frame_width)):
+        return True, True, "frame width changed"
+
+    resolved_ffmpeg_bin = resolve_ffmpeg_bin(args.ffmpeg_bin)
+    resolved_hwaccel = resolve_ffmpeg_hwaccel(args.ffmpeg_hwaccel, resolved_ffmpeg_bin) or "none"
+    if manifest.get("ffmpeg_bin") != resolved_ffmpeg_bin:
+        return True, True, "ffmpeg binary changed"
+    if manifest.get("ffmpeg_hwaccel") != resolved_hwaccel:
+        return True, True, "ffmpeg hardware decode changed"
+
+    manifest_mtime = manifest_path.stat().st_mtime
+    if paths.video.stat().st_mtime > manifest_mtime + 1.0:
+        return True, True, "source video is newer than visual-index manifest"
+    if paths.stage2_output.stat().st_mtime > manifest_mtime + 1.0:
+        return True, False, "stage2 output is newer than visual-index manifest"
+
+    if not manifest_sheet_paths_exist(manifest_path, manifest):
+        return True, False, "visual-index sheet image is missing"
+
+    return False, False, None
+
+
 def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -333,6 +468,16 @@ def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
         "video": str(paths.video),
         "run_root": str(paths.run_root),
         "transcript": str(paths.transcript_json),
+        "available_transcript": (
+            str(paths.available_transcript_json)
+            if paths.available_transcript_json.exists()
+            else None
+        ),
+        "response_cache_dir": str(paths.response_cache_dir),
+        "transcription": {
+            "provider": paths.transcribe_provider,
+            "model": paths.transcribe_model,
+        },
         "video_evidence_manifest": str(paths.evidence_manifest),
         "visual_index_manifest": str(paths.visual_index_manifest),
         "stage_outputs": {
@@ -392,20 +537,129 @@ def archive_incomplete_stage_dir(expected_output: Path) -> None:
     print(f"Archived incomplete stage directory: {archive_dir}")
 
 
+def effective_duration_from_manifest(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    media = manifest.get("media", {}) if isinstance(manifest, dict) else {}
+    value = media.get("effective_duration_seconds") or media.get("duration_seconds")
+    if value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
+def transcript_source_duration(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    source = data.get("source", {}) if isinstance(data, dict) else {}
+    value = source.get("effective_duration_seconds") or source.get("duration_seconds")
+    if value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
+def clip_transcript_for_duration(source_path: Path, output_path: Path, duration: float) -> Path:
+    data = json.loads(source_path.read_text(encoding="utf-8"))
+    segments: list[dict[str, Any]] = []
+    for segment in data.get("segments", []) or []:
+        start = float(segment.get("start") or 0)
+        end = float(segment.get("end") or 0)
+        if start >= duration:
+            continue
+        copied = dict(segment)
+        copied["end"] = round(min(end, duration), 3)
+        if isinstance(copied.get("words"), list):
+            copied["words"] = [
+                dict(word)
+                for word in copied["words"]
+                if word.get("start") is not None
+                and word.get("end") is not None
+                and float(word["start"]) < duration
+                and float(word["end"]) <= duration + 0.05
+            ]
+        if copied["end"] > start:
+            segments.append(copied)
+
+    words: list[dict[str, Any]] = []
+    for word in data.get("words", []) or []:
+        start_value = word.get("start")
+        end_value = word.get("end")
+        if start_value is None or end_value is None:
+            continue
+        start = float(start_value)
+        end = float(end_value)
+        if start >= duration or end > duration + 0.05:
+            continue
+        words.append(dict(word))
+
+    clipped = dict(data)
+    source = dict(clipped.get("source", {}) or {})
+    original_duration = source.get("effective_duration_seconds") or source.get("duration_seconds")
+    source["original_duration_seconds"] = original_duration
+    source["duration_seconds"] = round(duration, 3)
+    source["effective_duration_seconds"] = round(duration, 3)
+    source["clipped_to_video_duration"] = True
+    clipped["source"] = source
+    clipped["segments"] = segments
+    clipped["words"] = words
+    clipped["text"] = " ".join(str(segment.get("text", "")).strip() for segment in segments).strip()
+    output_path.write_text(json.dumps(clipped, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_srt(output_path.with_suffix(".srt"), segments)
+    return output_path
+
+
+def transcript_for_api_stages(paths: PipelinePaths) -> Path:
+    effective_duration = effective_duration_from_manifest(paths.evidence_manifest)
+    source_duration = transcript_source_duration(paths.transcript_json)
+    if (
+        effective_duration is None
+        or source_duration is None
+        or source_duration <= effective_duration + 0.5
+    ):
+        return paths.transcript_json
+
+    clipped_path = paths.available_transcript_json
+    if not clipped_path.exists() or clipped_path.stat().st_mtime < paths.transcript_json.stat().st_mtime:
+        clipped_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_transcript_for_duration(paths.transcript_json, clipped_path, effective_duration)
+        print(
+            f"Clipped transcript for API stages to {effective_duration:.3f}s: "
+            f"{clipped_path}"
+        )
+    return clipped_path
+
+
 def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
     video = args.video.expanduser().resolve()
     if not video.exists():
         raise FileNotFoundError(video)
 
     load_env_file(args.env_file)
-    timestamp = args.run_id or utc_timestamp()
+    transcribe_provider = resolve_transcribe_provider(args.transcribe_provider)
+    transcribe_model = resolve_transcribe_model(transcribe_provider, args.transcribe_model)
     stem = safe_stem(video)
-    run_root = (args.output_root.expanduser().resolve() if args.output_root else default_run_root(video, timestamp))
+    run_id_base = stem if args.run_id is None else f"{stem}-{safe_run_id(args.run_id)}"
+    run_root = (
+        args.output_root.expanduser().resolve()
+        if args.output_root
+        else default_run_root(video)
+    )
     paths = PipelinePaths(
         video=video,
         run_root=run_root,
         stem=stem,
-        run_id_base=f"{stem}-{timestamp}",
+        run_id_base=run_id_base,
+        transcribe_provider=transcribe_provider,
+        transcribe_model=transcribe_model,
     )
     paths.run_root.mkdir(parents=True, exist_ok=True)
     state = load_pipeline_state(paths, approved_cap_usd=args.approve_api_cost)
@@ -422,18 +676,37 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
                 str(paths.transcript_json),
                 "--output-dir",
                 str(paths.video_evidence_dir),
+                "--frame-interval-seconds",
+                str(args.frame_interval_seconds),
+                "--frame-width",
+                str(args.frame_width),
+                "--contact-sheet-frame-width",
+                str(args.contact_sheet_frame_width),
+                "--contact-sheet-columns",
+                str(args.contact_sheet_columns),
+                "--window-sheet-seconds",
+                str(args.window_sheet_seconds),
+                "--window-sheet-frame-width",
+                str(args.window_sheet_frame_width),
+                "--window-sheet-columns",
+                str(args.window_sheet_columns),
+                "--ffmpeg-bin",
+                args.ffmpeg_bin,
+                "--ffmpeg-hwaccel",
+                args.ffmpeg_hwaccel,
                 "--write-markdown",
             ],
             paths.evidence_manifest,
             force=args.force,
         )
+        stage_transcript = transcript_for_api_stages(paths)
 
         stage1 = [
             *python_module("extractor.openai_stage1"),
             "--env-file",
             str(args.env_file),
             "--transcript",
-            str(paths.transcript_json),
+            str(stage_transcript),
             "--manifest",
             str(paths.evidence_manifest),
             "--contact-sheet",
@@ -442,6 +715,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.openai_runs_dir),
             "--run-id",
             paths.stage1_run_id,
+            *response_cache_args(paths),
+            *cache_mode_args(args),
         ]
         run_api_step(state, "stage1", stage1, stage1, paths.stage1_output)
 
@@ -450,7 +725,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             "--env-file",
             str(args.env_file),
             "--transcript",
-            str(paths.transcript_json),
+            str(stage_transcript),
             "--manifest",
             str(paths.evidence_manifest),
             "--contact-sheet",
@@ -463,25 +738,42 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             paths.stage2_run_id,
             "--max-output-tokens",
             "24000",
+            *response_cache_args(paths),
+            *cache_mode_args(args),
         ]
         run_api_step(state, "stage2", stage2, stage2, paths.stage2_output)
 
+        visual_index_command = [
+            *python_module("extractor.visual_index"),
+            str(paths.video),
+            "--output-dir",
+            str(paths.visual_index_dir),
+            "--stage2-output",
+            str(paths.stage2_output),
+            "--frame-interval-seconds",
+            str(args.frame_interval_seconds),
+            "--frame-width",
+            str(args.frame_width),
+            "--ffmpeg-bin",
+            args.ffmpeg_bin,
+            "--ffmpeg-hwaccel",
+            args.ffmpeg_hwaccel,
+            "--write-markdown",
+        ]
+        rebuild_visual_index, force_visual_index_frames, rebuild_reason = visual_index_rebuild_decision(
+            paths,
+            args,
+        )
+        if force_visual_index_frames:
+            visual_index_command.append("--force")
+        if rebuild_reason:
+            print(f"\n== visual-index ==")
+            print(f"Rebuilding visual index: {rebuild_reason}")
         run_local_step(
             "visual-index",
-            [
-                *python_module("extractor.visual_index"),
-                str(paths.video),
-                "--output-dir",
-                str(paths.visual_index_dir),
-                "--stage2-output",
-                str(paths.stage2_output),
-                "--frame-interval-seconds",
-                str(args.frame_interval_seconds),
-                "--write-markdown",
-                "--force",
-            ],
+            visual_index_command,
             paths.visual_index_manifest,
-            force=True,
+            force=rebuild_visual_index,
         )
 
         stage3 = [
@@ -489,7 +781,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             "--env-file",
             str(args.env_file),
             "--transcript",
-            str(paths.transcript_json),
+            str(stage_transcript),
             "--manifest",
             str(paths.evidence_manifest),
             "--contact-sheet",
@@ -504,6 +796,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.openai_runs_dir),
             "--run-id",
             paths.stage3_run_id,
+            *response_cache_args(paths),
+            *cache_mode_args(args),
         ]
         run_api_step(state, "stage3", stage3, stage3, paths.stage3_output)
 
@@ -518,6 +812,10 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
                 "--output-dir",
                 str(paths.stage3_render_dir),
                 "--use-plan-render-settings",
+                "--ffmpeg-bin",
+                args.ffmpeg_bin,
+                "--ffmpeg-hwaccel",
+                args.ffmpeg_hwaccel,
             ],
             paths.stage3_render_manifest,
             force=args.force,
@@ -537,6 +835,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.openai_runs_dir / "_stage4-review-assets" / paths.stage4_run_id),
             "--run-id",
             paths.stage4_run_id,
+            *response_cache_args(paths),
+            *cache_mode_args(args),
         ]
         run_api_step(state, "stage4", stage4, stage4, paths.stage4_output)
 
@@ -545,7 +845,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             "--env-file",
             str(args.env_file),
             "--transcript",
-            str(paths.transcript_json),
+            str(stage_transcript),
             "--manifest",
             str(paths.evidence_manifest),
             "--contact-sheet",
@@ -562,6 +862,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.openai_runs_dir),
             "--run-id",
             paths.stage5_run_id,
+            *response_cache_args(paths),
+            *cache_mode_args(args),
         ]
         run_api_step(state, "stage5", stage5, stage5, paths.stage5_stage3_output)
 
@@ -576,6 +878,10 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
                 "--output-dir",
                 str(paths.final_render_dir),
                 "--use-plan-render-settings",
+                "--ffmpeg-bin",
+                args.ffmpeg_bin,
+                "--ffmpeg-hwaccel",
+                args.ffmpeg_hwaccel,
             ],
             paths.final_render_manifest,
             force=args.force,
@@ -600,12 +906,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=Path,
         default=None,
-        help="Optional run directory. Defaults next to the input video.",
+        help=(
+            "Optional run directory. Defaults to one directory beside the input "
+            "video, named after the input file stem."
+        ),
     )
     parser.add_argument(
         "--run-id",
         default=None,
-        help="Optional stable run id suffix. Defaults to a UTC timestamp.",
+        help="Optional stable run id suffix for named variants. Defaults to per-file stage dirs.",
     )
     parser.add_argument(
         "--approve-api-cost",
@@ -615,10 +924,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit total approval cap for all API calls made by this pipeline run.",
     )
     parser.add_argument(
+        "--cache-mode",
+        choices=stage_cache.CACHE_MODE_CHOICES,
+        default=None,
+        help=(
+            "Forward a local response cache identity mode to OpenAI stages. "
+            "Defaults to each stage's env setting when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--transcribe-provider",
+        choices=TRANSCRIBE_PROVIDER_CHOICES,
+        default=None,
+        help="Transcription provider for the first pipeline stage.",
+    )
+    parser.add_argument(
+        "--transcribe-model",
+        default=None,
+        help="Override the transcription model for the selected provider.",
+    )
+    parser.add_argument(
         "--frame-interval-seconds",
         type=float,
         default=DEFAULT_FRAME_INTERVAL_SECONDS,
-        help="Dense visual-index frame interval.",
+        help="Seconds between sampled local evidence and visual-index frames.",
+    )
+    parser.add_argument(
+        "--frame-width",
+        type=int,
+        default=DEFAULT_FRAME_WIDTH,
+        help="Downscaled sampled frame width in pixels.",
+    )
+    parser.add_argument(
+        "--contact-sheet-frame-width",
+        type=int,
+        default=DEFAULT_CONTACT_SHEET_FRAME_WIDTH,
+        help="Downscaled width for each preprocessing contact-sheet cell.",
+    )
+    parser.add_argument(
+        "--contact-sheet-columns",
+        type=int,
+        default=DEFAULT_CONTACT_SHEET_COLUMNS,
+        help="Number of columns in the preprocessing overview contact sheet.",
+    )
+    parser.add_argument(
+        "--window-sheet-seconds",
+        type=float,
+        default=DEFAULT_WINDOW_SHEET_SECONDS,
+        help="Seconds covered by each labeled preprocessing window sheet.",
+    )
+    parser.add_argument(
+        "--window-sheet-frame-width",
+        type=int,
+        default=DEFAULT_WINDOW_SHEET_FRAME_WIDTH,
+        help="Downscaled width for each cell in labeled preprocessing window sheets.",
+    )
+    parser.add_argument(
+        "--window-sheet-columns",
+        type=int,
+        default=DEFAULT_WINDOW_SHEET_COLUMNS,
+        help="Number of columns in labeled preprocessing window sheets.",
+    )
+    parser.add_argument(
+        "--ffmpeg-bin",
+        default=DEFAULT_FFMPEG_BIN,
+        help=(
+            "ffmpeg executable. Use auto to prefer "
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg when present."
+        ),
+    )
+    parser.add_argument(
+        "--ffmpeg-hwaccel",
+        choices=FFMPEG_HWACCEL_CHOICES,
+        default=DEFAULT_FFMPEG_HWACCEL,
+        help="Hardware decode mode for local video frame extraction and rendering.",
     )
     parser.add_argument("--force", action="store_true", help="Regenerate local artifacts.")
     return parser

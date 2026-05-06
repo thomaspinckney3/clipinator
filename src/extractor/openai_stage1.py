@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from extractor import stage_cache
 from extractor.preprocess_video import format_time
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
@@ -436,29 +437,40 @@ def request_fingerprint_payload(
 
 
 def request_cache_key(fingerprint_payload: dict[str, Any]) -> str:
-    return sha256_text(stable_json(fingerprint_payload))
+    return stage_cache.request_cache_key(fingerprint_payload)
 
 
 def cache_entry_dir(cache_dir: Path, cache_key: str) -> Path:
-    return cache_dir / cache_key[:2] / cache_key
+    return stage_cache.cache_entry_dir(cache_dir, cache_key)
 
 
 def cache_entry_exists(entry_dir: Path) -> bool:
-    return (entry_dir / "raw-response.json").exists()
+    return stage_cache.cache_entry_exists(entry_dir)
+
+
+def cache_source_files() -> list[Path]:
+    root = Path(__file__).resolve().parent
+    return [
+        Path(__file__).resolve(),
+        root / "stage_cache.py",
+        root / "preprocess_video.py",
+        root / "transcribe.py",
+    ]
 
 
 def cache_manifest_payload(
     cache_key: str,
     fingerprint_payload: dict[str, Any],
     source: str,
+    cache_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "created_at": datetime.now(UTC).isoformat(),
-        "cache_key": cache_key,
-        "source": source,
-        "fingerprint_payload": fingerprint_payload,
-    }
+    return stage_cache.cache_manifest_payload(
+        cache_key=cache_key,
+        query_fingerprint_payload=fingerprint_payload,
+        source=source,
+        cache_identity=cache_identity,
+        created_at=datetime.now(UTC).isoformat(),
+    )
 
 
 def write_cache_entry(
@@ -470,9 +482,13 @@ def write_cache_entry(
     parsed_output: dict[str, Any],
     usage_and_cost: dict[str, Any],
     source: str,
+    cache_identity: dict[str, Any] | None = None,
 ) -> None:
     entry_dir.mkdir(parents=True, exist_ok=True)
-    write_json(entry_dir / "cache-manifest.json", cache_manifest_payload(cache_key, fingerprint_payload, source))
+    write_json(
+        entry_dir / "cache-manifest.json",
+        cache_manifest_payload(cache_key, fingerprint_payload, source, cache_identity),
+    )
     write_json(entry_dir / "raw-response.json", response_dict)
     (entry_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
     write_json(entry_dir / "stage1-output.json", parsed_output)
@@ -526,6 +542,7 @@ def seed_cache_from_run(
     cache_key: str,
     fingerprint_payload: dict[str, Any],
     pricing: Pricing,
+    cache_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not source_run_dir.exists():
         raise FileNotFoundError(source_run_dir)
@@ -605,6 +622,7 @@ def seed_cache_from_run(
         parsed_output=parsed_output,
         usage_and_cost=usage_and_cost,
         source=f"seeded_from_run:{source_run_dir}",
+        cache_identity=cache_identity,
     )
     return usage_and_cost
 
@@ -766,15 +784,24 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
         task_prompt=task_prompt,
         contact_sheet_hash=contact_sheet_hash,
     )
-    local_cache_key = request_cache_key(fingerprint_payload)
-    cache_dir = None if args.no_local_cache else args.cache_dir.expanduser().resolve()
+    cache_mode = "off" if args.no_local_cache else args.cache_mode
+    cache_identity = stage_cache.build_cache_identity(
+        query_fingerprint_payload=fingerprint_payload,
+        source_files=cache_source_files(),
+        cache_mode=cache_mode,
+    )
+    local_cache_key = cache_identity["cache_key"]
+    cache_dir = None if cache_identity["mode"] == "off" else args.cache_dir.expanduser().resolve()
     entry_dir = cache_entry_dir(cache_dir, local_cache_key) if cache_dir else None
     cache_hit = bool(entry_dir and cache_entry_exists(entry_dir) and not args.refresh_cache)
     if cache_dir:
+        print(f"  local response cache mode: {cache_identity['mode']}")
         print(f"  local response cache key: {local_cache_key}")
+        print(f"  query hash: {cache_identity['query_hash']}")
+        print(f"  implementation hash: {cache_identity['implementation_hash']}")
         print(f"  local response cache: {'hit' if cache_hit else 'miss'}")
     else:
-        print("  local response cache: disabled")
+        print(f"  local response cache: disabled ({cache_identity['mode']})")
 
     if args.dry_run:
         return {
@@ -782,10 +809,12 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             "source_materials_sha256": sha256_text(source_materials),
             "task_prompt_sha256": sha256_text(task_prompt),
             "local_response_cache": {
-                "enabled": cache_dir is not None,
-                "hit": cache_hit,
-                "key": local_cache_key if cache_dir else None,
-                "entry_dir": str(entry_dir) if entry_dir else None,
+                **stage_cache.response_cache_status_payload(
+                    enabled=cache_dir is not None,
+                    hit=cache_hit,
+                    cache_identity=cache_identity,
+                    entry_dir=entry_dir,
+                ),
             },
         }
     if args.seed_cache_from_run:
@@ -797,6 +826,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             cache_key=local_cache_key,
             fingerprint_payload=fingerprint_payload,
             pricing=pricing,
+            cache_identity=cache_identity,
         )
         print(f"Seeded local response cache from {args.seed_cache_from_run}")
         print(f"  cache entry: {entry_dir}")
@@ -807,6 +837,9 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
                 "seeded": True,
                 "key": local_cache_key,
                 "entry_dir": str(entry_dir),
+                "mode": cache_identity["mode"],
+                "query_hash": cache_identity["query_hash"],
+                "implementation_hash": cache_identity["implementation_hash"],
             },
             "usage_and_cost": seeded,
         }
@@ -864,9 +897,14 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
                 "enabled": cache_dir is not None,
                 "hit": cache_hit,
                 "refresh_requested": args.refresh_cache,
+                "mode": cache_identity["mode"],
                 "cache_key": local_cache_key if cache_dir else None,
                 "entry_dir": str(entry_dir) if entry_dir else None,
-                "fingerprint_payload": fingerprint_payload if cache_dir else None,
+                "query_hash": cache_identity["query_hash"],
+                "implementation_hash": cache_identity["implementation_hash"],
+                "source_files": cache_identity["source_files"],
+                "query_fingerprint_payload": fingerprint_payload if cache_dir else None,
+                "cache_identity": cache_identity if cache_dir else None,
             },
         },
     )
@@ -890,6 +928,9 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
                 "hit": True,
                 "key": local_cache_key,
                 "entry_dir": str(entry_dir),
+                "mode": cache_identity["mode"],
+                "query_hash": cache_identity["query_hash"],
+                "implementation_hash": cache_identity["implementation_hash"],
             },
             "usage": {},
             "cost": zero_cost,
@@ -905,6 +946,9 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             "hit": True,
             "key": local_cache_key,
             "entry_dir": str(entry_dir),
+            "mode": cache_identity["mode"],
+            "query_hash": cache_identity["query_hash"],
+            "implementation_hash": cache_identity["implementation_hash"],
             "original_cost": original_cost,
         }
         write_response_artifacts(
@@ -984,6 +1028,9 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             "stored": entry_dir is not None,
             "key": local_cache_key if entry_dir else None,
             "entry_dir": str(entry_dir) if entry_dir else None,
+            "mode": cache_identity["mode"],
+            "query_hash": cache_identity["query_hash"],
+            "implementation_hash": cache_identity["implementation_hash"],
         },
         "usage": usage,
         "cost": cost,
@@ -997,6 +1044,9 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
         "hit": False,
         "key": local_cache_key if entry_dir else None,
         "entry_dir": str(entry_dir) if entry_dir else None,
+        "mode": cache_identity["mode"],
+        "query_hash": cache_identity["query_hash"],
+        "implementation_hash": cache_identity["implementation_hash"],
     }
     write_response_artifacts(
         run_dir=run_dir,
@@ -1017,6 +1067,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             parsed_output=parsed_output,
             usage_and_cost=usage_and_cost,
             source=f"api_run:{run_dir}",
+            cache_identity=cache_identity,
         )
         print(f"Stored local response cache entry: {entry_dir}")
     print(
@@ -1052,6 +1103,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-token-allowance", type=int, default=None)
     parser.add_argument("--prompt-cache-key", default=None)
     parser.add_argument("--prompt-cache-retention", choices=["in_memory", "24h"], default="24h")
+    parser.add_argument(
+        "--cache-mode",
+        choices=stage_cache.CACHE_MODE_CHOICES,
+        default=None,
+        help=(
+            "Local response cache identity mode. strict includes LLM query and "
+            "stage source-file hashes; query-only ignores source-file hash drift; "
+            "off disables the local response cache."
+        ),
+    )
     parser.add_argument("--no-local-cache", action="store_true")
     parser.add_argument(
         "--refresh-cache",
@@ -1115,6 +1176,13 @@ def apply_env_defaults(args: argparse.Namespace) -> None:
             "STAGE1_OUTPUT_USD_PER_MILLION",
             DEFAULT_GPT55_OUTPUT_USD_PER_MILLION,
         )
+    if args.cache_mode is None:
+        args.cache_mode = (
+            env_value("STAGE1_CACHE_MODE")
+            or env_value("OPENAI_RESPONSE_CACHE_MODE")
+            or stage_cache.DEFAULT_CACHE_MODE
+        )
+    args.cache_mode = stage_cache.normalize_cache_mode(args.cache_mode)
 
 
 def main(argv: list[str] | None = None) -> int:

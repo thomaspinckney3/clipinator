@@ -12,6 +12,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from extractor.preprocess_video import (
+    DEFAULT_FFMPEG_BIN,
+    DEFAULT_FFMPEG_HWACCEL,
+    FFMPEG_HWACCEL_CHOICES,
+    ffmpeg_hwaccel_input_args,
+    resolve_ffmpeg_bin,
+    resolve_ffmpeg_hwaccel,
+)
+
 
 DEFAULT_OUTPUT_DIR = Path("renders")
 DEFAULT_WIDTH = 720
@@ -25,6 +34,8 @@ DEFAULT_FOREGROUND_CONTRAST = 1.0
 DEFAULT_FOREGROUND_SATURATION = 1.0
 FINAL_VIDEO_FADE_OUT_DURATION = 0.6
 MIN_TITLE_CARD_SECONDS = 4.0
+FFMPEG_BIN = "ffmpeg"
+FFMPEG_HWACCEL: str | None = None
 
 TITLE_CARD_FONT = {
     "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
@@ -100,9 +111,15 @@ def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
         raise RuntimeError(message) from exc
 
 
+def configure_ffmpeg(ffmpeg_bin: str, ffmpeg_hwaccel: str | None) -> None:
+    global FFMPEG_BIN, FFMPEG_HWACCEL
+    FFMPEG_BIN = ffmpeg_bin
+    FFMPEG_HWACCEL = None if ffmpeg_hwaccel in {None, "none"} else ffmpeg_hwaccel
+
+
 def ffmpeg_has_filter(name: str) -> bool:
     result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-filters"],
+        [FFMPEG_BIN, "-hide_banner", "-filters"],
         check=True,
         text=True,
         stdout=subprocess.PIPE,
@@ -163,7 +180,7 @@ def mux_subtitles(video_path: Path, srt_path: Path, output_path: Path) -> bool:
     try:
         run_command(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -849,7 +866,7 @@ def render_video_chunk(
 ) -> Path:
     chunk_path = clip_dir / f"segment-{segment_index:03d}.visual-{chunk_index:03d}.mp4"
     args = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -858,6 +875,7 @@ def render_video_chunk(
         f"{source_start:.3f}",
         "-t",
         f"{duration:.3f}",
+        *ffmpeg_hwaccel_input_args(FFMPEG_HWACCEL),
         "-i",
         str(source_video),
         "-filter_complex",
@@ -916,7 +934,7 @@ def render_title_card_video(
         filters.append(f"fade=t=out:st={max(0.0, duration - 0.120):.3f}:d=0.120")
     run_command(
         [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -960,7 +978,7 @@ def concat_media(paths: list[Path], output_path: Path) -> None:
     )
     run_command(
         [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -1004,7 +1022,7 @@ def concat_video_chunks_with_crossfade(
         concat_media(paths, output_path)
         return
 
-    args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    args = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"]
     for path in paths:
         args.extend(["-i", str(path)])
 
@@ -1062,7 +1080,7 @@ def render_audio_track(
 ) -> Path:
     audio_path = clip_dir / f"segment-{index:03d}.audio.m4a"
     args = [
-        "ffmpeg",
+        FFMPEG_BIN,
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -1113,7 +1131,7 @@ def render_audio_track(
 def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
     run_command(
         [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -1269,7 +1287,7 @@ def concat_segments(segment_paths: list[Path], output_path: Path, width: int, he
     if not segment_paths:
         raise RuntimeError("Cannot concatenate an empty segment list.")
 
-    args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    args = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"]
     for path in segment_paths:
         args.extend(["-i", str(path)])
 
@@ -1351,7 +1369,7 @@ def concat_segments_with_crossfade(
         concat_segments(segment_paths, output_path, width=width, height=height)
         return
 
-    args = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    args = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error"]
     for path in segment_paths:
         args.extend(["-i", str(path)])
 
@@ -1461,7 +1479,7 @@ def apply_final_video_fade_to_black(input_path: Path, output_path: Path, fade_du
     fade_start = max(0.0, duration - usable_fade)
     run_command(
         [
-            "ffmpeg",
+            FFMPEG_BIN,
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -1823,6 +1841,8 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
         "resolution": {"width": args.width, "height": args.height},
         "renderer": {
             "type": "ffmpeg_draft_renderer",
+            "ffmpeg_bin": FFMPEG_BIN,
+            "ffmpeg_hwaccel": FFMPEG_HWACCEL or "none",
             "use_plan_render_settings": args.use_plan_render_settings,
             "sidecar_captions": True,
             "notes": [
@@ -1858,6 +1878,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     parser.add_argument("--font-file", type=Path, default=DEFAULT_FONT_FILE)
+    parser.add_argument(
+        "--ffmpeg-bin",
+        default=DEFAULT_FFMPEG_BIN,
+        help=(
+            "ffmpeg executable. Use auto to prefer "
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg when present."
+        ),
+    )
+    parser.add_argument(
+        "--ffmpeg-hwaccel",
+        choices=FFMPEG_HWACCEL_CHOICES,
+        default=DEFAULT_FFMPEG_HWACCEL,
+        help="Hardware decode mode for source video rendering.",
+    )
     parser.add_argument(
         "--burn-captions",
         action="store_true",
@@ -1923,7 +1957,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        require_command("ffmpeg")
+        args.ffmpeg_bin = resolve_ffmpeg_bin(args.ffmpeg_bin)
+        args.ffmpeg_hwaccel = resolve_ffmpeg_hwaccel(
+            args.ffmpeg_hwaccel, args.ffmpeg_bin
+        ) or "none"
+        configure_ffmpeg(args.ffmpeg_bin, args.ffmpeg_hwaccel)
         require_command("ffprobe")
         manifest = render_stage3(args)
         print(f"Wrote {manifest['output_dir']}")
