@@ -10,6 +10,7 @@ from typing import Any
 
 from extractor import stage_cache
 from extractor.openai_stage1 import (
+    CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
     DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION,
@@ -37,6 +38,7 @@ from extractor.openai_stage1 import (
     write_json,
 )
 from extractor.preprocess_video import format_time
+from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
@@ -48,6 +50,10 @@ def cache_source_files() -> list[Path]:
     root = Path(__file__).resolve().parent
     return [
         Path(__file__).resolve(),
+        root / "prompt_templates.py",
+        prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
+        prompt_template_path("stage2_ad.md"),
+        prompt_template_path("stage2_excerpt.md"),
         root / "stage_cache.py",
         root / "openai_stage1.py",
         root / "preprocess_video.py",
@@ -55,18 +61,18 @@ def cache_source_files() -> list[Path]:
     ]
 
 
-DEVELOPER_INSTRUCTIONS = (
-    "You are a senior short-form educational video strategist and transcript editor. "
-    "Find concrete, timestamp-grounded clip candidates that could advertise the full video. "
-    "Be strict about evidence, transcript QA risks, and audio/video alignment. Return only "
-    "valid JSON for the requested schema."
-)
+DEVELOPER_PROMPT_TEMPLATE = "stage2_developer.md"
+
+
+def developer_instructions() -> str:
+    return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
 STAGE2_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
+        "content_mode",
         "video_title",
         "analysis_summary",
         "angle_moment_sets",
@@ -75,6 +81,7 @@ STAGE2_SCHEMA: dict[str, Any] = {
         "notes_for_edit_plan",
     ],
     "properties": {
+        "content_mode": {"type": "string", "enum": ["ad", "excerpt"]},
         "video_title": {"type": "string"},
         "analysis_summary": {"type": "string"},
         "angle_moment_sets": {
@@ -304,24 +311,10 @@ def estimated_stage2_cost(
     }
 
 
-def build_task_prompt(stage1_output: dict[str, Any]) -> str:
-    return "\n\n".join(
-        [
-            "Create stage 2 of a video-to-clip-ad pipeline: transcript moment analysis.",
-            "Input includes the same stable video evidence prefix used in stage 1, plus the stage-1 brief and ad angles below.",
-            "Your job is not to create an edit plan yet. Your job is to find precise spoken moments and nearby transcript windows that could support each ad angle.",
-            "For each stage-1 angle, produce one to three candidate windows. Candidate windows should usually be 15-75 seconds, but can be shorter when they are only supporting B-roll or need to be combined later.",
-            "Prefer windows with a clean hook, enough context, and a clear payoff. A missing or weak payoff is a strong signal that the window is a bad clip candidate, not merely an editing problem.",
-            "Do not mark a window as primary unless its payoff field names a specific spoken or visual payoff. Use weak_or_rejected_windows or recommended_use=review_only for windows that are only setup, atmosphere, or information without a payoff.",
-            "If an angle depends on a concrete visible object or action, do not mark it primary unless the evidence indicates that object/action is likely visible in the window or nearby B-roll. For example, a hammer clip needs visible hammer/tool use, not just generic lunar training footage.",
-            "If dense candidate visual-index sheets are included, use them as visual evidence. Candidate windows should cite visual expectations from exact sheet timestamps/cells when concrete objects or actions are visible.",
-            "Penalize windows where the narration, speaker identity, transcript QA, or visual evidence seems unreliable.",
-            "Flag any window that must be checked against the original audio/video before editing. Do not use the known repeated-text artifact as a substantive candidate.",
-            "Use transcript excerpts sparingly: quote only the exact words needed to identify the moment.",
-            "Rank the best moments across all angles by likely usefulness for the next edit-plan stage.",
-            "STAGE 1 OUTPUT JSON:",
-            json.dumps(stage1_output, ensure_ascii=False, indent=2),
-        ]
+def build_task_prompt(stage1_output: dict[str, Any], content_mode: str) -> str:
+    return render_prompt_template(
+        f"stage2_{content_mode}.md",
+        stage1_output_json=json.dumps(stage1_output, ensure_ascii=False, indent=2),
     )
 
 
@@ -365,7 +358,7 @@ def request_fingerprint_payload(
         "input": [
             {
                 "role": "developer",
-                "content": DEVELOPER_INSTRUCTIONS,
+                "content": developer_instructions(),
             },
             {
                 "role": "user",
@@ -443,6 +436,8 @@ def write_markdown(
 ) -> None:
     lines = [
         f"# {output.get('video_title', 'Stage 2 Transcript Moment Analysis')}",
+        "",
+        f"- Content mode: `{output.get('content_mode', 'ad')}`",
         "",
         "## Summary",
         "",
@@ -556,6 +551,7 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
         output_usd_per_million=args.output_usd_per_million,
     )
     stage1_output = read_json(stage1_path)
+    content_mode = args.content_mode or str(stage1_output.get("content_mode") or "ad")
     stage1_output_text = stable_json(stage1_output)
     source_materials = build_source_materials(
         manifest_path=manifest_path,
@@ -587,7 +583,7 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
                 json.dumps(visual_index, ensure_ascii=False, indent=2),
             ]
         )
-    task_prompt = build_task_prompt(stage1_output)
+    task_prompt = build_task_prompt(stage1_output, content_mode)
     image_count = (1 if contact_sheet_path is not None else 0) + len(visual_index_images)
     preflight_cost = estimated_stage2_cost(
         source_materials=source_materials,
@@ -826,7 +822,7 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
     input_messages: list[dict[str, Any]] = [
         {
             "role": "developer",
-            "content": DEVELOPER_INSTRUCTIONS,
+            "content": developer_instructions(),
         },
         {"role": "user", "content": content},
         {
@@ -934,6 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--stage1-output", type=Path, required=True)
+    parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
     parser.add_argument("--contact-sheet", type=Path, default=None)
     parser.add_argument("--visual-index-manifest", type=Path, default=None)
     parser.add_argument("--visual-index-max-images", type=int, default=None)

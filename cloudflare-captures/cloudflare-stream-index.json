@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-05-30T21:05:50.187323+00:00",
+  "updated_at": "2026-05-30T21:05:50.187367+00:00",
+  "streams": {
+    "470abf885c1ca7d60dea90ea41d558f3": {
+      "stream_id": "470abf885c1ca7d60dea90ea41d558f3",
+      "downloads": [
+        {
+          "captured_at": "2026-05-30T21:05:50.185070+00:00",
+          "stream_id": "470abf885c1ca7d60dea90ea41d558f3",
+          "account_id": "338b560adc4df4456b99270b39902129",
+          "live_input_uid": null,
+          "capture_method": "playback",
+          "download_type": "mp4",
+          "file": "/Users/tp/clipinator/cloudflare-captures/Ergo-Braver-1.4-Nietzsche-260206_master.mp4-470abf885c1ca7d60dea90ea41d558f3.mp4",
+          "metadata": "/Users/tp/clipinator/cloudflare-captures/Ergo-Braver-1.4-Nietzsche-260206_master.mp4-470abf885c1ca7d60dea90ea41d558f3.mp4.json",
+          "bytes": 402552484,
+          "cloudflare_name": "Ergo-Braver-1.4-Nietzsche-260206_master.mp4",
+          "cloudflare_duration_seconds": 3069.5,
+          "ready_to_stream": true,
+          "require_signed_urls": false
+        }
+      ],
+      "account_id": "338b560adc4df4456b99270b39902129",
+      "cloudflare_name": "Ergo-Braver-1.4-Nietzsche-260206_master.mp4",
+      "cloudflare_duration_seconds": 3069.5,
+      "ready_to_stream": true,
+      "require_signed_urls": false,
+      "latest_file": "/Users/tp/clipinator/cloudflare-captures/Ergo-Braver-1.4-Nietzsche-260206_master.mp4-470abf885c1ca7d60dea90ea41d558f3.mp4",
+      "latest_metadata": "/Users/tp/clipinator/cloudflare-captures/Ergo-Braver-1.4-Nietzsche-260206_master.mp4-470abf885c1ca7d60dea90ea41d558f3.mp4.json",
+      "latest_capture_method": "playback",
+      "latest_download_type": "mp4",
+      "latest_captured_at": "2026-05-30T21:05:50.185070+00:00"
+    }
+  }
+}

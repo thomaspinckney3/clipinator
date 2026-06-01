@@ -11,6 +11,7 @@ from typing import Any
 
 from extractor import stage_cache
 from extractor.openai_stage1 import (
+    CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
     DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION,
@@ -37,6 +38,7 @@ from extractor.openai_stage1 import (
     write_json,
 )
 from extractor.openai_stage3 import STAGE3_SCHEMA
+from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
@@ -47,6 +49,10 @@ def cache_source_files() -> list[Path]:
     root = Path(__file__).resolve().parent
     return [
         Path(__file__).resolve(),
+        root / "prompt_templates.py",
+        prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
+        prompt_template_path("stage5_ad.md"),
+        prompt_template_path("stage5_excerpt.md"),
         root / "stage_cache.py",
         root / "openai_stage1.py",
         root / "openai_stage3.py",
@@ -55,12 +61,11 @@ def cache_source_files() -> list[Path]:
     ]
 
 
-DEVELOPER_INSTRUCTIONS = (
-    "You are a senior short-form documentary editor and pipeline designer. "
-    "Convert post-render critique into a revised, renderable edit plan. "
-    "Treat the work as a general video-to-clip system, not a one-off manual fix. "
-    "Return only valid JSON for the requested schema."
-)
+DEVELOPER_PROMPT_TEMPLATE = "stage5_developer.md"
+
+
+def developer_instructions() -> str:
+    return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
 RENDER_SETTINGS_SCHEMA: dict[str, Any] = {
@@ -130,7 +135,7 @@ STAGE5_SCHEMA: dict[str, Any] = {
                     "prior_clip_id": {"type": "string"},
                     "action": {
                         "type": "string",
-                        "enum": ["keep_as_is", "revise", "reject", "defer"],
+                        "enum": ["keep_as_is", "revise", "merge", "reject", "defer"],
                     },
                     "issues_addressed": {"type": "array", "items": {"type": "string"}},
                     "applied_changes": {"type": "array", "items": {"type": "string"}},
@@ -301,6 +306,7 @@ def build_task_prompt(
     render_manifest: dict[str, Any],
     review_package: dict[str, Any] | None,
     include_video_source_materials: bool,
+    content_mode: str,
 ) -> str:
     evidence_scope = (
         "The stable video transcript and preprocessing evidence are included, so you may "
@@ -309,50 +315,18 @@ def build_task_prompt(
         else "No full transcript/source prefix is included. Do not invent new source ranges; "
         "revise only from the prior plan, render manifest, and Stage 4 critique."
     )
-    return "\n\n".join(
-        [
-            "Create stage 5 of a video-to-clip-ad pipeline: re-edit after post-render critique.",
-            evidence_scope,
-            "The output must include a full revised Stage 3 plan under revised_stage3_output. It must be directly renderable by extractor.render_stage3.",
-            "Do not produce a one-off patch for the current example. Express fixes as general edit decisions driven by critique categories and evidence.",
-            "Hard editorial rules:",
-            "- If there is no clear payoff, reject or defer the clip instead of trying to rescue it with captions or faster cuts.",
-            "- Preserve portfolio diversity. Do not keep multiple clips with the same named object, prop, demo type, or audience promise when a strong distinct candidate is available in the supplied Stage 3/critique/source evidence.",
-            "- If Stage 4 flags redundant selected hooks, replace or defer the weaker duplicate rather than retitling it.",
-            "- Every revised clip ad should open with a short, intentional title/tagline card unless the visual action itself is the payoff.",
-            "- Title/tagline cards are ad headlines, not summaries. Make concept_title and the first rendered caption_or_overlay short, concrete, and punchy: target 3-7 words, with a soft cap of 9 words or about 55 characters unless a source quote or essential number forces more.",
-            "- Title/tagline cards must be understandable to a cold viewer before source audio starts. Rewrite cryptic shorthand, unexplained numbers, ambiguous either/or phrases, insider labels, vague hype, and wordy institutional summaries into a concrete subject plus surprising payoff.",
-            "- Put extra explanatory context in opening_hook.visual as a small subtitle or in the first spoken beat, not in the main title-card caption_or_overlay.",
-            "- The first generated title card's caption_or_overlay should normally be identical to concept_title. If Stage 4 says concept_title is clearer than the visible title card, rewrite concept_title itself into the shortest clear title-card text and use that same text as caption_or_overlay.",
-            "- Use sentence case for title/tagline cards. Do not preserve multi-word all-caps cards except acronyms or one intentionally emphasized word.",
-            "- Title/tagline cards should normally last 4-5 seconds so the viewer can read and understand the hook. Do not preserve a 1-2 second title flash.",
-            "- For any generated title, hook, or CTA card, set source_start and source_end to 0, visual_source exactly to 'Generated black title card.', and audio_source to 'No source dialogue; silent generated title card.' This is the renderer contract; do not use source_start=0 footage as a fake card.",
-            "- The payoff or surprising line should be the first spoken beat after the title/tagline card whenever it can open cleanly.",
-            "- Do not put a payoff line first if it begins with a connective such as 'but', 'and', or 'so', depends on prior context, or sounds like a mid-sentence start. Include the setup before it or reject/defer the clip.",
-            "- Title, overlay, and caption wording must preserve the source claim. Do not turn a narrator interpretation into a literal factual claim; for example, 'the next words were about science' is not the same as 'the next words were science'.",
-            "- Prefer an intentional black title card over silent source video before dialogue.",
-            "- If Stage 4 flags a broken title, repair the title card text/timing; do not remove the title card and start directly on interview or narration footage.",
-            "- Do not start or end spoken audio mid-sentence or mid-word. Leave a small tail when needed, but trim before topic drift.",
-            "- Avoid showing a talking head while unrelated narration or a different speaker is heard; use B-roll, title cards, or matching-source visuals instead.",
-            "- If B-roll repeats to stretch the clip, shorten the clip unless verified alternate visuals are available.",
-            "- If Stage 4 says the concrete object/action named by the clip is not visually legible, either find explicit visual proof from the supplied source evidence or mark the clip reject/defer with should_render=false.",
-            "- Do not turn a hard visual-proof gap into a soft note for later review. If a hammer clip cannot show a hammer, hammer-like tool, or unambiguous gloved-hand tool use, do not include it in revised_stage3_output.clip_ads.",
-            "- Smooth abrupt cuts with crossfades, J/L cuts, cut-on-action choices, or shorter ranges, but do not hide story problems with transitions.",
-            "- The ending must stay on the same story and should land after the thought resolves.",
-            "- Phrase-level captions should be explicit render-time SRT entries. When doing that, set caption_plan_source to absolute_render_time on the revised clip.",
-            "- Use render_settings when the critique calls for crossfades, internal visual dissolves, foreground punch-in, or exposure/contrast fixes.",
-            "For each clip, explain which Stage 4 issues you addressed and which feedback remains unresolved. If a requested fix needs source evidence that is not present, say so and choose the conservative edit.",
-            "PREVIOUS STAGE 3 OUTPUT JSON:",
-            json.dumps(stage3_output, ensure_ascii=False, indent=2),
-            "RENDER MANIFEST JSON:",
-            json.dumps(render_manifest, ensure_ascii=False, indent=2),
-            "STAGE 4 CRITIQUE JSON:",
-            json.dumps(stage4_output, ensure_ascii=False, indent=2),
-            "OPTIONAL LOCAL REVIEW PACKAGE JSON:",
-            json.dumps(review_package, ensure_ascii=False, indent=2)
-            if review_package is not None
-            else "No review package JSON supplied.",
-        ]
+    review_package_json = (
+        json.dumps(review_package, ensure_ascii=False, indent=2)
+        if review_package is not None
+        else "No review package JSON supplied."
+    )
+    return render_prompt_template(
+        f"stage5_{content_mode}.md",
+        evidence_scope=evidence_scope,
+        stage3_output_json=json.dumps(stage3_output, ensure_ascii=False, indent=2),
+        render_manifest_json=json.dumps(render_manifest, ensure_ascii=False, indent=2),
+        stage4_output_json=json.dumps(stage4_output, ensure_ascii=False, indent=2),
+        review_package_json=review_package_json,
     )
 
 
@@ -381,7 +355,7 @@ def request_fingerprint_payload(
         "api": "openai.responses.create",
         "model": args.model,
         "input": [
-            {"role": "developer", "content": DEVELOPER_INSTRUCTIONS},
+            {"role": "developer", "content": developer_instructions()},
             {"role": "user", "content": content},
             {
                 "role": "user",
@@ -581,12 +555,20 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
         if review_package_path is not None
         else None
     )
+    content_mode = args.content_mode or str(
+        stage3_output.get("content_mode")
+        or stage4_output.get("content_mode")
+        or render_manifest.get("content_mode")
+        or (review_package or {}).get("content_mode")
+        or "ad"
+    )
     task_prompt = build_task_prompt(
         stage3_output=stage3_output,
         stage4_output=stage4_output,
         render_manifest=render_manifest,
         review_package=review_package,
         include_video_source_materials=transcript_path is not None,
+        content_mode=content_mode,
     )
     preflight_cost = estimated_request_cost(
         source_materials=source_materials,
@@ -825,7 +807,7 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
     input_messages: list[dict[str, Any]] = [
-        {"role": "developer", "content": DEVELOPER_INSTRUCTIONS},
+        {"role": "developer", "content": developer_instructions()},
         {"role": "user", "content": content},
         {"role": "user", "content": [{"type": "input_text", "text": task_prompt}]},
     ]
@@ -959,6 +941,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage4-output", type=Path, required=True)
     parser.add_argument("--render-manifest", type=Path, required=True)
     parser.add_argument("--review-package", type=Path, default=None)
+    parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
     parser.add_argument("--transcript", type=Path, default=None)
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--contact-sheet", type=Path, default=None)

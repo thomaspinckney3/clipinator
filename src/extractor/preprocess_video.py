@@ -25,6 +25,7 @@ DEFAULT_WINDOW_SHEET_FRAME_WIDTH = 240
 DEFAULT_WINDOW_SHEET_COLUMNS = 10
 SHEET_PADDING_PIXELS = 8
 SHEET_MARGIN_PIXELS = 8
+MAX_CONTACT_SHEET_DIMENSION_PIXELS = 60_000
 DEFAULT_FFMPEG_BIN = "auto"
 HOMEBREW_FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
 DEFAULT_FFMPEG_HWACCEL = "auto"
@@ -475,6 +476,77 @@ def sheet_frame_entries(
     ]
 
 
+def image_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        probe = ffprobe_json(path)
+    except Exception:
+        return None
+    stream = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+    if not isinstance(stream, dict):
+        return None
+    try:
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def adjusted_sheet_columns(
+    frame_samples: list[FrameSample],
+    requested_columns: int,
+    frame_width: int,
+) -> tuple[int, bool]:
+    if requested_columns <= 0:
+        raise RuntimeError("contact sheet columns must be > 0")
+    if not frame_samples:
+        return requested_columns, False
+
+    dimensions = image_dimensions(frame_samples[0].path)
+    if dimensions is None:
+        # Most lecture sources are 16:9; use a conservative fallback when the
+        # probe is unavailable.
+        scaled_height = math.ceil(frame_width * 9 / 16)
+    else:
+        source_width, source_height = dimensions
+        scaled_height = math.ceil(source_height * frame_width / source_width)
+
+    max_rows = max(
+        1,
+        math.floor(
+            (
+                MAX_CONTACT_SHEET_DIMENSION_PIXELS
+                - 2 * SHEET_MARGIN_PIXELS
+                + SHEET_PADDING_PIXELS
+            )
+            / (scaled_height + SHEET_PADDING_PIXELS)
+        ),
+    )
+    max_columns = max(
+        1,
+        math.floor(
+            (
+                MAX_CONTACT_SHEET_DIMENSION_PIXELS
+                - 2 * SHEET_MARGIN_PIXELS
+                + SHEET_PADDING_PIXELS
+            )
+            / (frame_width + SHEET_PADDING_PIXELS)
+        ),
+    )
+    needed_columns = max(requested_columns, math.ceil(len(frame_samples) / max_rows))
+    if needed_columns > max_columns:
+        raise RuntimeError(
+            "contact sheet would exceed the safe image dimensions even after "
+            f"auto-adjusting columns: frames={len(frame_samples)}, "
+            f"frame_width={frame_width}, needed_columns={needed_columns}, "
+            f"max_columns={max_columns}. Increase --frame-interval-seconds or "
+            "lower --contact-sheet-frame-width."
+        )
+    return needed_columns, needed_columns != requested_columns
+
+
 def create_contact_sheet(
     ffmpeg_bin: str,
     frame_samples: list[FrameSample],
@@ -488,6 +560,12 @@ def create_contact_sheet(
 ) -> dict[str, Any] | None:
     if not frame_samples:
         return None
+    requested_columns = columns
+    columns, columns_adjusted = adjusted_sheet_columns(
+        frame_samples,
+        requested_columns=columns,
+        frame_width=frame_width,
+    )
     rows = math.ceil(len(frame_samples) / columns)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if len(frame_samples) > 1:
@@ -543,6 +621,8 @@ def create_contact_sheet(
         "path": relative_to_root(output_path, root),
         "columns": columns,
         "rows": rows,
+        "requested_columns": requested_columns,
+        "columns_auto_adjusted": columns_adjusted,
         "cell_width": frame_width,
         "frame_count": len(frame_samples),
         "labeled": True,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -39,6 +40,11 @@ DEFAULT_FRAME_INTERVAL_SECONDS = 1.0
 DEFAULT_FRAME_WIDTH = 480
 DEFAULT_CONTACT_SHEET_FRAME_WIDTH = 180
 DEFAULT_CONTACT_SHEET_COLUMNS = 12
+CONTENT_MODE_CHOICES = ("ad", "excerpt")
+EXCERPT_SECONDS_PER_CLIP = 10 * 60
+STAGE3_DEFAULT_MAX_OUTPUT_TOKENS = 18_000
+STAGE3_MAX_OUTPUT_TOKENS = 32_000
+STAGE3_OUTPUT_TOKENS_PER_EXTRACT = 6_000
 
 
 @dataclass
@@ -100,8 +106,10 @@ class PipelinePaths:
     run_root: Path
     stem: str
     run_id_base: str
+    content_mode: str
     transcribe_provider: str
     transcribe_model: str
+    render_variant: str | None = None
 
     @property
     def transcript_dir(self) -> Path:
@@ -147,11 +155,25 @@ class PipelinePaths:
 
     @property
     def visual_index_dir(self) -> Path:
+        if self.render_variant:
+            return self.run_root / "visual-index" / self.render_variant
         return self.run_root / "visual-index"
 
     @property
     def visual_index_manifest(self) -> Path:
         return self.visual_index_dir / self.stem / "manifest.json"
+
+    @property
+    def subject_index_dir(self) -> Path:
+        return self.run_root / "subject-index"
+
+    @property
+    def stage3_subject_index_manifest(self) -> Path:
+        return self.subject_index_dir / self.stage3_run_id / "manifest.json"
+
+    @property
+    def final_subject_index_manifest(self) -> Path:
+        return self.subject_index_dir / self.stage5_run_id / "manifest.json"
 
     @property
     def stage1_run_id(self) -> str:
@@ -199,7 +221,10 @@ class PipelinePaths:
 
     @property
     def stage3_render_dir(self) -> Path:
-        return self.run_root / "renders" / "stage3"
+        stage_dir = f"{self.render_variant}-stage3" if self.render_variant else "stage3"
+        if self.content_mode != "ad":
+            return self.run_root / "renders" / self.content_mode / stage_dir
+        return self.run_root / "renders" / stage_dir
 
     @property
     def stage3_render_manifest(self) -> Path:
@@ -207,7 +232,10 @@ class PipelinePaths:
 
     @property
     def final_render_dir(self) -> Path:
-        return self.run_root / "renders" / "stage5"
+        stage_dir = f"{self.render_variant}-stage5" if self.render_variant else "stage5"
+        if self.content_mode != "ad":
+            return self.run_root / "renders" / self.content_mode / stage_dir
+        return self.run_root / "renders" / stage_dir
 
     @property
     def final_render_manifest(self) -> Path:
@@ -467,6 +495,7 @@ def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
         "created_at": datetime.now(UTC).isoformat(),
         "video": str(paths.video),
         "run_root": str(paths.run_root),
+        "content_mode": paths.content_mode,
         "transcript": str(paths.transcript_json),
         "available_transcript": (
             str(paths.available_transcript_json)
@@ -480,6 +509,10 @@ def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
         },
         "video_evidence_manifest": str(paths.evidence_manifest),
         "visual_index_manifest": str(paths.visual_index_manifest),
+        "subject_index_manifests": {
+            "stage3": str(paths.stage3_subject_index_manifest),
+            "final": str(paths.final_subject_index_manifest),
+        },
         "stage_outputs": {
             "stage1": str(paths.stage1_output),
             "stage2": str(paths.stage2_output),
@@ -638,6 +671,25 @@ def transcript_for_api_stages(paths: PipelinePaths) -> Path:
     return clipped_path
 
 
+def excerpt_clip_count_for_duration(duration_seconds: float | None) -> int:
+    if duration_seconds is None or duration_seconds <= 0:
+        return 1
+    return max(1, int(math.ceil(duration_seconds / EXCERPT_SECONDS_PER_CLIP)))
+
+
+def stage3_clip_count(paths: PipelinePaths) -> int:
+    if paths.content_mode != "excerpt":
+        return 3
+    return excerpt_clip_count_for_duration(effective_duration_from_manifest(paths.evidence_manifest))
+
+
+def stage3_max_output_tokens(clip_count: int) -> int:
+    return min(
+        STAGE3_MAX_OUTPUT_TOKENS,
+        max(STAGE3_DEFAULT_MAX_OUTPUT_TOKENS, clip_count * STAGE3_OUTPUT_TOKENS_PER_EXTRACT),
+    )
+
+
 def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
     video = args.video.expanduser().resolve()
     if not video.exists():
@@ -647,7 +699,12 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
     transcribe_provider = resolve_transcribe_provider(args.transcribe_provider)
     transcribe_model = resolve_transcribe_model(transcribe_provider, args.transcribe_model)
     stem = safe_stem(video)
-    run_id_base = stem if args.run_id is None else f"{stem}-{safe_run_id(args.run_id)}"
+    run_id_parts = [stem]
+    if args.content_mode != "ad":
+        run_id_parts.append(args.content_mode)
+    if args.run_id is not None:
+        run_id_parts.append(safe_run_id(args.run_id))
+    run_id_base = "-".join(run_id_parts)
     run_root = (
         args.output_root.expanduser().resolve()
         if args.output_root
@@ -658,8 +715,10 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
         run_root=run_root,
         stem=stem,
         run_id_base=run_id_base,
+        content_mode=args.content_mode,
         transcribe_provider=transcribe_provider,
         transcribe_model=transcribe_model,
+        render_variant=safe_run_id(args.run_id) if args.run_id else None,
     )
     paths.run_root.mkdir(parents=True, exist_ok=True)
     state = load_pipeline_state(paths, approved_cap_usd=args.approve_api_cost)
@@ -700,6 +759,22 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             force=args.force,
         )
         stage_transcript = transcript_for_api_stages(paths)
+        stage3_count = stage3_clip_count(paths)
+        stage3_count_args = (
+            [
+                "--clip-count",
+                str(stage3_count),
+                "--max-output-tokens",
+                str(stage3_max_output_tokens(stage3_count)),
+            ]
+            if paths.content_mode == "excerpt"
+            else []
+        )
+        augmentation_assets_args = (
+            ["--augmentation-assets", str(args.augmentation_assets.expanduser().resolve())]
+            if args.augmentation_assets
+            else []
+        )
 
         stage1 = [
             *python_module("extractor.openai_stage1"),
@@ -711,6 +786,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.evidence_manifest),
             "--contact-sheet",
             str(paths.contact_sheet),
+            "--content-mode",
+            args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
@@ -732,6 +809,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.contact_sheet),
             "--stage1-output",
             str(paths.stage1_output),
+            "--content-mode",
+            args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
@@ -792,14 +871,38 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.stage1_output),
             "--stage2-output",
             str(paths.stage2_output),
+            "--content-mode",
+            args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
             paths.stage3_run_id,
+            *stage3_count_args,
+            *augmentation_assets_args,
             *response_cache_args(paths),
             *cache_mode_args(args),
         ]
         run_api_step(state, "stage3", stage3, stage3, paths.stage3_output)
+
+        run_local_step(
+            "subject-index-stage3",
+            [
+                *python_module("extractor.subject_index"),
+                str(paths.video),
+                "--stage3-output",
+                str(paths.stage3_output),
+                "--output-dir",
+                str(paths.subject_index_dir),
+                "--run-id",
+                paths.stage3_run_id,
+                "--ffmpeg-bin",
+                args.ffmpeg_bin,
+                "--ffmpeg-hwaccel",
+                args.ffmpeg_hwaccel,
+            ],
+            paths.stage3_subject_index_manifest,
+            force=args.force,
+        )
 
         run_local_step(
             "render-stage3",
@@ -809,9 +912,15 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
                 str(paths.video),
                 "--stage3-output",
                 str(paths.stage3_output),
+                "--transcript",
+                str(stage_transcript),
                 "--output-dir",
                 str(paths.stage3_render_dir),
                 "--use-plan-render-settings",
+                "--auto-foreground-scale",
+                "--subject-index-manifest",
+                str(paths.stage3_subject_index_manifest),
+                *augmentation_assets_args,
                 "--ffmpeg-bin",
                 args.ffmpeg_bin,
                 "--ffmpeg-hwaccel",
@@ -829,6 +938,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.stage3_render_manifest),
             "--stage3-output",
             str(paths.stage3_output),
+            "--content-mode",
+            args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--assets-dir",
@@ -858,6 +969,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.stage4_output),
             "--review-package",
             str(paths.stage4_review_package),
+            "--content-mode",
+            args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
@@ -868,6 +981,26 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
         run_api_step(state, "stage5", stage5, stage5, paths.stage5_stage3_output)
 
         run_local_step(
+            "subject-index-final",
+            [
+                *python_module("extractor.subject_index"),
+                str(paths.video),
+                "--stage3-output",
+                str(paths.stage5_stage3_output),
+                "--output-dir",
+                str(paths.subject_index_dir),
+                "--run-id",
+                paths.stage5_run_id,
+                "--ffmpeg-bin",
+                args.ffmpeg_bin,
+                "--ffmpeg-hwaccel",
+                args.ffmpeg_hwaccel,
+            ],
+            paths.final_subject_index_manifest,
+            force=args.force,
+        )
+
+        run_local_step(
             "render-final",
             [
                 *python_module("extractor.render_stage3"),
@@ -875,9 +1008,15 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
                 str(paths.video),
                 "--stage3-output",
                 str(paths.stage5_stage3_output),
+                "--transcript",
+                str(stage_transcript),
                 "--output-dir",
                 str(paths.final_render_dir),
                 "--use-plan-render-settings",
+                "--auto-foreground-scale",
+                "--subject-index-manifest",
+                str(paths.final_subject_index_manifest),
+                *augmentation_assets_args,
                 "--ffmpeg-bin",
                 args.ffmpeg_bin,
                 "--ffmpeg-hwaccel",
@@ -903,6 +1042,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("video", type=Path, help="Input video file. This is the only required input.")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument(
+        "--content-mode",
+        choices=CONTENT_MODE_CHOICES,
+        default="ad",
+        help=(
+            "Pipeline creative mode. ad sells the longer video; excerpt creates "
+            "self-contained extracts from the longer video. Excerpts may be atomic "
+            "moments or longer chapter extracts when that is the smallest coherent unit."
+        ),
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=None,
@@ -915,6 +1064,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-id",
         default=None,
         help="Optional stable run id suffix for named variants. Defaults to per-file stage dirs.",
+    )
+    parser.add_argument(
+        "--augmentation-assets",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON catalog of local, rights-reviewed assets. Stage 3 may "
+            "reference assets as asset://id, and the renderer will resolve them."
+        ),
     )
     parser.add_argument(
         "--approve-api-cost",

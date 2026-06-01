@@ -14,6 +14,7 @@ from typing import Any
 
 from extractor import stage_cache
 from extractor.preprocess_video import format_time
+from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
@@ -25,6 +26,7 @@ DEFAULT_CACHE_SUBDIR = "_response-cache"
 DEFAULT_MAX_OUTPUT_TOKENS = 12_000
 DEFAULT_IMAGE_DETAIL = "high"
 DEFAULT_IMAGE_TOKEN_ALLOWANCE = 50_000
+CONTENT_MODE_CHOICES = ("ad", "excerpt")
 
 DEFAULT_GPT55_INPUT_USD_PER_MILLION = 5.00
 DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION = 0.50
@@ -42,6 +44,7 @@ STAGE1_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
+        "content_mode",
         "video_title",
         "core_idea",
         "why_watch",
@@ -54,6 +57,7 @@ STAGE1_SCHEMA: dict[str, Any] = {
         "notes_for_next_stage",
     ],
     "properties": {
+        "content_mode": {"type": "string", "enum": ["ad", "excerpt"]},
         "video_title": {"type": "string"},
         "core_idea": {"type": "string"},
         "why_watch": {"type": "string"},
@@ -321,57 +325,23 @@ def build_source_materials(
             "and is arranged left-to-right, top-to-bottom. Treat timestamps as approximate "
             "visual evidence, not exact shot boundaries."
         )
-    return "\n\n".join(
-        [
-            "NASA VIDEO SOURCE MATERIALS",
-            contact_sheet_note,
-            (
-                "Known QA warning: the transcript QA can flag hallucinated or repeated text. "
-                "Do not build a clip angle on flagged transcript artifacts unless it is also "
-                "supported by visual evidence."
-            ),
-            "COMPACT VIDEO EVIDENCE MANIFEST JSON:",
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            "COMPACT TRANSCRIPT TIMELINE JSON:",
-            json.dumps(transcript, ensure_ascii=False, indent=2),
-        ]
+    return render_prompt_template(
+        "source_materials.md",
+        contact_sheet_note=contact_sheet_note,
+        manifest_json=json.dumps(manifest, ensure_ascii=False, indent=2),
+        transcript_json=json.dumps(transcript, ensure_ascii=False, indent=2),
     )
 
 
-def build_task_prompt() -> str:
-    return """Create stage 1 of a video-to-clip-ad pipeline.
-
-Goal: understand what the full NASA video is about, why a general audience should
-watch it, and which short-form ad angles are worth testing before any precise edit
-plan is generated.
-
-Creative priors for educational short-form clips:
-- Prefer concrete, visual, surprising claims over broad summaries.
-- Favor a fast hook with conflict, scale, counterintuitive detail, stakes, or a
-  myth/reframe.
-- A good clip ad needs a clear payoff or surprising line. If an angle has no
-  likely payoff, treat that as evidence it is a weak clip candidate.
-- The payoff can be the hook: a short clip may open with the strongest payoff
-  line, then backfill context, while still selling the larger full-video story.
-- Prefer angles that the video can prove visually. Use transcript-only angles only
-  when the spoken idea is unusually strong and the likely B-roll can carry it.
-- If the hook names a concrete object or action, the candidate needs visible
-  proof of that object or action. A clip about a hammer should visibly show a
-  hammer or unambiguous hammer use; generic related training footage is not
-  enough.
-- Flag timing regions where narration, speaker identity, or visuals may not line
-  up cleanly.
-
-Output JSON only. Rank ad angles by expected usefulness for downstream clip
-assembly, not by chronological order. Evidence ranges should be broad enough for
-the next stage to inspect but narrow enough to be actionable."""
+def build_task_prompt(content_mode: str) -> str:
+    return render_prompt_template(f"stage1_{content_mode}.md")
 
 
-DEVELOPER_INSTRUCTIONS = (
-    "You are a senior short-form educational video strategist and editor. "
-    "Be concrete, evidence-grounded, and cautious about transcript/video "
-    "misalignment. Return only valid JSON for the requested schema."
-)
+DEVELOPER_PROMPT_TEMPLATE = "stage1_developer.md"
+
+
+def developer_instructions() -> str:
+    return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
 def response_text_config() -> dict[str, Any]:
@@ -413,7 +383,7 @@ def request_fingerprint_payload(
         "input": [
             {
                 "role": "developer",
-                "content": DEVELOPER_INSTRUCTIONS,
+                "content": developer_instructions(),
             },
             {
                 "role": "user",
@@ -452,6 +422,11 @@ def cache_source_files() -> list[Path]:
     root = Path(__file__).resolve().parent
     return [
         Path(__file__).resolve(),
+        root / "prompt_templates.py",
+        prompt_template_path("source_materials.md"),
+        prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
+        prompt_template_path("stage1_ad.md"),
+        prompt_template_path("stage1_excerpt.md"),
         root / "stage_cache.py",
         root / "preprocess_video.py",
         root / "transcribe.py",
@@ -649,6 +624,8 @@ def write_markdown(
     lines = [
         f"# {output.get('video_title', 'Stage 1 Video Brief')}",
         "",
+        f"- Content mode: `{output.get('content_mode', 'ad')}`",
+        "",
         "## Core Idea",
         "",
         str(output.get("core_idea", "")).strip(),
@@ -661,7 +638,7 @@ def write_markdown(
         "",
         str(output.get("viewer_promise", "")).strip(),
         "",
-        "## Ad Angles",
+        "## Ad Angles" if output.get("content_mode") != "excerpt" else "## Excerpt Candidates",
         "",
     ]
     for angle in output.get("ad_angles", []) or []:
@@ -746,7 +723,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
         transcript_path=transcript_path,
         contact_sheet_path=contact_sheet_path,
     )
-    task_prompt = build_task_prompt()
+    task_prompt = build_task_prompt(args.content_mode)
     preflight_cost = estimated_request_cost(
         source_materials=source_materials,
         task_prompt=task_prompt,
@@ -774,6 +751,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             source_materials,
             args.model,
             args.reasoning_effort,
+            args.content_mode,
             contact_sheet_hash or "",
         ]
     )
@@ -987,7 +965,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
     input_messages: list[dict[str, Any]] = [
         {
             "role": "developer",
-            "content": DEVELOPER_INSTRUCTIONS,
+            "content": developer_instructions(),
         },
         {"role": "user", "content": content},
         {
@@ -1093,6 +1071,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--contact-sheet", type=Path, default=None)
+    parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default="ad")
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--run-id", default=None)

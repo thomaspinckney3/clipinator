@@ -12,6 +12,7 @@ from typing import Any
 
 from extractor import stage_cache
 from extractor.openai_stage1 import (
+    CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
     DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION,
@@ -37,6 +38,12 @@ from extractor.openai_stage1 import (
     usage_dict,
     write_json,
 )
+from extractor.prompt_templates import (
+    load_prompt_lines,
+    load_prompt_template,
+    prompt_template_path,
+    render_prompt_template,
+)
 from extractor.render_stage3 import ffprobe_summary, require_command, run_command, safe_name
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
@@ -57,6 +64,13 @@ def cache_source_files() -> list[Path]:
     root = Path(__file__).resolve().parent
     return [
         Path(__file__).resolve(),
+        root / "prompt_templates.py",
+        prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
+        prompt_template_path("stage4_ad.md"),
+        prompt_template_path("stage4_excerpt.md"),
+        prompt_template_path("stage4_rubric_ad.md"),
+        prompt_template_path("stage4_rubric_excerpt.md"),
+        prompt_template_path("stage4_rubric_common.md"),
         root / "stage_cache.py",
         root / "openai_stage1.py",
         root / "render_stage3.py",
@@ -64,19 +78,18 @@ def cache_source_files() -> list[Path]:
     ]
 
 
-DEVELOPER_INSTRUCTIONS = (
-    "You are a blunt senior short-form documentary editor doing post-render QA. "
-    "Critique rendered clip ads the way a human editor would after watching the draft. "
-    "Prioritize story clarity, payoff strength, visual relevance, repeated B-roll, "
-    "audio/video mismatch, cut smoothness, topic drift, and whether the clip should be "
-    "shortened instead of padded. Return only valid JSON for the requested schema."
-)
+DEVELOPER_PROMPT_TEMPLATE = "stage4_developer.md"
+
+
+def developer_instructions() -> str:
+    return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
 STAGE4_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
+        "content_mode",
         "review_summary",
         "global_findings",
         "clip_reviews",
@@ -84,6 +97,7 @@ STAGE4_SCHEMA: dict[str, Any] = {
         "notes_for_pipeline",
     ],
     "properties": {
+        "content_mode": {"type": "string", "enum": ["ad", "excerpt"]},
         "review_summary": {"type": "string"},
         "global_findings": {"type": "array", "items": {"type": "string"}},
         "clip_reviews": {
@@ -173,6 +187,9 @@ STAGE4_SCHEMA: dict[str, Any] = {
                                         "repeated_broll",
                                         "abrupt_cut",
                                         "topic_drift",
+                                        "semantic_unit",
+                                        "accessibility",
+                                        "portfolio_balance",
                                         "visual_relevance",
                                         "captioning",
                                         "technical",
@@ -780,6 +797,11 @@ def build_review_package(
 ) -> tuple[dict[str, Any], list[Path]]:
     render_manifest = read_json(render_manifest_path)
     stage3_output = read_json(stage3_output_path) if stage3_output_path else None
+    content_mode = str(
+        (stage3_output or {}).get("content_mode")
+        or render_manifest.get("content_mode")
+        or "ad"
+    )
     assets_dir.mkdir(parents=True, exist_ok=True)
 
     clips = render_manifest.get("clips", []) or []
@@ -889,6 +911,7 @@ def build_review_package(
 
     package = {
         "schema_version": 3,
+        "content_mode": content_mode,
         "created_at": datetime.now(UTC).isoformat(),
         "render_manifest_path": str(render_manifest_path),
         "stage3_output_path": str(stage3_output_path) if stage3_output_path else None,
@@ -904,24 +927,8 @@ def build_review_package(
             "if a motion-only issue still cannot be verified from local evidence, mark it as needs_playback_review."
         ),
         "evidence_images": [str(path) for path in evidence_images],
-        "human_feedback_rubric": [
-            "A good clip needs a clear payoff. If there is no payoff, it is probably a bad clip.",
-            "The set of selected clips should advertise different reasons to watch the full video. Flag a batch when multiple clips use the same named object, prop, demo type, or audience promise while a stronger distinct source candidate existed.",
-            "The payoff or surprising line should usually be the first spoken beat after a title/tagline card.",
-            "A title/tagline card should read like a short ad headline, not a full summary. Flag titles that are wordy, institutional, academic, or longer than about 9 words unless a source quote or essential number requires it.",
-            "A title/tagline card must be understandable to a cold viewer before source audio starts. Flag cryptic shorthand, unexplained numbers, ambiguous binaries, insider labels, or wording that does not tell the viewer what surprising thing they are about to learn.",
-            "Recommend a shorter concrete subject-plus-payoff title when the rendered card is accurate but not punchy enough.",
-            "Flag the title card if concept_title is clearer than the rendered first title-card text. The rendered card should normally use concept_title or a clearer sentence-case variant.",
-            "Flag multi-word title cards written in all caps as a readability/style issue unless only an acronym or one emphasized word is uppercase.",
-            "A title/tagline card should stay readable long enough to process, normally 4-5 seconds. Flag title cards that flash by in 1-2 seconds unless the visual action immediately explains the hook.",
-            "Prefer an intentional black title card over source video silently running before audio.",
-            "Do not start the spoken opening in the middle of a sentence unless the title card makes it understandable.",
-            "Avoid showing a talking head while unrelated narration or a different speaker is heard.",
-            "Do not repeat the same B-roll to stretch a clip. Shorten the clip instead.",
-            "Abrupt cuts should be softened, covered, or motivated by story rhythm.",
-            "The ending should stay in the same story; do not drift into a different part of the source video.",
-            "The video should define the clip at least as much as the transcript does.",
-        ],
+        "human_feedback_rubric": load_prompt_lines(f"stage4_rubric_{content_mode}.md")
+        + load_prompt_lines("stage4_rubric_common.md"),
         "clips": package_clips,
     }
     write_json(assets_dir / "review-package.json", package)
@@ -931,10 +938,12 @@ def build_review_package(
 def build_source_materials(package: dict[str, Any]) -> str:
     prompt_package = dict(package)
     prompt_package.pop("created_at", None)
+    content_mode = str(prompt_package.get("content_mode") or "ad")
+    label = "rendered draft excerpts" if content_mode == "excerpt" else "rendered draft clip ads"
     return "\n\n".join(
         [
             "STAGE 4 POST-RENDER REVIEW MATERIALS",
-            "This is a critique of already-rendered draft clip ads, not a request to make edit plans from scratch.",
+            f"This is a critique of already-{label}, not a request to make edit plans from scratch.",
             "The rendered MP4 files remain local. The LLM receives local evidence images: storyboard contact sheets, transition strips around segment boundaries and internal multi-cut B-roll edits, and audio waveform timelines, plus SRT captions, render metadata, and the edit plan when available.",
             "REVIEW PACKAGE JSON:",
             json.dumps(prompt_package, ensure_ascii=False, indent=2),
@@ -942,37 +951,8 @@ def build_source_materials(package: dict[str, Any]) -> str:
     )
 
 
-def build_task_prompt() -> str:
-    return "\n".join(
-        [
-            "Critique each rendered clip ad as a post-render reviewer.",
-            "Use the same standards reflected in the human feedback:",
-            "- If there is no clear payoff, the clip is probably bad.",
-            "- Review the batch as a portfolio, not only clip-by-clip. Flag redundant selections when multiple clips rely on the same named object, prop, demo type, or audience promise while a stronger distinct candidate appears in the prior edit plan or source evidence.",
-            "- The payoff should be the hook and should usually be the first spoken beat after a title/tagline card.",
-            "- The title/tagline card should read like a short ad headline, not a full summary. Flag wordy, institutional, academic, or longer-than-about-9-word titles unless a source quote or essential number requires it.",
-            "- The title/tagline card itself must make sense to a cold viewer. Flag it if it is just shorthand, unexplained numbers, an ambiguous either/or, or an insider phrase without a concrete promise.",
-            "- If the title is accurate but not punchy, recommend a shorter concrete subject-plus-payoff version.",
-            "- If concept_title is clearer than the visible first title-card text, flag the title card and recommend using concept_title.",
-            "- Flag multi-word all-caps title cards as less readable unless the uppercase text is an acronym or one intentionally emphasized word.",
-            "- The title/tagline card should stay on screen for about 4-5 seconds. Flag 1-2 second title cards as too fast unless the next visual instantly explains the hook.",
-            "- The first spoken beat must still be a clean sentence or complete thought. Flag it if the SRT/audio starts with a connective like 'but', 'and', or 'so' and the missing prior context is not supplied before it.",
-            "- Flag titles, overlays, and captions that overstate or change the source claim, especially when a title turns an interpretation into a literal factual claim.",
-            "- A black title card is better than several seconds of silent source video before audio starts.",
-            "- The opening should not cut into a sentence in a way that makes it confusing.",
-            "- Do not show a talking head while unrelated narration or a different speaker is playing.",
-            "- Repeated B-roll is a sign the clip is being stretched; recommend shortening instead.",
-            "- Abrupt cuts should be called out and fixed with better shot choice, crossfades, J/L cuts, or shortening.",
-            "- The ending should stay inside the same story and not wander into a different part of the source video.",
-            "- The visual story matters at least as much as the transcript.",
-            "",
-            "For each clip, decide keep/minor_revision/major_revision/reject.",
-            "Be concrete: cite frame patterns from the storyboard sheet, transition-sheet rows, waveform/timing evidence, SRT timing, segment plans, or missing evidence.",
-            "Use transition strips to judge whether segment-boundary cuts and internal multi-cut B-roll edits are visually motivated or likely abrupt. Use waveform and silence evidence to judge dead air and audio/caption handoff timing.",
-            "If a problem requires actual playback beyond these local evidence assets, mark it as needs_playback_review and explain the local check to run.",
-            "Return only the requested JSON schema.",
-        ]
-    )
+def build_task_prompt(content_mode: str) -> str:
+    return render_prompt_template(f"stage4_{content_mode}.md")
 
 
 def estimated_stage4_cost(
@@ -1017,7 +997,7 @@ def request_fingerprint_payload(
         "api": "openai.responses.create",
         "model": args.model,
         "input": [
-            {"role": "developer", "content": DEVELOPER_INSTRUCTIONS},
+            {"role": "developer", "content": developer_instructions()},
             {
                 "role": "user",
                 "content": [
@@ -1206,7 +1186,8 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
         include_waveform=not args.no_waveform,
     )
     source_materials = build_source_materials(package)
-    task_prompt = build_task_prompt()
+    content_mode = args.content_mode or str(package.get("content_mode") or "ad")
+    task_prompt = build_task_prompt(content_mode)
     preflight_cost = estimated_stage4_cost(
         source_materials=source_materials,
         task_prompt=task_prompt,
@@ -1432,7 +1413,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
     input_messages: list[dict[str, Any]] = [
-        {"role": "developer", "content": DEVELOPER_INSTRUCTIONS},
+        {"role": "developer", "content": developer_instructions()},
         {"role": "user", "content": content},
         {"role": "user", "content": [{"type": "input_text", "text": task_prompt}]},
     ]
@@ -1533,6 +1514,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", type=Path, default=Path(DEFAULT_ENV_FILE))
     parser.add_argument("--render-manifest", type=Path, required=True)
     parser.add_argument("--stage3-output", type=Path, default=None)
+    parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
     parser.add_argument("--clip-id", action="append", default=[])
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--assets-dir", type=Path, default=None)

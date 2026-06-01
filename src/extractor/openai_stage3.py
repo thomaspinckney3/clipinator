@@ -10,6 +10,7 @@ from typing import Any
 
 from extractor import stage_cache
 from extractor.openai_stage1 import (
+    CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
     DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION,
@@ -37,6 +38,7 @@ from extractor.openai_stage1 import (
     write_json,
 )
 from extractor.preprocess_video import format_time
+from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
@@ -51,6 +53,10 @@ def cache_source_files() -> list[Path]:
     root = Path(__file__).resolve().parent
     return [
         Path(__file__).resolve(),
+        root / "prompt_templates.py",
+        prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
+        prompt_template_path("stage3_ad.md"),
+        prompt_template_path("stage3_excerpt.md"),
         root / "stage_cache.py",
         root / "openai_stage1.py",
         root / "openai_stage2.py",
@@ -59,27 +65,73 @@ def cache_source_files() -> list[Path]:
     ]
 
 
-DEVELOPER_INSTRUCTIONS = (
-    "You are a senior short-form documentary editor. Convert strategy and transcript "
-    "moment analysis into concrete, timestamp-grounded edit plans. Be practical about "
-    "audio/video sync, B-roll coverage, captions, visual hooks, and manual verification. "
-    "Return only valid JSON for the requested schema."
-)
+DEVELOPER_PROMPT_TEMPLATE = "stage3_developer.md"
+
+
+def developer_instructions() -> str:
+    return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
+
+
+MEDIA_REQUEST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "id",
+        "request_type",
+        "desired_asset_type",
+        "purpose",
+        "placement_notes",
+        "license_requirements",
+        "rights_risk",
+    ],
+    "properties": {
+        "id": {"type": "string"},
+        "request_type": {
+            "type": "string",
+            "enum": [
+                "third_party_media",
+                "generated_video",
+                "generated_image",
+                "generated_graphic",
+                "generated_audio",
+            ],
+        },
+        "desired_asset_type": {
+            "type": "string",
+            "enum": ["video", "image", "graphic", "audio"],
+        },
+        "purpose": {"type": "string"},
+        "placement_notes": {"type": "string"},
+        "search_query": {"type": "string"},
+        "suggested_sources": {"type": "array", "items": {"type": "string"}},
+        "generation_prompt": {"type": "string"},
+        "negative_prompt": {"type": "string"},
+        "duration_seconds": {"type": "number"},
+        "aspect_ratio": {"type": "string"},
+        "style_notes": {"type": "string"},
+        "license_requirements": {"type": "string"},
+        "rights_risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "review_notes": {"type": "array", "items": {"type": "string"}},
+    },
+}
 
 
 STAGE3_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
+        "content_mode",
         "video_title",
         "plan_summary",
         "global_editing_rules",
         "clip_ads",
+        "media_requests",
         "manual_review_queue",
         "deferred_candidates",
         "notes_for_rendering",
     ],
     "properties": {
+        "content_mode": {"type": "string", "enum": ["ad", "excerpt"]},
         "video_title": {"type": "string"},
         "plan_summary": {"type": "string"},
         "global_editing_rules": {"type": "array", "items": {"type": "string"}},
@@ -103,6 +155,7 @@ STAGE3_SCHEMA: dict[str, Any] = {
                     "caption_plan",
                     "audio_plan",
                     "visual_plan",
+                    "media_request_ids",
                     "verification_steps",
                     "risk_notes",
                     "success_criteria",
@@ -116,6 +169,18 @@ STAGE3_SCHEMA: dict[str, Any] = {
                     "target_duration_seconds": {"type": "number"},
                     "editorial_objective": {"type": "string"},
                     "why_this_ad_sells_the_full_video": {"type": "string"},
+                    "excerpt_type": {"type": "string"},
+                    "excerpt_scope": {
+                        "type": "string",
+                        "enum": ["atomic_excerpt", "chapter_extract", "multi_part_extract"],
+                    },
+                    "coherence_unit": {"type": "string"},
+                    "merge_or_split_rationale": {"type": "string"},
+                    "depends_on_prior_excerpt": {"type": "boolean"},
+                    "self_contained_score": {"type": "number"},
+                    "context_needed": {"type": "string"},
+                    "source_order_preserved": {"type": "boolean"},
+                    "cta_policy": {"type": "string"},
                     "source_ranges": {
                         "type": "array",
                         "items": {
@@ -208,12 +273,14 @@ STAGE3_SCHEMA: dict[str, Any] = {
                             "needed_visual_checks": {"type": "array", "items": {"type": "string"}},
                         },
                     },
+                    "media_request_ids": {"type": "array", "items": {"type": "string"}},
                     "verification_steps": {"type": "array", "items": {"type": "string"}},
                     "risk_notes": {"type": "array", "items": {"type": "string"}},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
+        "media_requests": {"type": "array", "items": MEDIA_REQUEST_SCHEMA},
         "manual_review_queue": {
             "type": "array",
             "items": {
@@ -318,6 +385,52 @@ def visual_index_image_paths(manifest_path: Path, max_images: int) -> list[Path]
     return paths
 
 
+def compact_augmentation_assets(path: Path) -> dict[str, Any]:
+    data = read_json(path)
+    raw_assets = data.get("assets", data)
+    if isinstance(raw_assets, dict):
+        items = [
+            {"id": asset_id, **asset}
+            for asset_id, asset in raw_assets.items()
+            if isinstance(asset, dict)
+        ]
+    elif isinstance(raw_assets, list):
+        items = [asset for asset in raw_assets if isinstance(asset, dict)]
+    else:
+        raise RuntimeError("Augmentation assets manifest must contain an assets list or object.")
+
+    compact: list[dict[str, Any]] = []
+    for asset in items:
+        asset_id = str(asset.get("id", "")).strip()
+        if not asset_id:
+            continue
+        compact.append(
+            {
+                "id": asset_id,
+                "type": asset.get("type"),
+                "description": asset.get("description"),
+                "tags": asset.get("tags", []),
+                "license": asset.get("license"),
+                "license_url": asset.get("license_url"),
+                "source_url": asset.get("source_url"),
+                "creator": asset.get("creator"),
+                "usage_notes": asset.get("usage_notes"),
+                "default_volume": asset.get("volume", asset.get("default_volume")),
+                "has_local_path": bool(asset.get("path")),
+            }
+        )
+    return {
+        "asset_count": len(compact),
+        "usage_contract": (
+            "Reference a local video/image/graphic asset in timeline.visual_source as "
+            "asset://id or asset://id#t=SECONDS. Reference an audio asset in "
+            "timeline.audio_source only as an explicit quiet bed or standalone silent-card "
+            "audio source. Preserve source dialogue sync."
+        ),
+        "assets": compact,
+    }
+
+
 def estimated_stage3_cost(
     source_materials: str,
     task_prompt: str,
@@ -354,44 +467,15 @@ def build_task_prompt(
     clip_count: int,
     target_aspect_ratio: str,
     target_seconds: int,
+    content_mode: str,
 ) -> str:
-    return "\n\n".join(
-        [
-            "Create stage 3 of a video-to-clip-ad pipeline: concrete edit plans.",
-            "Input includes the stable video evidence prefix, stage-1 strategy, and stage-2 candidate transcript moments.",
-            f"Create edit plans for the strongest {clip_count} short-form clip ads.",
-            f"Assume a default target of {target_seconds} seconds and {target_aspect_ratio} vertical delivery unless a clip clearly needs a different duration.",
-            "This is not a render request. Produce editor-facing instructions that could drive a later FFmpeg/Premiere/Resolve assembly step.",
-            "Each clip plan must specify the opening hook, source in/out ranges, audio strategy, visual strategy, B-roll coverage, captions/overlays, and verification steps.",
-            "Treat the Stage 2 cross-angle ranking as the default selection order. Only skip a higher-ranked candidate for a lower-ranked one when the higher-ranked candidate has a concrete defect such as no clear payoff, unusable visual proof, severe transcript risk, or topic duplication. Record skipped strong candidates in deferred_candidates with the specific reason.",
-            "The selected clips should work as a diverse portfolio advertising the full video. Avoid choosing multiple clips with the same named object, prop, demo type, or audience promise when a strong distinct candidate is available. For example, do not choose two bunny-centered clips over a high-ranked falling-picture puzzle unless the picture clip fails a specific visual/audio check.",
-            "Prefer the strongest distinct story over a second variation on an already selected motif. A lower-ranked candidate that repeats the same object or hook family must be clearly better than the higher-ranked distinct alternative, not merely easier to title.",
-            "Only create a clip plan when there is a clear payoff. A missing or weak payoff is a rejection signal; put that candidate in deferred_candidates instead of trying to rescue it with pacing, captions, or B-roll.",
-            "Default story order: title/tagline card first, then the strongest payoff or surprise line as the first spoken beat, then supporting context. The payoff is the hook; do not bury it at the end when it can cleanly open the clip.",
-            "Only move a payoff line to the first spoken beat if that source line is syntactically and semantically self-contained. If it starts with a connective such as 'but', 'and', or 'so', depends on prior context, or would sound like a mid-sentence start, either include the needed setup before it or defer the candidate.",
-            "Every planned clip ad should open with a short, intentional title/tagline card unless the visual action itself is the payoff. For interview, narration, or explanation-led hooks, use a black title card first; do not replace it with source video just because dialogue can start immediately.",
-            "Title/tagline cards are ad headlines, not summaries. Make concept_title and the first rendered caption_or_overlay short, concrete, and punchy: target 3-7 words, with a soft cap of 9 words or about 55 characters unless a source quote or essential number forces more.",
-            "A cold viewer still needs to understand the promise before source audio plays. Use a concrete subject plus a surprising payoff, but do not explain the whole clip in the title. Put extra context in opening_hook.visual as a small subtitle or in the following spoken beat, not in caption_or_overlay.",
-            "Prefer specific high-curiosity wording like 'Moon hammers are custom-built', 'Ancient Rome had takeout', 'One cut reveals MIT', or 'Rejected 30 times, then NASA'. Avoid long institutional or academic summary titles like 'NASA has to preserve future Moon samples for decades of science'.",
-            "Do not use cryptic shorthand, unexplained numbers, ambiguous binaries, insider labels, or source-specific abbreviations. If a short accurate title cannot be written without sounding vague, defer the candidate.",
-            "The first generated title card's caption_or_overlay should normally be identical to concept_title. If it differs, it must be a clearer sentence-case variant, not a vaguer slogan. Do not make concept_title clearer than the rendered title card.",
-            "Use sentence case for title/tagline cards. Do not use all caps except acronyms or one intentionally emphasized word.",
-            "Title/tagline card duration should normally be 4-5 seconds. Do not use a 1-2 second title flash unless the visual action itself immediately explains the hook.",
-            "For any generated title, hook, or CTA card, set source_start and source_end to 0, visual_source exactly to 'Generated black title card.', and audio_source to 'No source dialogue; silent generated title card.' Do not describe it as a music bed only or source roomtone; the renderer treats that as ambiguous.",
-            "Title, overlay, and caption wording must preserve the source claim. Do not compress 'the next words were about science' into the false literal claim 'the next words were science'; distinguish narrator interpretation from the actual quoted words.",
-            "If the payoff occurs later in the source than its setup, jump to the payoff first, then cut back to the setup/context. Make this chronology shift explicit in the edit_action and cover it with B-roll when needed.",
-            "Prefer a black title card or other fully intentional title beat over silent source video before dialogue. Do not let source video run for multiple seconds before the audio starts unless the visual action itself is the hook.",
-            "Prefer plans that use visually provable moments. If the best spoken hook starts with a talking head, recommend a title card, B-roll cover, visual-first cold open, or J-cut when appropriate.",
-            "Before creating a plan, check whether the named object/action in the hook can be visually proven. If the plan would have to say 'verify whether the object is visible' for a core premise, defer the candidate instead of rendering it.",
-            "Do not use generic related visuals as a substitute for a concrete object named by the hook. A clip titled around a Moon hammer must show a hammer, a hammer-like tool, or an unambiguous gloved-hand tool strike/grip; otherwise it belongs in deferred_candidates.",
-            "If dense candidate visual-index sheets are included, use them as the authority for exact visual proof. Cite specific timestamps from those sheets in visual_source, source_ranges, visual_plan, and verification_steps.",
-            "Be explicit about where audio and video may need to be offset, covered with B-roll, faded in, or manually checked for speaker/narration alignment.",
-            "Do not include transcript-artifact text as dialogue. Put questionable ranges in the manual review queue.",
-            "STAGE 1 OUTPUT JSON:",
-            json.dumps(stage1_output, ensure_ascii=False, indent=2),
-            "STAGE 2 OUTPUT JSON:",
-            json.dumps(stage2_output, ensure_ascii=False, indent=2),
-        ]
+    return render_prompt_template(
+        f"stage3_{content_mode}.md",
+        clip_count=clip_count,
+        target_seconds=target_seconds,
+        target_aspect_ratio=target_aspect_ratio,
+        stage1_output_json=json.dumps(stage1_output, ensure_ascii=False, indent=2),
+        stage2_output_json=json.dumps(stage2_output, ensure_ascii=False, indent=2),
     )
 
 
@@ -436,7 +520,7 @@ def request_fingerprint_payload(
         "input": [
             {
                 "role": "developer",
-                "content": DEVELOPER_INSTRUCTIONS,
+                "content": developer_instructions(),
             },
             {
                 "role": "user",
@@ -516,11 +600,13 @@ def write_markdown(
     lines = [
         f"# {output.get('video_title', 'Stage 3 Edit Plans')}",
         "",
+        f"- Content mode: `{output.get('content_mode', 'ad')}`",
+        "",
         "## Summary",
         "",
         str(output.get("plan_summary", "")).strip(),
         "",
-        "## Clip Ads",
+        "## Clip Ads" if output.get("content_mode") != "excerpt" else "## Excerpt Plans",
         "",
     ]
     for clip in output.get("clip_ads", []) or []:
@@ -551,6 +637,22 @@ def write_markdown(
             for step in clip.get("verification_steps", []) or []:
                 lines.append(f"- {step}")
             lines.append("")
+        if clip.get("media_request_ids"):
+            lines.append(f"Media requests: `{', '.join(clip.get('media_request_ids', []))}`")
+            lines.append("")
+    if output.get("media_requests"):
+        lines.extend(["## Media Requests", ""])
+        for item in output.get("media_requests", []) or []:
+            lines.append(
+                f"- `{item.get('id', '')}` `{item.get('request_type', '')}` "
+                f"`{item.get('desired_asset_type', '')}` risk `{item.get('rights_risk', '')}`: "
+                f"{item.get('purpose', '')}"
+            )
+            if item.get("search_query"):
+                lines.append(f"  Search: {item.get('search_query')}")
+            if item.get("generation_prompt"):
+                lines.append(f"  Generate: {item.get('generation_prompt')}")
+        lines.append("")
     if output.get("manual_review_queue"):
         lines.extend(["## Manual Review Queue", ""])
         for item in output.get("manual_review_queue", []) or []:
@@ -613,6 +715,11 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
     stage2_path = args.stage2_output.expanduser().resolve()
     contact_sheet_path = args.contact_sheet.expanduser().resolve() if args.contact_sheet else None
     visual_index_path = args.visual_index_manifest.expanduser().resolve() if args.visual_index_manifest else None
+    augmentation_assets_path = (
+        args.augmentation_assets.expanduser().resolve()
+        if args.augmentation_assets
+        else None
+    )
     for path in [transcript_path, manifest_path, stage1_path, stage2_path]:
         if not path.exists():
             raise FileNotFoundError(path)
@@ -620,6 +727,8 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError(contact_sheet_path)
     if visual_index_path is not None and not visual_index_path.exists():
         raise FileNotFoundError(visual_index_path)
+    if augmentation_assets_path is not None and not augmentation_assets_path.exists():
+        raise FileNotFoundError(augmentation_assets_path)
 
     pricing = Pricing(
         input_usd_per_million=args.input_usd_per_million,
@@ -628,6 +737,9 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
     )
     stage1_output = read_json(stage1_path)
     stage2_output = read_json(stage2_path)
+    content_mode = args.content_mode or str(
+        stage2_output.get("content_mode") or stage1_output.get("content_mode") or "ad"
+    )
     stage1_output_text = stable_json(stage1_output)
     stage2_output_text = stable_json(stage2_output)
     source_materials = build_source_materials(
@@ -660,12 +772,30 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
                 json.dumps(visual_index, ensure_ascii=False, indent=2),
             ]
         )
+    augmentation_assets_text = ""
+    if augmentation_assets_path is not None:
+        augmentation_assets = compact_augmentation_assets(augmentation_assets_path)
+        augmentation_assets_text = stable_json(augmentation_assets)
+        source_materials = "\n\n".join(
+            [
+                source_materials,
+                "OPTIONAL AUGMENTATION ASSET CATALOG",
+                (
+                    "These local, rights-reviewed assets may be used as related cutaway, "
+                    "graphic, or quiet audio-bed material. Use only asset ids listed here, "
+                    "and only when the usage notes and license metadata make the asset "
+                    "appropriate for the excerpt."
+                ),
+                json.dumps(augmentation_assets, ensure_ascii=False, indent=2),
+            ]
+        )
     task_prompt = build_task_prompt(
         stage1_output=stage1_output,
         stage2_output=stage2_output,
         clip_count=args.clip_count,
         target_aspect_ratio=args.target_aspect_ratio,
         target_seconds=args.target_seconds,
+        content_mode=content_mode,
     )
     image_count = (1 if contact_sheet_path is not None else 0) + len(visual_index_images)
     preflight_cost = estimated_stage3_cost(
@@ -792,18 +922,22 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
                 "contact_sheet": str(contact_sheet_path) if contact_sheet_path else None,
                 "stage1_output": str(stage1_path),
                 "stage2_output": str(stage2_path),
-                "visual_index_manifest": str(visual_index_path) if visual_index_path else None,
-                "visual_index_images": [str(path) for path in visual_index_images],
-            },
+            "visual_index_manifest": str(visual_index_path) if visual_index_path else None,
+            "visual_index_images": [str(path) for path in visual_index_images],
+            "augmentation_assets": str(augmentation_assets_path) if augmentation_assets_path else None,
+        },
             "hashes": {
                 "source_materials_sha256": sha256_text(source_materials),
                 "task_prompt_sha256": sha256_text(task_prompt),
                 "stage1_output_sha256": sha256_text(stage1_output_text),
                 "stage2_output_sha256": sha256_text(stage2_output_text),
                 "contact_sheet_sha256": contact_sheet_hash,
-                "visual_index_sha256": visual_index_hash,
-                "visual_index_image_sha256s": visual_index_image_hashes,
-            },
+            "visual_index_sha256": visual_index_hash,
+            "visual_index_image_sha256s": visual_index_image_hashes,
+            "augmentation_assets_sha256": (
+                sha256_text(augmentation_assets_text) if augmentation_assets_text else None
+            ),
+        },
             "preflight_cost": preflight_cost,
             "pricing": {
                 "input_usd_per_million": pricing.input_usd_per_million,
@@ -912,7 +1046,7 @@ def run_stage3(args: argparse.Namespace) -> dict[str, Any]:
     input_messages: list[dict[str, Any]] = [
         {
             "role": "developer",
-            "content": DEVELOPER_INSTRUCTIONS,
+            "content": developer_instructions(),
         },
         {"role": "user", "content": content},
         {
@@ -1049,8 +1183,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--stage1-output", type=Path, required=True)
     parser.add_argument("--stage2-output", type=Path, required=True)
+    parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
     parser.add_argument("--contact-sheet", type=Path, default=None)
     parser.add_argument("--visual-index-manifest", type=Path, default=None)
+    parser.add_argument(
+        "--augmentation-assets",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON catalog of local, rights-reviewed assets that Stage 3 "
+            "may reference as asset://id in visual_source/audio_source."
+        ),
+    )
     parser.add_argument("--visual-index-max-images", type=int, default=None)
     parser.add_argument(
         "--no-visual-index-images",

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PROVIDER = "openai"
+DEFAULT_PROVIDER = "elevenlabs"
 DEFAULT_OPENAI_MODEL = "whisper-1"
 DEFAULT_ELEVENLABS_MODEL = "scribe_v2"
 TRANSCRIBE_PROVIDER_CHOICES = ("openai", "elevenlabs")
@@ -957,7 +957,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         choices=TRANSCRIBE_PROVIDER_CHOICES,
         default=None,
-        help="Transcription provider. Defaults to TRANSCRIBE_PROVIDER or openai.",
+        help="Transcription provider. Defaults to TRANSCRIBE_PROVIDER or elevenlabs.",
     )
     parser.add_argument("--model", default=None, help="Provider transcription model.")
     parser.add_argument("--language", default=None, help="Optional ISO language code, e.g. en.")
