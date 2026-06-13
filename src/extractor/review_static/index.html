@@ -59,6 +59,7 @@
 let CURRENT = null;            // current project detail
 let FFMPEG = false;            // whether ffmpeg is available for in-app render
 const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+const fmt1 = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}.${Math.floor((s%1)*10)}`;
 
 async function loadProjects(){
   const d = await (await fetch('/api/projects')).json();
@@ -101,7 +102,7 @@ function currentSegments(c){
 
 function renderClip(c,idx){
   const div=document.createElement('div'); div.className='clip'; div.dataset.idx=idx;
-  const words=c.words.map((w,wi)=>`<span class="w ${w.in?'in':'out'}" data-wi="${wi}">${w.text}</span>`).join(' ');
+  const words=c.words.map((w,wi)=>`<span class="w ${w.in?'in':'out'}" data-wi="${wi}" title="source ${fmt1(w.start)}">${w.text}</span>`).join(' ');
   div.innerHTML=`
     <div class="cliphead">
       <input class="title" value="${(c.title||c.clip_id).replace(/"/g,'&quot;')}">
@@ -117,10 +118,11 @@ function renderClip(c,idx){
       <span class="hint renderstatus"></span>
     </div>
     <div class="transcript">${words || '<span class="hint">no transcript words for this clip</span>'}</div>
+    <div class="segtimes hint"></div>
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
     <div class="row">
       <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
-      <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div><div class="phone"><video class="pv" controls></video><div class="cap"></div></div></div>
+      <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div><div class="phone"><video class="pv" controls></video><div class="cap"></div></div><div class="clock pvclock hint">source —:— · cut —:—</div></div>
     </div>`;
 
   // word toggling
@@ -148,6 +150,8 @@ function updateSegInfo(div,c){
   const segs=currentSegments(c);
   const total=segs.reduce((a,s)=>a+(s.source_out-s.source_in),0)+c.title_card_seconds;
   div.querySelector('.seginfo').textContent=`${segs.length} segment(s), ~${total.toFixed(1)}s`;
+  const cuts=segs.map(s=>`${fmt(s.source_in)}–${fmt(s.source_out)}`).join('  ');
+  div.querySelector('.segtimes').textContent = cuts ? 'source cuts: '+cuts : '';
 }
 
 // Captions ARE the in-words in transcript-first editing — derive them live from
@@ -173,8 +177,11 @@ function previewCut(div,c){
   if(!CURRENT.source_url){ alert('Source video not found, cannot preview.'); return; }
   const segs=currentSegments(c); if(!segs.length){ alert('No words selected.'); return; }
   const caps=captionsFromWords(c.words);
-  const v=div.querySelector('.pv'); const cap=div.querySelector('.cap');
+  const v=div.querySelector('.pv'); const cap=div.querySelector('.cap'); const clk=div.querySelector('.pvclock');
   if(v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url;
+  // cumulative cut time at the start of each segment (excl. title card)
+  const before=[]; let acc=0;
+  for(const s of segs){ before.push(acc); acc+=s.source_out-s.source_in; }
   let i=0;
   const playSeg=()=>{ if(i>=segs.length){ cap.textContent=''; v.pause(); return; } v.currentTime=segs[i].source_in; v.play(); };
   v.ontimeupdate=()=>{
@@ -183,6 +190,8 @@ function previewCut(div,c){
     const t=v.currentTime;
     const line=caps.find(x=>x.source_start<=t && t<=x.source_end);
     cap.textContent=line?line.text:'';
+    const cut=before[i]+(t-s.source_in);
+    clk.textContent=`source ${fmt1(t)} · cut ${fmt1(cut)} / ${fmt1(acc)}`;
   };
   i=0; playSeg();
 }
