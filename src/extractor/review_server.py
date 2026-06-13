@@ -37,8 +37,59 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 DEFAULT_LIBRARY = Path.home() / "Documents" / "clipinator"
 STATIC_DIR = Path(__file__).resolve().parent / "review_static"
 SCAN_MAX_DEPTH = 7
-SCAN_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "Library", ".Trash"}
+SCAN_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "Library", ".Trash", "review"}
 SCAN_MAX_PROJECTS = 500
+
+# Background single-clip render jobs and the previews they produce. Previews are
+# served via /video even though they live under review/ (which discovery skips).
+RENDER_JOBS: dict[str, dict[str, Any]] = {}
+RENDER_JOBS_LOCK = threading.Lock()
+RENDERED_PREVIEWS: set[str] = set()
+
+
+def ffmpeg_available() -> bool:
+    import shutil
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def start_render_job(*, plan_path: Path, source: Path, transcript: Path | None,
+                     out_dir: Path, clip_id: str) -> str:
+    import sys
+    import uuid
+    job_id = uuid.uuid4().hex[:12]
+    with RENDER_JOBS_LOCK:
+        RENDER_JOBS[job_id] = {"status": "running", "message": "Rendering…"}
+
+    def worker() -> None:
+        import subprocess
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # render_plan imports only stdlib + extractor; point PYTHONPATH at the
+        # package root so the subprocess finds it whether run from src or installed.
+        import extractor
+        src_root = str(Path(extractor.__file__).resolve().parents[1])
+        env = {**os.environ, "PYTHONPATH": src_root}
+        cmd = [sys.executable, "-m", "extractor.render_plan",
+               "--source-video", str(source), "--plan-output", str(plan_path),
+               "--output-dir", str(out_dir), "--output-label", "", "--clip-id", clip_id]
+        if transcript is not None:
+            cmd += ["--transcript", str(transcript)]
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()[-1:] or ["render failed"]
+            with RENDER_JOBS_LOCK:
+                RENDER_JOBS[job_id] = {"status": "error", "message": tail[0]}
+            return
+        mp4 = out_dir / f"{clip_id}.mp4"
+        if not mp4.exists():
+            with RENDER_JOBS_LOCK:
+                RENDER_JOBS[job_id] = {"status": "error", "message": "Render finished but no file was produced."}
+            return
+        RENDERED_PREVIEWS.add(str(mp4.resolve()))
+        with RENDER_JOBS_LOCK:
+            RENDER_JOBS[job_id] = {"status": "done", "message": "Done.", "output": str(mp4)}
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
 
 
 def load_config() -> dict[str, Any]:
@@ -266,12 +317,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._api_project(query.get("id", [""])[0])
             elif route == "/api/config":
                 self._json(load_config())
+            elif route == "/api/render-status":
+                self._api_render_status(query.get("job", [""])[0])
             elif route == "/video":
                 self._serve_video(query.get("path", [""])[0])
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
-        except BrokenPipeError:
-            pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client closed the connection (common while scrubbing video)
         except Exception as exc:  # never leak a traceback to the browser
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Something went wrong: {exc}")
 
@@ -280,9 +333,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/save":
                 self._api_save()
+            elif parsed.path == "/api/render":
+                self._api_render()
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             pass
         except RuntimeError as exc:  # validation / known errors -> plain message
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
@@ -300,7 +355,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
         config = load_config()
         projects, allowed = discover_projects(library_dir(config))
         type(self).allowed_media = allowed
-        self._json({"library": str(library_dir(config)), "projects": projects})
+        self._json({
+            "library": str(library_dir(config)),
+            "projects": projects,
+            "ffmpeg": ffmpeg_available(),
+        })
 
     def _api_project(self, pid: str) -> None:
         from urllib.parse import unquote
@@ -313,9 +372,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
         type(self).allowed_media = allowed
         self._json(project_detail(manifest_path))
 
-    def _api_save(self) -> None:
+    def _write_human_plan(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Apply the edit overlay from the browser and write the human plan.
+
+        Shared by save and render. Returns paths needed to render afterward.
+        """
         from urllib.parse import unquote
-        body = self._read_json_body()
         manifest_path = Path(unquote(str(body.get("project_id", ""))))
         if not manifest_path.exists():
             raise RuntimeError("That project could not be found.")
@@ -324,29 +386,64 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if not (plan_path and Path(str(plan_path)).exists()):
             raise RuntimeError("The plan for this project is missing.")
         plan = read_json(Path(str(plan_path)))
+        source = manifest.get("source_video")
         transcript_path = manifest.get("transcript")
         words = (
             transcript_words_from_data(read_json(Path(str(transcript_path))))
             if transcript_path and Path(str(transcript_path)).exists() else []
         )
-        source = manifest.get("source_video")
         duration = probe_duration(Path(str(source))) if source and Path(str(source)).exists() else None
 
-        edits = {"clips": body.get("clips", [])}
-        revised = apply_edits(plan, edits, words, duration, source="clipinator-review-editor")
-
+        revised = apply_edits(plan, {"clips": body.get("clips", [])}, words, duration,
+                              source="clipinator-review-editor")
         out_dir = run_root_of(manifest_path) / "review" / manifest_path.parent.name
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "plan-output.human.json"
         write_json(out_path, revised)
-        he = revised["human_edit"]
+        return {
+            "revised": revised, "out_path": out_path, "out_dir": out_dir,
+            "source": source, "transcript": transcript_path,
+        }
+
+    def _api_save(self) -> None:
+        info = self._write_human_plan(self._read_json_body())
+        he = info["revised"]["human_edit"]
         self._json({
             "ok": True,
-            "output": str(out_path),
-            "kept": len(revised["clip_ads"]),
+            "output": str(info["out_path"]),
+            "kept": len(info["revised"]["clip_ads"]),
             "dropped": he["dropped_clip_ids"],
             "reworked": he["rework_clip_ids"],
         })
+
+    def _api_render(self) -> None:
+        if not ffmpeg_available():
+            raise RuntimeError("ffmpeg is not installed; install it to render clips here.")
+        body = self._read_json_body()
+        clip_id = str(body.get("clip_id", ""))
+        if not clip_id:
+            raise RuntimeError("No clip specified to render.")
+        info = self._write_human_plan(body)  # save current edits first
+        if not (info["source"] and Path(str(info["source"])).exists()):
+            raise RuntimeError("The source video for this project was not found.")
+        job_id = start_render_job(
+            plan_path=info["out_path"],
+            source=Path(str(info["source"])),
+            transcript=Path(str(info["transcript"])) if info["transcript"] else None,
+            out_dir=info["out_dir"] / "preview-renders",
+            clip_id=clip_id,
+        )
+        self._json({"job_id": job_id})
+
+    def _api_render_status(self, job_id: str) -> None:
+        job = RENDER_JOBS.get(job_id)
+        if not job:
+            self._error(HTTPStatus.NOT_FOUND, "Unknown render job.")
+            return
+        payload = {"status": job["status"], "message": job.get("message", "")}
+        if job["status"] == "done" and job.get("output"):
+            payload["output_url"] = video_url(job["output"])
+        self._json(payload)
 
     def _serve_static(self, rel: str) -> None:
         path = (STATIC_DIR / rel).resolve()
@@ -369,7 +466,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "Missing path.")
             return
         path = Path(raw_path)
-        if str(path.resolve()) not in type(self).allowed_media:
+        if str(path.resolve()) not in type(self).allowed_media and str(path.resolve()) not in RENDERED_PREVIEWS:
             self._error(HTTPStatus.FORBIDDEN, "That file is not part of a known project.")
             return
         if not path.exists():
@@ -417,7 +514,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 chunk = handle.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return  # browser aborted the range request (normal while scrubbing)
                 remaining -= len(chunk)
 
 

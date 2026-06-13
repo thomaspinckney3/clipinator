@@ -96,8 +96,16 @@ plan-output.human.json`. Verified end-to-end on the Gemes run (word flags, save
 with a drop → valid human plan; word-boundary reconstruction faithful, merges
 sub-second gaps as expected). Inline JS syntax-checked.
 
-NOT yet built: "render this clip" endpoint (single-clip `render-plan` + progress
-UI); inline AI critique suggestions; conversational rework via LLM.
+**"Render this clip" built**: `POST /api/render` saves the current edits then
+runs single-clip `render-plan` in a background thread; the front-end polls
+`/api/render-status` and swaps in the new render. ffmpeg-gated (button disabled
+with a friendly note when absent); previews land in `<run>/review/<variant>/
+preview-renders/` (discovery skips `review/`) and are served via an allowlist.
+Video streaming tolerates client disconnects (normal while scrubbing) without
+tracebacks. Verified live on the Gemes run (job → done → served 200).
+
+NOT yet built: inline AI critique suggestions; conversational rework via LLM
+(both add the only API-key dependency).
 
 ## Why this shape (innovation thesis)
 

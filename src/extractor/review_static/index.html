@@ -57,11 +57,13 @@
 </div>
 <script>
 let CURRENT = null;            // current project detail
+let FFMPEG = false;            // whether ffmpeg is available for in-app render
 const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
 
 async function loadProjects(){
   const d = await (await fetch('/api/projects')).json();
-  document.getElementById('lib').textContent = 'Library: ' + d.library;
+  FFMPEG = !!d.ffmpeg;
+  document.getElementById('lib').textContent = 'Library: ' + d.library + (FFMPEG?'':'  (ffmpeg not found — preview only)');
   const sb = document.getElementById('sidebar');
   if(!d.projects.length){ sb.innerHTML='<div class="empty">No projects found. Drag a project folder onto the launcher.</div>'; return; }
   sb.innerHTML='';
@@ -110,7 +112,9 @@ function renderClip(c,idx){
       <label><input type="checkbox" class="keep" checked> keep</label>
       <label><input type="radio" name="dec${idx}" class="rework"> rework</label>
       <button class="preview">▶ preview cut</button>
+      <button class="render" title="Render this clip with ffmpeg">render this clip</button>
       <span class="hint seginfo"></span>
+      <span class="hint renderstatus"></span>
     </div>
     <div class="transcript">${words || '<span class="hint">no transcript words for this clip</span>'}</div>
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
@@ -132,6 +136,10 @@ function renderClip(c,idx){
   div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
   // preview the cut from the source, segment by segment, with captions
   div.querySelector('.preview').onclick=()=>previewCut(div,c);
+  // render this clip for real (ffmpeg) — gated on availability
+  const rb=div.querySelector('.render');
+  if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
+  rb.onclick=()=>renderClipNow(div,c);
   updateSegInfo(div,c);
   return div;
 }
@@ -159,18 +167,45 @@ function previewCut(div,c){
   i=0; playSeg();
 }
 
+function clipPayload(c){
+  return {clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
+          title_card_seconds:c.title_card_seconds, notes:c.notes||'',
+          segments: c.decision==='drop'?[]:currentSegments(c), captions:c.captions};
+}
+
+async function renderClipNow(div,c){
+  const status=div.querySelector('.renderstatus');
+  const btn=div.querySelector('.render'); btn.disabled=true;
+  status.textContent='Saving + rendering… (about a minute)';
+  try{
+    const res=await fetch('/api/render',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, clips:CURRENT.clips.map(clipPayload)})});
+    const d=await res.json();
+    if(d.error){ status.textContent='Error: '+d.error; btn.disabled=false; return; }
+    const poll=async()=>{
+      const s=await (await fetch('/api/render-status?job='+d.job_id)).json();
+      if(s.status==='running'){ status.textContent='Rendering…'; setTimeout(poll,2000); return; }
+      btn.disabled=false;
+      if(s.status==='done' && s.output_url){
+        status.textContent='Rendered ✓';
+        const vid=div.querySelector('.row .col video'); // the "current render" player
+        if(vid){ vid.src=s.output_url + '&t=' + Date.now(); }
+        else { // no prior preview element; insert one
+          const col=div.querySelector('.row .col');
+          col.innerHTML='<div class="hint">current render</div><video src="'+s.output_url+'" controls preload="metadata"></video>';
+        }
+      } else { status.textContent='Error: '+(s.message||'render failed'); }
+    };
+    poll();
+  }catch(e){ status.textContent='Error: '+e; btn.disabled=false; }
+}
+
 async function save(){
   if(!CURRENT) return;
   const status=document.getElementById('status'); status.textContent='Saving…';
-  const clips=CURRENT.clips.map(c=>({
-    clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
-    title_card_seconds:c.title_card_seconds, notes:c.notes||'',
-    segments: c.decision==='drop'?[]:currentSegments(c),
-    captions: c.captions,
-  }));
   try{
     const res=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:CURRENT.id, clips})});
+      body:JSON.stringify({project_id:CURRENT.id, clips:CURRENT.clips.map(clipPayload)})});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; return; }
     status.textContent=`Saved ✓  ${d.kept} kept, ${d.dropped.length} dropped → ${d.output}`;
