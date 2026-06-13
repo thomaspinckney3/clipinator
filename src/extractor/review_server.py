@@ -52,6 +52,106 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
+def load_env_file_minimal() -> None:
+    """Load KEY=VALUE lines from the repo .env (for OPENAI_API_KEY etc.) without
+    importing the heavy pipeline modules — keeps the core server dependency-free."""
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+def openai_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("openai") is not None and bool(os.environ.get("OPENAI_API_KEY"))
+
+
+REWORK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    # strict json_schema requires every property to be listed in "required"
+    "required": ["kept_sentences", "note"],
+    "properties": {
+        "kept_sentences": {"type": "array", "items": {"type": "integer"}},
+        "note": {"type": "string"},
+    },
+}
+
+
+def build_sentences(neigh: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group neighborhood words into sentences by terminal punctuation."""
+    import re
+    sents: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    for w in neigh:
+        cur.append(w)
+        if re.search(r'[.!?]["\')]?$', w["text"]):
+            sents.append(cur)
+            cur = []
+    if cur:
+        sents.append(cur)
+    return sents
+
+
+def rework_clip(neigh: list[dict[str, Any]], in_idx: set[int], instruction: str) -> tuple[set[int], str]:
+    """Ask the model to re-select sentences per the editor's instruction.
+
+    `neigh` is the clip neighborhood (words with global index `gi`, text, start,
+    end); `in_idx` is the currently-included global indices. Returns the new set
+    of included global indices plus a short note. Lazy-imports openai so the core
+    server has no third-party dependency.
+    """
+    from openai import OpenAI
+    from extractor.openai_responses import create_response_streaming
+
+    def ts(s: float) -> str:
+        return f"{int(s // 60)}:{int(s % 60):02d}"
+
+    sents = build_sentences(neigh)
+    lines = []
+    for i, s in enumerate(sents):
+        inflag = any(w["gi"] in in_idx for w in s)
+        text = " ".join(w["text"] for w in s)
+        lines.append(f"[{i}]{'*' if inflag else ' '} ({ts(s[0]['start'])}-{ts(s[-1]['end'])}) {text}")
+
+    developer = (
+        "You are helping a video editor refine a short standalone excerpt from a "
+        "lecture transcript. You are given numbered sentences from the source with "
+        "timestamps; a leading '*' marks sentences currently IN the excerpt. Apply "
+        "the editor's instruction and return kept_sentences: the indices that should "
+        "be IN the revised excerpt, in source order. Keep it coherent and self-"
+        "contained, starting and ending on clean sentence boundaries; do not invent "
+        "indices outside the list."
+    )
+    user = f"Editor instruction: {instruction}\n\nSentences:\n" + "\n".join(lines)
+    client = OpenAI(timeout=float(os.environ.get("OPENAI_CLIENT_TIMEOUT_SECONDS", "600")))
+    resp = create_response_streaming(
+        client, label="rework",
+        model=os.environ.get("REVIEW_REWORK_MODEL") or "gpt-5.5",
+        input=[{"role": "developer", "content": developer},
+               {"role": "user", "content": user}],
+        reasoning={"effort": os.environ.get("REVIEW_REWORK_EFFORT") or "low"},
+        max_output_tokens=2000,
+        store=False,
+        text={"format": {"type": "json_schema", "name": "rework_selection",
+                         "schema": REWORK_SCHEMA, "strict": True}},
+    )
+    out = json.loads(resp.output_text)
+    kept = set(int(i) for i in out.get("kept_sentences", []))
+    new_in: set[int] = set()
+    for i, s in enumerate(sents):
+        if i in kept:
+            new_in.update(w["gi"] for w in s)
+    return new_in, str(out.get("note", "")).strip()
+
+
 def start_render_job(*, plan_path: Path, source: Path, transcript: Path | None,
                      out_dir: Path, clip_id: str) -> str:
     import sys
@@ -392,6 +492,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._api_save()
             elif parsed.path == "/api/render":
                 self._api_render()
+            elif parsed.path == "/api/rework":
+                self._api_rework()
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
         except (BrokenPipeError, ConnectionResetError):
@@ -416,6 +518,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             "library": str(library_dir(config)),
             "projects": projects,
             "ffmpeg": ffmpeg_available(),
+            "ai": openai_available(),
         })
 
     def _api_project(self, pid: str) -> None:
@@ -491,6 +594,57 @@ class ReviewHandler(BaseHTTPRequestHandler):
             clip_id=clip_id,
         )
         self._json({"job_id": job_id})
+
+    def _api_rework(self) -> None:
+        if not openai_available():
+            raise RuntimeError("AI rework needs the openai package and OPENAI_API_KEY in .env.")
+        from urllib.parse import unquote
+        body = self._read_json_body()
+        instruction = str(body.get("instruction", "")).strip()
+        if not instruction:
+            raise RuntimeError("Type an instruction for the AI (e.g. 'tighten the middle').")
+        segs = body.get("segments", []) or []
+        if not segs:
+            raise RuntimeError("Select some words first so the AI knows the current cut.")
+        manifest_path = Path(unquote(str(body.get("project_id", ""))))
+        if not manifest_path.exists():
+            raise RuntimeError("That project could not be found.")
+        manifest = read_json(manifest_path)
+        transcript_path = manifest.get("transcript")
+        if not (transcript_path and Path(str(transcript_path)).exists()):
+            raise RuntimeError("The transcript for this project is missing.")
+        words = transcript_words_from_data(read_json(Path(str(transcript_path))))
+
+        lo = min(s["source_in"] for s in segs) - 45.0
+        hi = max(s["source_out"] for s in segs) + 45.0
+        neigh = [
+            {"gi": i, "text": w["text"], "start": float(w["start"]), "end": float(w["end"])}
+            for i, w in enumerate(words)
+            if float(w["end"]) >= lo and float(w["start"]) <= hi
+        ]
+        in_idx = {n["gi"] for n in neigh
+                  if any(s["source_in"] - 1e-6 <= n["start"] <= s["source_out"] + 1e-6 for s in segs)}
+        new_in, note = rework_clip(neigh, in_idx, instruction)
+
+        new_segs: list[dict[str, float]] = []
+        run = None
+        prev = None
+        for i in sorted(new_in):
+            w = words[i]
+            if run is not None and prev == i - 1:
+                run["source_out"] = float(w["end"])
+            else:
+                if run is not None:
+                    new_segs.append(run)
+                run = {"source_in": float(w["start"]), "source_out": float(w["end"])}
+            prev = i
+        if run is not None:
+            new_segs.append(run)
+        self._json({
+            "segments": [{"source_in": round(s["source_in"], 3), "source_out": round(s["source_out"], 3)}
+                         for s in new_segs],
+            "note": note,
+        })
 
     def _api_render_status(self, job_id: str) -> None:
         job = RENDER_JOBS.get(job_id)
@@ -598,6 +752,7 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(argv)
 
+    load_env_file_minimal()  # make OPENAI_API_KEY available for AI rework
     config = load_config()
     chosen = args.target or args.library
     if chosen:

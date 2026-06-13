@@ -51,6 +51,10 @@
   .isslist { margin:.3rem 0 0; padding-left:1.1rem; }
   .iss { margin:.2rem 0; } .iss.sev-high { color:#8a2b2b; } .iss.sev-medium { color:#8a5a00; }
   .iss .fix { color:#555; font-size:.8rem; margin-left:.2rem; }
+  .rework-row { display:flex; gap:.5rem; align-items:center; margin-top:.5rem; flex-wrap:wrap; }
+  .rework-row .rwinstr { flex:1; min-width:18rem; font:inherit; font-size:.85rem; padding:.3rem .5rem; border:1px solid #ccc; border-radius:5px; }
+  .rework-row .rwbtn { border:1px solid #3a5bd9; color:#3a5bd9; background:#fff; border-radius:5px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; white-space:nowrap; }
+  .rework-row .rwbtn:disabled { opacity:.4; cursor:default; border-color:#bbb; color:#999; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
   .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
@@ -74,13 +78,14 @@
 <script>
 let CURRENT = null;            // current project detail
 let FFMPEG = false;            // whether ffmpeg is available for in-app render
+let AI = false;                // whether OPENAI key is available for AI rework
 const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
 const fmt1 = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}.${Math.floor((s%1)*10)}`;
 
 async function loadProjects(){
   const d = await (await fetch('/api/projects')).json();
-  FFMPEG = !!d.ffmpeg;
-  document.getElementById('lib').textContent = 'Library: ' + d.library + (FFMPEG?'':'  (ffmpeg not found — preview only)');
+  FFMPEG = !!d.ffmpeg; AI = !!d.ai;
+  document.getElementById('lib').textContent = 'Library: ' + d.library + (FFMPEG?'':'  (ffmpeg not found — preview only)') + (AI?'':'  (no AI key — rework off)');
   const sb = document.getElementById('sidebar');
   if(!d.projects.length){ sb.innerHTML='<div class="empty">No projects found. Drag a project folder onto the launcher.</div>'; return; }
   sb.innerHTML='';
@@ -199,6 +204,11 @@ function renderClip(c,idx){
     </div>
     <div class="transcript"></div>
     <div class="segtimes hint"></div>
+    <div class="rework-row">
+      <input class="rwinstr" placeholder="tell the AI how to change this cut — e.g. 'tighten the middle', 'start at the question', 'cut the aside about Wagner'">
+      <button class="rwbtn">rework with AI</button>
+      <span class="hint rwstatus"></span>
+    </div>
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
     <div class="row">
       <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
@@ -226,6 +236,12 @@ function renderClip(c,idx){
   const rb=div.querySelector('.render');
   if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
   rb.onclick=()=>renderClipNow(div,c);
+  // AI rework — gated on an OPENAI key
+  const rw=div.querySelector('.rwbtn');
+  if(!AI){ rw.disabled=true; rw.title='Set OPENAI_API_KEY in .env to enable AI rework';
+    div.querySelector('.rwinstr').disabled=true; }
+  rw.onclick=()=>reworkClip(div,c);
+  div.querySelector('.rwinstr').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); reworkClip(div,c); } });
   updateSegInfo(div,c);
   return div;
 }
@@ -285,6 +301,37 @@ function setupPreview(div,c){
   div.querySelector('.trestart').onclick=start;
   div.querySelector('.preview').onclick=start;
   pbar.onclick=e=>{ if(!segs.length) rebuild(); const r=pbar.getBoundingClientRect(); seekCut((e.clientX-r.left)/r.width*total); };
+}
+
+function applySegments(c, segs){
+  c.inSet=new Set();
+  for(let i=0;i<CURRENT.W.length;i++){
+    const w=CURRENT.W[i];
+    if(segs.some(s=>s.source_in-1e-6<=w.start && w.start<=s.source_out+1e-6)) c.inSet.add(i);
+  }
+}
+
+async function reworkClip(div,c){
+  if(!AI) return;
+  const instr=div.querySelector('.rwinstr').value.trim();
+  const status=div.querySelector('.rwstatus');
+  if(!instr){ status.textContent='Type an instruction first.'; return; }
+  const segs=currentSegments(c);
+  if(!segs.length){ status.textContent='Select some words first so the AI has a starting cut.'; return; }
+  const btn=div.querySelector('.rwbtn'); btn.disabled=true; status.textContent='Asking the AI…';
+  try{
+    const res=await fetch('/api/rework',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, instruction:instr, segments:segs})});
+    const d=await res.json();
+    if(d.error){ status.textContent='Error: '+d.error; return; }
+    if(!d.segments||!d.segments.length){ status.textContent='AI returned an empty cut — left unchanged.'; return; }
+    applySegments(c, d.segments);
+    c.win=[Math.max(0,Math.min(...d.segments.map(s=>s.source_in))-4),
+           Math.min(CURRENT.tend, Math.max(...d.segments.map(s=>s.source_out))+4)];
+    renderWords(div,c); updateSegInfo(div,c);
+    status.textContent='AI updated the cut ✓ — review and tweak'+(d.note?(' · '+d.note):'');
+  }catch(e){ status.textContent='Error: '+e; }
+  finally{ btn.disabled=false; }
 }
 
 function clipPayload(c){

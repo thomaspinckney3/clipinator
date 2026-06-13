@@ -160,6 +160,38 @@ class TestRunRoot:
         assert rs.run_root_of(mp) == tmp_path / "MyRun"
 
 
+class TestCritique:
+    def test_compact_and_match(self, tmp_path):
+        review = {"clip_id": "EX01", "verdict": "major_revision", "score_0_to_100": 66,
+                  "one_sentence_assessment": "x",
+                  "issues": [{"category": "mid_sentence", "severity": "high",
+                              "why_it_matters": "starts mid-sentence", "suggested_fix": "extend"}]}
+        reviews = {"EX01": review}
+        # exact match
+        c = rs.compact_critique(rs.clip_critique(reviews, "EX01"))
+        assert c["verdict"] == "major_revision" and c["score"] == 66
+        assert c["issues"][0]["why"] == "starts mid-sentence"
+        # prefix match (final clip carries a revise suffix)
+        assert rs.clip_critique(reviews, "EX01_R2") is review
+        assert rs.clip_critique(reviews, "ZZ") is None
+        assert rs.compact_critique(None) is None
+
+
+class TestBuildSentences:
+    def test_splits_on_terminal_punctuation(self):
+        words = [{"gi": i, "text": t, "start": i, "end": i + 0.5} for i, t in
+                 enumerate(["Hello", "there.", "How", "are", "you?", "Good!"])]
+        sents = rs.build_sentences(words)
+        assert len(sents) == 3
+        assert [w["text"] for w in sents[0]] == ["Hello", "there."]
+        assert [w["text"] for w in sents[2]] == ["Good!"]
+
+    def test_trailing_fragment_kept(self):
+        words = [{"gi": 0, "text": "no", "start": 0, "end": 1},
+                 {"gi": 1, "text": "period", "start": 1, "end": 2}]
+        assert len(rs.build_sentences(words)) == 1
+
+
 class TestVideoUrl:
     def test_none(self):
         assert rs.video_url(None) is None
