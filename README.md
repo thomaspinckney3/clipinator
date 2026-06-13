@@ -28,10 +28,11 @@ tesseract
 sox
 ```
 
-Install Python dependencies:
+Install Python dependencies. The project targets Python 3.13 (the
+`opentimelineio` interchange library has no working Python 3.14 build yet):
 
 ```bash
-python3 -m venv .venv
+python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
@@ -42,6 +43,24 @@ Python package dependencies are recorded in both `pyproject.toml` and
 ```bash
 pip install -r requirements.txt
 ```
+
+## Tests
+
+The test suite is `pytest`-based and lives in `tests/`. Install the dev extra
+and run it:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+Tests are pure and fast except a few that build a tiny video with `ffmpeg`;
+those skip automatically when `ffmpeg`/`ffprobe` are absent. Coverage focuses on
+the pure-logic core — frame-grid quantization (`test_timebase`), the edit-list
+export/import and caption mapping (`test_edit_list`), the run-layout migration
+(`test_migrate_run_layout`), and the streaming retry helper
+(`test_openai_responses`) — and includes a regression test for each fix from the
+code audit.
 
 Put local config and API keys in `.env`:
 
@@ -63,7 +82,12 @@ TRANSCRIBE_ELEVENLABS_USD_PER_HOUR=0.40
 TRANSCRIBE_CHUNK_SECONDS=
 ```
 
-`.env` is ignored by git. `.env.example` is the shareable template.
+`.env` is ignored by git. `.env.example` is the complete, commented reference
+for every setting: per-stage model/pricing/limit families (`STRATEGY_*`,
+`MOMENTS_*`, `PLAN_*`, `CRITIQUE_*`, `REVISE_*`), transcription
+(`TRANSCRIBE_*`), Cloudflare capture (`CLOUDFLARE_*`), the video API probe
+(`VIDEO_PROBE_*`), and the local response cache mode
+(`OPENAI_RESPONSE_CACHE_MODE`). CLI flags always override `.env` values.
 
 ## Capture From Cloudflare Stream
 
@@ -197,8 +221,7 @@ Expected ElevenLabs outputs per input video:
 raw/<video-stem>.elevenlabs-scribe_v2.chunk-000.json
 ```
 
-OpenAI Whisper outputs omit the provider name for compatibility with older
-pipeline runs:
+OpenAI Whisper outputs omit the provider name:
 
 ```text
 <video-stem>.whisper-1.json
@@ -288,9 +311,9 @@ resumes from that directory unless `--force` or a distinct `--run-id` is used.
 It runs:
 
 ```text
-video -> provider transcript -> local evidence -> stage 1 -> stage 2
--> dense visual index from stage 2 candidates -> stage 3
--> local subject index -> render -> stage 4 critique -> stage 5 re-edit
+video -> provider transcript -> local evidence -> strategy -> moments
+-> dense visual index from moments candidates -> plan
+-> local subject index -> draft render -> critique -> revise
 -> local subject index -> final render
 ```
 
@@ -307,16 +330,116 @@ overview contact sheet with `180px` cells. The pipeline also forwards
 visual indexing, and rendering, which resolves to ffmpeg-full plus VideoToolbox
 on supported Macs.
 
-OpenAI stage cache keys include a hash of the LLM query inputs and, by default,
-hashes of the stage source files that produced and parse that query. Set
-`OPENAI_RESPONSE_CACHE_MODE=query-only` or pass `--cache-mode query-only` to reuse
-a response when the query is unchanged but stage code has moved on.
-
 If an input MP4 is truncated, the pipeline keeps the decodable prefix instead of
 failing or planning against misleading container metadata. Audio extraction
 records the actual extracted duration, preprocessing records both container and
 effective decoded duration, and downstream OpenAI stages receive a transcript
 clipped to the usable video duration.
+
+### Run Directory Layout
+
+`extract-clips` creates one run root beside the input video (or at
+`--output-root`), named after the input file stem:
+
+```text
+<video-stem>/
+  pipeline-manifest.json          # stage outputs, costs, cache settings for this run
+  transcripts/
+    <stem>.<provider>-<model>.json / .srt
+    <stem>.<provider>-<model>.available.json   # present only for truncated inputs
+  video-evidence/<stem>/
+    manifest.json  manifest.md  contact-sheet.jpg  frames/  sheets/
+  visual-index/<stem>/            # 1 fps dense index from moments candidates
+    manifest.json  frames/  sheets/
+  subject-index/
+    <base>-plan/manifest.json     # subject/crop analysis for the draft render
+    <base>-revise/manifest.json   # subject/crop analysis for the final render
+  openai-runs/
+    _response-cache/              # local response cache shared by all stages
+    _critique-assets/<base>-critique/   # contact sheets, transition strips, waveforms
+    <base>-strategy/  strategy-output.json
+    <base>-moments/   moments-output.json
+    <base>-plan/      plan-output.json
+    <base>-critique/  critique-output.json  critique-package.json
+    <base>-revise/    revise-output.json  plan-output.json   # revised plan
+  review/
+    draft/                        # human edit list for the draft plan
+      edit-list.toml  edit-list.html  plan-output.human.json
+    final/                        # human edit list for the revised plan
+  renders/
+    [excerpt/]draft/              # ad mode omits the content-mode directory
+      <clip-id>.draft.mp4 / .draft.srt / .draft.subtitled.mp4
+      render-manifest.json
+    [excerpt/]final/              # final deliverables, no stage word in the name
+      <clip-id>.mp4 / .srt / .subtitled.mp4
+      render-manifest.json
+    [excerpt/]human/              # renders of a human-edited plan
+```
+
+`<base>` is the input stem, plus the content mode when it is not `ad`, plus the
+`--run-id` suffix when one is given (for example `my-video-excerpt-strategy`).
+With `--run-id`, the render directories also gain the variant prefix
+(`renders/[excerpt/]<run-id>-draft`), so variants never overwrite each other.
+Each `openai-runs/<base>-<stage>/` directory also records the exact request:
+`request-manifest.json`, `source-materials.txt`, `task-prompt.txt`,
+`raw-response.json`, `usage-and-cost.json`, and a human-readable `summary.md`.
+
+### Stages At A Glance
+
+| Stage | Command | Consumes | Produces |
+|---|---|---|---|
+| transcribe | `transcribe-video` | video | normalized transcript JSON + SRT |
+| preprocess | `preprocess-video` | video + transcript | evidence manifest, contact sheet, frames |
+| strategy | `openai-strategy` | transcript, evidence manifest, contact sheet | `strategy-output.json` |
+| moments | `openai-moments` | the above + strategy output | `moments-output.json` |
+| visual-index | `visual-index` (local) | video + moments output | dense frame index + candidate sheets |
+| plan | `openai-plan` | the above + moments output, visual index | `plan-output.json` (master edit plan) |
+| subject-index | `subject-index` (local) | video + plan | subject/crop analysis manifest |
+| draft-render | `render-plan` (local) | video + plan + subject index | draft MP4s, SRT, `render-manifest.json` |
+| critique | `openai-critique` | render manifest + plan | `critique-output.json`, `critique-package.json` |
+| revise | `openai-revise` | plan + critique + package + render manifest | revised `plan-output.json` |
+| final-render | `render-plan` (local) | video + revised plan + subject index | final MP4s + manifest |
+
+The plan and revise stages emit the same plan format; the renderer does not
+care which one produced its input. Only the `openai-*` stages call an API;
+everything else is local ffmpeg/ffprobe work.
+
+## Caching, Cost Approval, And Resume
+
+Three separate mechanisms reduce repeat work; they are easy to conflate.
+
+**Local response cache.** Every OpenAI stage hashes its full request into a
+cache key and stores the raw response under the cache directory
+(`openai-runs/_response-cache` for pipeline runs, `<STAGE>_CACHE_DIR` for
+standalone commands). A repeat request replays the cached response with no API
+call and no approval flag. `OPENAI_RESPONSE_CACHE_MODE` (or `--cache-mode`)
+selects the identity mode: `strict` keys on the LLM query hash plus hashes of
+the stage source files and prompt templates that produced it, so any code or
+prompt change is a cache miss; `query-only` keys on the query alone, which
+keeps cache hits across code-only changes; `off` disables the cache.
+`--refresh-cache` forces a fresh API call (and therefore requires
+`--approve-api-cost`); `--seed-cache-from-run` imports an existing run
+directory into the cache without an API call.
+
+**OpenAI server-side prompt caching.** The strategy, moments, and plan stages
+share one stable prompt prefix (transcript + video evidence) and send a shared
+`prompt_cache_key` (prefix `strategy-`), so the provider can reuse the cached
+prefix across consecutive stages. Critique and revise use their own keys
+(`critique-`, `revise-`). This affects provider-side token pricing only, not
+local behavior.
+
+**Pipeline resume.** `extract-clips` skips any stage whose expected output file
+already exists, so re-running the same input resumes where it stopped. Use
+`--force` to regenerate local artifacts, or a distinct `--run-id` to build a
+parallel variant without disturbing earlier outputs. `pipeline-manifest.json`
+records each stage's estimated and actual cost for the run.
+
+**Cost approval.** No command makes an API call without an explicit cap. Every
+API stage supports `--dry-run` (transcription uses `--estimate-cost`) to print
+an upper-bound estimate; pass `--approve-api-cost <USD>` at or above it.
+`extract-clips` takes one total cap and spends from it across all stages,
+estimating before each call; with no cap it stops at the first uncached API
+call and prints the required estimate.
 
 ## Dense Visual Indexing
 
@@ -328,7 +451,7 @@ and makes no API calls.
 ```bash
 PYTHONPATH=src python -m extractor.visual_index \
   /Volumes/t9/extract/nasa-explorers-space-school.mp4 \
-  --stage2-output /Volumes/t9/extract/openai-runs/space-school-stage2-gpt-5.5-high/stage2-output.json \
+  --moments-output /Volumes/t9/extract/openai-runs/space-school-moments-gpt-5.5-high/moments-output.json \
   --output-dir /Volumes/t9/extract/visual-index \
   --frame-interval-seconds 1 \
   --write-markdown
@@ -344,8 +467,8 @@ sheets/window-*.jpg
 sheets/candidate-*.jpg
 ```
 
-Candidate sheets are built from Stage 2 windows with padding. They are intended
-as visual-proof packages: Stage 3 should cite exact sheet timestamps for named
+Candidate sheets are built from moments-stage windows with padding. They are intended
+as visual-proof packages: the plan stage should cite exact sheet timestamps for named
 objects/actions before rendering a clip around them.
 
 ## Transcript QA
@@ -413,9 +536,9 @@ the local response-cache source hash.
 Set `CLIPINATOR_PROMPT_DIR` to point at an alternate prompt directory with the
 same filenames.
 
-## OpenAI Stage 1: Video Brief And Ad Angles
+## OpenAI Strategy Stage: Video Brief And Ad Angles
 
-Run the first LLM stage against the real OpenAI API. This consolidates the full
+Run the first LLM stage (`openai-strategy`) against the real OpenAI API. This consolidates the full
 video overview, why-to-watch summary, visual inventory, and proposed clip-ad
 angles into one structured output. It sends a compact transcript timeline, the
 local preprocessing manifest, and optionally the contact sheet image.
@@ -423,7 +546,7 @@ local preprocessing manifest, and optionally the contact sheet image.
 Dry-run the estimated API cost without making a call:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage1 \
+PYTHONPATH=src python -m extractor.openai_strategy \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
@@ -433,7 +556,7 @@ PYTHONPATH=src python -m extractor.openai_stage1 \
 Run with an explicit approved cap:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage1 \
+PYTHONPATH=src python -m extractor.openai_strategy \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
@@ -444,7 +567,7 @@ The command refuses non-dry-run API calls unless `--approve-api-cost` is
 provided. The command also computes a deterministic local response-cache key
 from the model, prompt, schema, transcript, manifest, contact sheet bytes, image
 detail, reasoning effort, and output cap. When the same request is already in
-`STAGE1_CACHE_DIR`, it reuses the cached response locally and makes no API call,
+`STRATEGY_CACHE_DIR`, it reuses the cached response locally and makes no API call,
 so no approval flag is needed.
 
 To bypass a cached response intentionally, pass `--refresh-cache`; that path is
@@ -453,52 +576,52 @@ treated as a fresh API call and still requires `--approve-api-cost`.
 Seed the cache from an existing run without calling the API:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage1 \
+PYTHONPATH=src python -m extractor.openai_strategy \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
-  --seed-cache-from-run /Volumes/t9/extract/openai-runs/space-school-stage1-gpt-5.5-high
+  --seed-cache-from-run /Volumes/t9/extract/openai-runs/space-school-strategy-gpt-5.5-high
 ```
 
-Outputs are written under `STAGE1_OUTPUT_DIR` and include:
+Outputs are written under `STRATEGY_OUTPUT_DIR` and include:
 
 ```text
 request-manifest.json
 source-materials.txt
 task-prompt.txt
 raw-response.json
-stage1-output.json
+strategy-output.json
 usage-and-cost.json
 summary.md
 ```
 
-## OpenAI Stage 2: Transcript Moment Analysis
+## OpenAI Moments Stage: Transcript Moment Analysis
 
-Run the second LLM stage after stage 1 has produced a video brief and ad-angle
-hypotheses. This stage reuses the same stable video evidence prefix and adds the
-stage-1 output, then asks for concrete timestamped transcript windows for each
+Run the second LLM stage (`openai-moments`) after the strategy stage has produced
+a video brief and ad-angle hypotheses. This stage reuses the same stable video
+evidence prefix and adds the strategy output, then asks for concrete timestamped transcript windows for each
 ad angle. It still uses the local response cache and the explicit API approval
 gate.
 
 Dry-run the estimated API cost without making a call:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage2 \
+PYTHONPATH=src python -m extractor.openai_moments \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
-  --stage1-output /Volumes/t9/extract/openai-runs/space-school-stage1-gpt-5.5-high/stage1-output.json \
+  --strategy-output /Volumes/t9/extract/openai-runs/space-school-strategy-gpt-5.5-high/strategy-output.json \
   --dry-run
 ```
 
 Run with an explicit approved cap:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage2 \
+PYTHONPATH=src python -m extractor.openai_moments \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
-  --stage1-output /Volumes/t9/extract/openai-runs/space-school-stage1-gpt-5.5-high/stage1-output.json \
+  --strategy-output /Volumes/t9/extract/openai-runs/space-school-strategy-gpt-5.5-high/strategy-output.json \
   --approve-api-cost 1.00
 ```
 
@@ -509,20 +632,21 @@ request-manifest.json
 source-materials.txt
 task-prompt.txt
 raw-response.json
-stage2-output.json
+moments-output.json
 usage-and-cost.json
 summary.md
 ```
 
-## OpenAI Stage 3: Edit Plans
+## OpenAI Plan Stage: Edit Plans
 
-Run the third LLM stage after stage 2 has produced ranked candidate moments.
+Run the third LLM stage (`openai-plan`) after the moments stage has produced
+ranked candidate moments.
 This stage creates concrete editor-facing cut plans for the strongest short-form
 clip ads: source ranges, opening hook, audio/video strategy, B-roll coverage,
 caption/overlay notes, verification steps, and rendering assumptions. It does
 not render video.
 
-Stage 3 treats the payoff as the hook by default: title/tagline card first,
+The plan stage treats the payoff as the hook by default: title/tagline card first,
 strongest payoff line as the first spoken beat, then context. It should avoid
 silent source-video lead-ins unless the visual action itself is the hook.
 Candidates without a clear payoff should be deferred instead of turned into edit
@@ -531,26 +655,26 @@ plans.
 Dry-run the estimated API cost without making a call:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage3 \
+PYTHONPATH=src python -m extractor.openai_plan \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
   --visual-index-manifest /Volumes/t9/extract/visual-index/nasa-explorers-space-school/manifest.json \
-  --stage1-output /Volumes/t9/extract/openai-runs/space-school-stage1-gpt-5.5-high/stage1-output.json \
-  --stage2-output /Volumes/t9/extract/openai-runs/space-school-stage2-gpt-5.5-high/stage2-output.json \
+  --strategy-output /Volumes/t9/extract/openai-runs/space-school-strategy-gpt-5.5-high/strategy-output.json \
+  --moments-output /Volumes/t9/extract/openai-runs/space-school-moments-gpt-5.5-high/moments-output.json \
   --dry-run
 ```
 
 Run with an explicit approved cap:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage3 \
+PYTHONPATH=src python -m extractor.openai_plan \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
   --visual-index-manifest /Volumes/t9/extract/visual-index/nasa-explorers-space-school/manifest.json \
-  --stage1-output /Volumes/t9/extract/openai-runs/space-school-stage1-gpt-5.5-high/stage1-output.json \
-  --stage2-output /Volumes/t9/extract/openai-runs/space-school-stage2-gpt-5.5-high/stage2-output.json \
+  --strategy-output /Volumes/t9/extract/openai-runs/space-school-strategy-gpt-5.5-high/strategy-output.json \
+  --moments-output /Volumes/t9/extract/openai-runs/space-school-moments-gpt-5.5-high/moments-output.json \
   --approve-api-cost 8.00
 ```
 
@@ -561,35 +685,35 @@ request-manifest.json
 source-materials.txt
 task-prompt.txt
 raw-response.json
-stage3-output.json
+plan-output.json
 usage-and-cost.json
 summary.md
 ```
 
 ## Local Draft Rendering
 
-Render local draft cuts from a stage-3 edit plan. This uses only `ffmpeg`; it
-does not call any API. The renderer uses the stage-3 timeline source ranges,
+Render local draft cuts from an edit plan. This uses only `ffmpeg`; it
+does not call any API. The renderer uses the plan's timeline source ranges,
 separates dialogue audio from visual B-roll when the edit plan provides usable
 visual time cues, formats drafts as vertical `9:16`, writes sidecar SRT
 captions, and muxes a subtitle-track version when possible. If the installed
 `ffmpeg` lacks `drawtext`, captions are not burned into the video.
 
 ```bash
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/nasa-explorers-space-school.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/space-school-stage3-gpt-5.5-high/stage3-output.json \
-  --output-dir /Volumes/t9/extract/renders/space-school-stage3-drafts
+  --plan-output /Volumes/t9/extract/openai-runs/space-school-plan-gpt-5.5-high/plan-output.json \
+  --output-dir /Volumes/t9/extract/renders/space-school-plan-drafts
 ```
 
 If a planned silent cold open creates dead air, repair that clip by borrowing
 the beginning of the following narration beat under the opening visual:
 
 ```bash
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/nasa-explorers-space-school.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/space-school-stage3-gpt-5.5-high/stage3-output.json \
-  --output-dir /Volumes/t9/extract/renders/space-school-stage3-final \
+  --plan-output /Volumes/t9/extract/openai-runs/space-school-plan-gpt-5.5-high/plan-output.json \
+  --output-dir /Volumes/t9/extract/renders/space-school-plan-final \
   --repair-silent-lead-clip clip_ad_02_moon_hammer
 ```
 
@@ -597,12 +721,13 @@ For a cleaner silent opening, replace the first silent beat with a baked-in
 black title card. On macOS the renderer uses `tools/render_title_card.swift`
 for crisp system text, with a dependency-free bitmap fallback. The renderer does
 this automatically when the first silent timeline beat is described as a title
-card; `--black-title-card-clip` forces it for older plans:
+card; `--black-title-card-clip` forces it for plans whose first silent beat is
+not described as a title card:
 
 ```bash
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/nasa-explorers-space-school.mp4 \
-  --stage3-output /Volumes/t9/extract/renders/moon-hammer-alternatives/moon-hammer-alternatives-stage3.json \
+  --plan-output /Volumes/t9/extract/renders/moon-hammer-alternatives/moon-hammer-alternatives-plan.json \
   --output-dir /Volumes/t9/extract/renders/moon-hammer-alternatives/renders-black-title \
   --black-title-card-clip clip_ad_02a_moon_hammer_geology_setup \
   --black-title-card-clip clip_ad_02b_moon_hammer_payoff_first
@@ -618,25 +743,40 @@ foreground punch-ins so the speaker is not pushed half off-screen:
 
 ```bash
 PYTHONPATH=src python -m extractor.subject_index /Volumes/t9/extract/source.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/example-stage3/stage3-output.json \
+  --plan-output /Volumes/t9/extract/openai-runs/example-plan/plan-output.json \
   --output-dir /Volumes/t9/extract/subject-index \
-  --run-id example-stage3
+  --run-id example-plan
 
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/source.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/example-stage3/stage3-output.json \
-  --subject-index-manifest /Volumes/t9/extract/subject-index/example-stage3/manifest.json \
-  --output-dir /Volumes/t9/extract/renders/example-stage3 \
+  --plan-output /Volumes/t9/extract/openai-runs/example-plan/plan-output.json \
+  --subject-index-manifest /Volumes/t9/extract/subject-index/example-plan/manifest.json \
+  --output-dir /Volumes/t9/extract/renders/example-plan \
   --use-plan-render-settings \
   --auto-foreground-scale
 ```
 
 Outputs include one `.draft.mp4`, one `.draft.srt`, and one
-`.draft.subtitled.mp4` per clip, plus `render-manifest.json`.
+`.draft.subtitled.mp4` per clip, plus `render-manifest.json`. The `.draft`
+infix is controlled by `--output-label` (default `draft`); the pipeline passes
+an empty label for the final render, so final deliverables are named
+`<clip-id>.mp4` / `.srt` / `.subtitled.mp4`.
+
+### Frame-Accurate Timing
+
+Plans carry times as float seconds, but cuts land on discrete frames. At
+ingest, the renderer and the subject indexer snap every plan time onto an
+exact frame grid (`extractor/timebase.py`): source-addressing times (timeline
+`source_start`/`source_end`, `source_ranges`, manual-review ranges) snap to
+the source video's native frame rate probed from the file (for example
+`24000/1001`), while render-clock times (screen times, caption offsets,
+durations) snap to the renderer's 30 fps output grid. Snapping uses exact
+rational arithmetic, so repeated runs are stable, and `render-manifest.json`
+records the applied rates and how many values moved under `timebase`.
 
 ### Augmentation assets
 
-Stage 3 and the renderer can experiment with related local assets for excerpt
+The plan stage and the renderer can experiment with related local assets for excerpt
 cutaways, graphics, and quiet audio beds. The assets must already be local and
 rights-reviewed; the renderer does not download web media or verify licenses.
 
@@ -667,15 +807,15 @@ Create a JSON catalog:
 }
 ```
 
-Pass it to Stage 3 so the model can plan with the catalog:
+Pass it to the plan stage so the model can plan with the catalog:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage3 \
+PYTHONPATH=src python -m extractor.openai_plan \
   --transcript /Volumes/t9/extract/transcripts/example.elevenlabs-scribe_v2.json \
   --manifest /Volumes/t9/extract/video-evidence/example/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/example/contact-sheet.jpg \
-  --stage1-output /Volumes/t9/extract/openai-runs/example-stage1/stage1-output.json \
-  --stage2-output /Volumes/t9/extract/openai-runs/example-stage2/stage2-output.json \
+  --strategy-output /Volumes/t9/extract/openai-runs/example-strategy/strategy-output.json \
+  --moments-output /Volumes/t9/extract/openai-runs/example-moments/moments-output.json \
   --content-mode excerpt \
   --augmentation-assets /Volumes/t9/extract/assets/augmentation-assets.json \
   --approve-api-cost 4.00
@@ -688,7 +828,7 @@ lecture audio. A beat can also mention `asset://id` in `audio_source` as a
 quiet bed; source dialogue remains primary unless `audio_source` starts with
 the asset URI, in which case the asset is used as that segment's audio.
 
-Stage 3 can also emit planned media requests when the useful cutaway, audio, or
+The plan stage can also emit planned media requests when the useful cutaway, audio, or
 graphic is not already local. Those appear in top-level `media_requests`, and
 clips list the relevant `media_request_ids`. Third-party requests include a
 search query, suggested source types, license requirements, review notes, and a
@@ -702,9 +842,9 @@ as a real `asset://id`. The renderer records unresolved request IDs in
 Render with the same catalog:
 
 ```bash
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/example.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/example-stage3/stage3-output.json \
+  --plan-output /Volumes/t9/extract/openai-runs/example-plan/plan-output.json \
   --transcript /Volumes/t9/extract/transcripts/example.elevenlabs-scribe_v2.json \
   --output-dir /Volumes/t9/extract/renders/example-augmented \
   --use-plan-render-settings \
@@ -713,23 +853,86 @@ PYTHONPATH=src python -m extractor.render_stage3 \
   --augmentation-assets /Volumes/t9/extract/assets/augmentation-assets.json
 ```
 
-`run_pipeline` also accepts `--augmentation-assets` and forwards it to Stage 3
-and both render passes.
+`run_pipeline` also accepts `--augmentation-assets` and forwards it to the plan
+stage and both render passes.
 
-Stage 5 can put reusable rendering defaults in the plan itself. To use those
+The revise stage can put reusable rendering defaults in the plan itself. To use those
 settings while still allowing CLI overrides, pass:
 
 ```bash
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/nasa-explorers-space-school.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/<stage5-run>/stage3-output.json \
-  --output-dir /Volumes/t9/extract/renders/<stage5-render> \
+  --plan-output /Volumes/t9/extract/openai-runs/<revise-run>/plan-output.json \
+  --output-dir /Volumes/t9/extract/renders/<revise-render> \
   --use-plan-render-settings
 ```
 
-## OpenAI Stage 4: Post-Render Review
+## Human Review: Edit List Export And Import
 
-Run the fourth LLM stage after local rendering. This stage critiques rendered
+Between the draft render and the final render, a human can adjust the proposed
+clips without touching the plan JSON. `edit-list export` writes two files into
+`review/draft/` or `review/final/` in the run root, depending on which plan is
+being reviewed:
+
+```bash
+edit-list export \
+  --plan-output <run>/openai-runs/<base>-plan/plan-output.json \
+  --render-manifest <run>/renders/excerpt/draft/render-manifest.json
+```
+
+- `edit-list.toml` - the editable artifact. One block per clip with
+  `decision` (`keep` / `drop` / `rework`), `title`, `title_card_seconds`,
+  `notes`, the source `segments` (in/out points in source-video seconds,
+  annotated with the transcript words at each boundary), and the `captions`.
+- `edit-list.html` - a read-only, self-contained review page: the source
+  video and each draft preview play inline, and every transcript word is
+  clickable to seek the source player, with a millisecond clock under each
+  player for copying timestamps into the TOML.
+
+Edit the TOML in any text editor, then apply it:
+
+```bash
+edit-list import <run>/review/draft/edit-list.toml
+```
+
+This validates the edits (ordered, non-overlapping segments inside the source
+duration; known clip ids; non-empty titles) and writes
+`plan-output.human.json` - a normal plan-format file the renderer consumes
+directly:
+
+```bash
+render-plan --source-video <video> \
+  --plan-output <run>/review/draft/plan-output.human.json \
+  --transcript <run>/transcripts/<stem>.<provider>-<model>.json \
+  --output-dir <run>/renders/excerpt/human
+```
+
+Mechanics worth knowing:
+
+- All paths embedded in the TOML and the HTML are relative to those files, so
+  a run directory is relocatable as a unit: it can move to another disk or
+  remount under a different volume prefix and the edit list keeps working. If
+  a recorded path is stale anyway (for example an absolute path from an old
+  export), `import` relinks it by file name inside the run root, the same way
+  an NLE relinks media, and says so.
+- Caption entries are anchored to source time, not render time, so caption
+  text edits survive trims; on import they are clamped onto the kept segments
+  and re-timed, and captions whose span was trimmed away go dormant with a
+  warning instead of failing. Delete a clip's `[[clips.captions]]` entries to
+  regenerate its captions from the word-level transcript.
+- When a clip's segments are unchanged (within 75 ms), its original timeline
+  entries are preserved, including B-roll and asset cutaway instructions;
+  larger changes rebuild plain source-playthrough entries.
+- `decision = "rework"` keeps the clip and records `notes` in the output plan
+  under `human_review_notes` for a later revision pass.
+- The output plan records provenance under `human_edit` (edit-list path,
+  content hash, applied time, dropped/rework clip ids).
+- Clips missing from the TOML are kept unchanged with a warning; dropping a
+  clip is always an explicit `decision = "drop"`.
+
+## OpenAI Critique Stage: Post-Render Review
+
+Run the fourth LLM stage (`openai-critique`) after local rendering. This stage critiques rendered
 draft clips using the human-review rules from this project: payoff first, no
 confusing mid-sentence opening, no mismatched talking head under narration, no
 repeated B-roll padding, smooth cuts, and no ending that drifts into a different
@@ -739,32 +942,32 @@ The rendered MP4 files stay local. The stage sends local evidence images:
 storyboard contact sheets sampled from the rendered clips, transition strips
 around segment boundaries and internal multi-cut B-roll edits, and audio waveform timelines. The prompt also includes the
 render manifest, SRT captions, local silence/caption timing diagnostics,
-source-range overlap warnings, and the optional stage-3 edit plan.
+source-range overlap warnings, and the optional edit plan.
 
 Dry-run the estimated API cost without making a call:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage4_review \
+PYTHONPATH=src python -m extractor.openai_critique \
   --render-manifest /Volumes/t9/extract/renders/space-school-underwater-fixed/renders-tight/render-manifest.json \
-  --stage3-output /Volumes/t9/extract/renders/space-school-underwater-fixed/space-school-underwater-tight-stage3.json \
+  --plan-output /Volumes/t9/extract/renders/space-school-underwater-fixed/space-school-underwater-tight-plan.json \
   --dry-run
 ```
 
 Run with an explicit approved cap:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage4_review \
+PYTHONPATH=src python -m extractor.openai_critique \
   --render-manifest /Volumes/t9/extract/renders/space-school-underwater-fixed/renders-tight/render-manifest.json \
-  --stage3-output /Volumes/t9/extract/renders/space-school-underwater-fixed/space-school-underwater-tight-stage3.json \
+  --plan-output /Volumes/t9/extract/renders/space-school-underwater-fixed/space-school-underwater-tight-plan.json \
   --approve-api-cost 1.00
 ```
 
 Review only one clip from a multi-clip render:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage4_review \
+PYTHONPATH=src python -m extractor.openai_critique \
   --render-manifest /Volumes/t9/extract/renders/space-school-payoff-first-other-clips/renders/render-manifest.json \
-  --stage3-output /Volumes/t9/extract/renders/space-school-payoff-first-other-clips/space-school-other-clips-payoff-first-stage3.json \
+  --plan-output /Volumes/t9/extract/renders/space-school-payoff-first-other-clips/space-school-other-clips-payoff-first-plan.json \
   --clip-id clip_ad_03_personal_spacecraft_payoff_first \
   --dry-run
 ```
@@ -775,23 +978,24 @@ Outputs include:
 request-manifest.json
 source-materials.txt
 task-prompt.txt
-review-package.json
+critique-package.json
 raw-response.json
-stage4-output.json
+critique-output.json
 usage-and-cost.json
 summary.md
 ```
 
-Local review assets are written under `_stage4-review-assets/` and include one
+Local review assets are written under `_critique-assets/` and include one
 `review-contact-sheet.jpg`, `transition-contact-sheet.jpg`, and
 `audio-waveform.jpg` per reviewed clip when the default evidence layers are
 enabled. Use `--no-transition-strips` or `--no-waveform` for a cheaper
 storyboard-only review.
 
-## OpenAI Stage 5: Critique-Driven Re-Edit
+## OpenAI Revise Stage: Critique-Driven Re-Edit
 
-Run the fifth LLM stage after Stage 4 has critiqued a render. This stage turns
-the critique back into a full revised Stage-3-compatible edit plan. It is not a
+Run the fifth LLM stage (`openai-revise`) after the critique stage has reviewed
+a render. This stage turns the critique back into a full revised plan-compatible
+edit plan. It is not a
 manual clip patch: the prompt asks the model to apply general rules such as
 payoff-first structure, no dead source video before audio, no mid-word endings,
 no mismatched talking head under narration, no repeated B-roll padding, and
@@ -800,11 +1004,11 @@ topic-consistent endings.
 Dry-run the estimated API cost without making a call:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage5_reedit \
-  --stage3-output /Volumes/t9/extract/renders/moon-hammer-polish/moon-hammer-polish-stage3-v2.json \
+PYTHONPATH=src python -m extractor.openai_revise \
+  --plan-output /Volumes/t9/extract/renders/moon-hammer-polish/moon-hammer-polish-plan-v2.json \
   --render-manifest /Volumes/t9/extract/renders/moon-hammer-polish/renders-v2/render-manifest.json \
-  --stage4-output /Volumes/t9/extract/openai-runs/renders-v2.stage4.gpt-5.5.high.20260430T131557Z/stage4-output.json \
-  --review-package /Volumes/t9/extract/openai-runs/renders-v2.stage4.gpt-5.5.high.20260430T131557Z/review-package.json \
+  --critique-output /Volumes/t9/extract/openai-runs/renders-v2.critique.gpt-5.5.high.20260430T131557Z/critique-output.json \
+  --critique-package /Volumes/t9/extract/openai-runs/renders-v2.critique.gpt-5.5.high.20260430T131557Z/critique-package.json \
   --dry-run
 ```
 
@@ -812,14 +1016,14 @@ Include the full transcript/video evidence prefix when the re-edit may need new
 sentence boundaries or alternate B-roll ranges:
 
 ```bash
-PYTHONPATH=src python -m extractor.openai_stage5_reedit \
+PYTHONPATH=src python -m extractor.openai_revise \
   --transcript /Volumes/t9/extract/transcripts/nasa-explorers-space-school.whisper-1.json \
   --manifest /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/manifest.json \
   --contact-sheet /Volumes/t9/extract/video-evidence/nasa-explorers-space-school/contact-sheet.jpg \
-  --stage3-output /Volumes/t9/extract/renders/moon-hammer-polish/moon-hammer-polish-stage3-v2.json \
+  --plan-output /Volumes/t9/extract/renders/moon-hammer-polish/moon-hammer-polish-plan-v2.json \
   --render-manifest /Volumes/t9/extract/renders/moon-hammer-polish/renders-v2/render-manifest.json \
-  --stage4-output /Volumes/t9/extract/openai-runs/renders-v2.stage4.gpt-5.5.high.20260430T131557Z/stage4-output.json \
-  --review-package /Volumes/t9/extract/openai-runs/renders-v2.stage4.gpt-5.5.high.20260430T131557Z/review-package.json \
+  --critique-output /Volumes/t9/extract/openai-runs/renders-v2.critique.gpt-5.5.high.20260430T131557Z/critique-output.json \
+  --critique-package /Volumes/t9/extract/openai-runs/renders-v2.critique.gpt-5.5.high.20260430T131557Z/critique-package.json \
   --approve-api-cost 1.50
 ```
 
@@ -830,8 +1034,8 @@ request-manifest.json
 source-materials.txt
 task-prompt.txt
 raw-response.json
-stage5-output.json
-stage3-output.json
+revise-output.json
+plan-output.json
 usage-and-cost.json
 summary.md
 ```
@@ -839,17 +1043,17 @@ summary.md
 Render the revised output with:
 
 ```bash
-PYTHONPATH=src python -m extractor.render_stage3 \
+PYTHONPATH=src python -m extractor.render_plan \
   --source-video /Volumes/t9/extract/nasa-explorers-space-school.mp4 \
-  --stage3-output /Volumes/t9/extract/openai-runs/<stage5-run>/stage3-output.json \
-  --output-dir /Volumes/t9/extract/renders/<stage5-render> \
+  --plan-output /Volumes/t9/extract/openai-runs/<revise-run>/plan-output.json \
+  --output-dir /Volumes/t9/extract/renders/<revise-render> \
   --use-plan-render-settings
 ```
 
 ## Experimental Video API Probe
 
 Probe whether provider APIs accept MP4 files as model inputs. This is separate
-from Stage 4 so failed provider experiments do not disturb the working
+from the critique stage so failed provider experiments do not disturb the working
 storyboard review path. The probe creates a small local MP4 sample by default,
 then estimates a conservative upper-bound cost before any API call.
 
