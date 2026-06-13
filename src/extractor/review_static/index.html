@@ -39,6 +39,9 @@
   .w.out { color:#bbb; text-decoration:line-through; } .w.out:hover { color:#666; }
   .ctrls { display:flex; gap:.6rem; align-items:center; margin-top:.5rem; font-size:.85rem; flex-wrap:wrap; }
   .ctrls label { display:flex; gap:.3rem; align-items:center; }
+  .expand { display:flex; gap:.5rem; align-items:center; margin-top:.5rem; font-size:.82rem; flex-wrap:wrap; }
+  .expand button { border:1px solid #bbb; background:#fff; border-radius:5px; padding:.15rem .5rem; cursor:pointer; font-size:.78rem; }
+  .expand button:disabled { opacity:.4; cursor:default; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
   .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
@@ -86,30 +89,68 @@ async function loadProject(id){
   const proj = await (await fetch('/api/project?id='+encodeURIComponent(id))).json();
   if(proj.error){ main.innerHTML=`<div class="empty">${proj.error}</div>`; return; }
   CURRENT = proj;
-  proj.clips.forEach(c=>{ c.decision='keep'; });  // edit state lives on the objects
+  const W = proj.transcript_words || []; CURRENT.W = W;
+  CURRENT.tend = W.length ? W[W.length-1].end : 0;
+  // Each clip's edit state: a Set of GLOBAL word indices that are "in", seeded
+  // from its segments, plus a visible window over the full transcript that the
+  // editor can expand earlier/later to reach content beyond the clip.
+  proj.clips.forEach(c=>{
+    c.decision='keep';
+    c.inSet=new Set();
+    for(let i=0;i<W.length;i++){
+      if((c.segments||[]).some(s=>s.source_in-1e-6<=W[i].start && W[i].start<=s.source_out+1e-6)) c.inSet.add(i);
+    }
+    const lo=(c.segments&&c.segments.length)?Math.min(...c.segments.map(s=>s.source_in)):0;
+    const hi=(c.segments&&c.segments.length)?Math.max(...c.segments.map(s=>s.source_out)):CURRENT.tend;
+    c.win=[Math.max(0,lo-4), Math.min(CURRENT.tend,hi+4)];
+  });
   main.innerHTML = `<h2>${proj.label}</h2><p class="hint">${proj.content_mode} · ${proj.clips.length} clips · ${proj.transcript_word_count} transcript words${proj.source_found?'':' · <b>source video not found</b>'}</p>`;
   proj.clips.forEach((c,i)=>main.appendChild(renderClip(c,i)));
   document.getElementById('savebar').style.display='flex';
   document.getElementById('status').textContent='';
 }
 
+const esc=s=>String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+
+function inWords(c){ return [...c.inSet].sort((a,b)=>a-b).map(i=>CURRENT.W[i]); }
+
 function currentSegments(c){
-  // contiguous runs of "in" words -> segments (in/out snap to word boundaries)
-  const segs=[]; let run=null;
-  for(const w of c.words){
-    if(w.in){ if(!run) run={source_in:w.start,source_out:w.end}; else run.source_out=w.end; }
-    else if(run){ segs.push(run); run=null; }
+  // contiguous runs of GLOBAL in-word indices -> segments (snap to word edges)
+  const idx=[...c.inSet].sort((a,b)=>a-b); const segs=[]; let run=null, prev=null;
+  for(const i of idx){ const w=CURRENT.W[i];
+    if(run && prev===i-1){ run.source_out=w.end; }
+    else { if(run) segs.push(run); run={source_in:w.start,source_out:w.end}; }
+    prev=i;
   }
   if(run) segs.push(run);
   return segs;
 }
 
+function renderWords(div,c){
+  const W=CURRENT.W, t=div.querySelector('.transcript');
+  let html=''; let any=false;
+  for(let i=0;i<W.length;i++){
+    const w=W[i];
+    if(w.end<c.win[0] || w.start>c.win[1]) continue;
+    any=true;
+    html+=`<span class="w ${c.inSet.has(i)?'in':'out'}" data-i="${i}" title="source ${fmt1(w.start)}">${esc(w.text)}</span> `;
+  }
+  t.innerHTML=html||'<span class="hint">no transcript words here</span>';
+  t.querySelectorAll('.w').forEach(sp=>{
+    sp.onclick=()=>{ const i=+sp.dataset.i; if(c.inSet.has(i)) c.inSet.delete(i); else c.inSet.add(i);
+      sp.className='w '+(c.inSet.has(i)?'in':'out'); updateSegInfo(div,c); };
+  });
+  const atStart=c.win[0]<=0, atEnd=c.win[1]>=CURRENT.tend;
+  div.querySelector('.earlier').disabled=atStart;
+  div.querySelector('.later').disabled=atEnd;
+  div.querySelector('.wininfo').textContent=`showing ${fmt(c.win[0])}–${fmt(c.win[1])} of ${fmt(CURRENT.tend)}`;
+}
+
 function renderClip(c,idx){
   const div=document.createElement('div'); div.className='clip'; div.dataset.idx=idx;
-  const words=c.words.map((w,wi)=>`<span class="w ${w.in?'in':'out'}" data-wi="${wi}" title="source ${fmt1(w.start)}">${w.text}</span>`).join(' ');
   div.innerHTML=`
     <div class="cliphead">
-      <input class="title" value="${(c.title||c.clip_id).replace(/"/g,'&quot;')}">
+      <input class="title" value="${esc(c.title||c.clip_id)}">
       ${c.uses_assets?'<span class="badge">uses B-roll — render to confirm</span>':''}
     </div>
     <div class="hint">${c.clip_id} · title card ${c.title_card_seconds.toFixed(1)}s</div>
@@ -121,7 +162,13 @@ function renderClip(c,idx){
       <span class="hint seginfo"></span>
       <span class="hint renderstatus"></span>
     </div>
-    <div class="transcript">${words || '<span class="hint">no transcript words for this clip</span>'}</div>
+    <div class="expand">
+      <button class="earlier" title="reveal earlier transcript">⟵ 30s earlier</button>
+      <button class="later" title="reveal later transcript">30s later ⟶</button>
+      <span class="hint wininfo"></span>
+      <span class="hint">· click words to include/exclude them in the clip</span>
+    </div>
+    <div class="transcript"></div>
     <div class="segtimes hint"></div>
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
     <div class="row">
@@ -133,10 +180,10 @@ function renderClip(c,idx){
       </div>
     </div>`;
 
-  // word toggling
-  div.querySelectorAll('.w').forEach(span=>{
-    span.onclick=()=>{ const w=c.words[+span.dataset.wi]; w.in=!w.in; span.className='w '+(w.in?'in':'out'); updateSegInfo(div,c); };
-  });
+  // transcript window + expand controls
+  renderWords(div,c);
+  div.querySelector('.earlier').onclick=()=>{ c.win[0]=Math.max(0,c.win[0]-30); renderWords(div,c); };
+  div.querySelector('.later').onclick=()=>{ c.win[1]=Math.min(CURRENT.tend,c.win[1]+30); renderWords(div,c); };
   // keep/drop + rework
   const keep=div.querySelector('.keep'), rework=div.querySelector('.rework');
   keep.onchange=()=>{ c.decision=keep.checked?(rework.checked?'rework':'keep'):'drop'; div.classList.toggle('dropped',!keep.checked); if(!keep.checked) rework.checked=false; };
@@ -164,13 +211,12 @@ function updateSegInfo(div,c){
 
 // Captions ARE the in-words in transcript-first editing — derive them live from
 // the current selection so newly-included dialogue shows up immediately.
-function captionsFromWords(words){
+function currentCaptions(c){
   const MAXC=42, MAXW=7, GAP=0.9, TAIL=0.15;
   const caps=[]; let line=[];
   const flush=()=>{ if(line.length){ caps.push({source_start:line[0].start,
     source_end:line[line.length-1].end+TAIL, text:line.map(w=>w.text).join(' ')}); line=[]; } };
-  for(const w of words){
-    if(!w.in) continue;
+  for(const w of inWords(c)){
     if(line.length){
       const chars=line.map(x=>x.text).join(' ').length+1+w.text.length;
       const gap=w.start-line[line.length-1].end;
@@ -188,7 +234,7 @@ function setupPreview(div,c){
   const v=div.querySelector('.pv'), cap=div.querySelector('.cap'), clk=div.querySelector('.pvclock');
   const playBtn=div.querySelector('.tplay'), pfill=div.querySelector('.pfill'), pbar=div.querySelector('.pbar');
   let segs=[], before=[], total=0, caps=[], i=0, finished=false;
-  const rebuild=()=>{ segs=currentSegments(c); before=[]; let acc=0; for(const s of segs){before.push(acc);acc+=s.source_out-s.source_in;} total=acc; caps=captionsFromWords(c.words); };
+  const rebuild=()=>{ segs=currentSegments(c); before=[]; let acc=0; for(const s of segs){before.push(acc);acc+=s.source_out-s.source_in;} total=acc; caps=currentCaptions(c); };
   const ensureSrc=()=>{ if(CURRENT.source_url && v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url; };
   const showAt=(t,cut)=>{ const line=caps.find(x=>x.source_start<=t&&t<=x.source_end); cap.textContent=line?line.text:''; clk.textContent=`source ${fmt1(t)} · cut ${fmt1(cut)} / ${fmt1(total)}`; pfill.style.width=(100*cut/Math.max(total,0.01))+'%'; };
   function seekCut(t){ if(!segs.length) return; t=Math.max(0,Math.min(t,total-0.01)); let idx=0; while(idx<segs.length-1 && t>=before[idx]+(segs[idx].source_out-segs[idx].source_in)) idx++; i=idx; finished=false; v.currentTime=segs[idx].source_in+(t-before[idx]); showAt(v.currentTime,t); }

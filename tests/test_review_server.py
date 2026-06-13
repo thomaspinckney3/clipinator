@@ -87,10 +87,11 @@ class TestProjectDetail:
         clip = detail["clips"][0]
         assert clip["clip_id"] == "EX01"
         assert clip["segments"] == [{"source_in": 0.5, "source_out": 4.5}]
-        assert clip["captions"]  # seeded from transcript
         assert clip["preview_url"].startswith("/video?path=")
         assert detail["source_url"].startswith("/video?path=")
         assert detail["source_found"] is True
+        # full transcript is sent at the project level for the expandable window
+        assert detail["transcript_words"] and "start" in detail["transcript_words"][0]
 
     def test_asset_flag(self, tmp_path):
         root = tmp_path / "Proj"

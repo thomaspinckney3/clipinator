@@ -44,3 +44,8 @@ Mark each: `[ ]` open · `[x]` fixed (note the commit) · `[~]` won't-fix/by-des
     "back to clip start" (fixed: replaced native source controls with a
     cut-confined transport — play/pause, ⏮ start, and a clickable cut progress
     bar; playback is clamped to the segments so it never leaves the clip).
+[x] Couldn't include content before (or after) where a clip currently starts —
+    the transcript view was bounded to the clip span (fixed: backend now sends
+    the full transcript; the editor works over global word indices with an
+    expandable window — "⟵ 30s earlier" / "30s later ⟶" reveal more words to
+    toggle in, so any part of the lecture can be pulled into a clip).

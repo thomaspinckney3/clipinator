@@ -266,8 +266,6 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
             "title": clip.get("concept_title", ""),
             "title_card_seconds": card,
             "segments": [{"source_in": s["source_in"], "source_out": s["source_out"]} for s in segments],
-            "captions": export_captions(clip, card, segments, words),
-            "words": clip_words(words, segments),
             "preview_url": video_url(preview) if preview and Path(str(preview)).exists() else None,
             "uses_assets": has_assets,
         })
@@ -278,6 +276,13 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
         "source_url": video_url(source) if source and Path(str(source)).exists() else None,
         "source_found": bool(source and Path(str(source)).exists()),
         "transcript_word_count": len(words),
+        # the full transcript, so the editor can reveal and include content before
+        # or after where a clip currently starts/ends (front-end windows it)
+        "transcript_words": [
+            {"text": str(w.get("text", "")), "start": round(float(w["start"]), 3),
+             "end": round(float(w["end"]), 3)}
+            for w in words
+        ],
         "clips": clips,
     }
 
