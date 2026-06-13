@@ -112,6 +112,53 @@ class TestProjectDetail:
         assert detail["clips"][0]["uses_assets"] is True
 
 
+class TestClipWords:
+    def _words(self):
+        # one word per 0.5s from 0..10s
+        return [{"text": f"w{i}", "start": i * 0.5, "end": i * 0.5 + 0.4} for i in range(20)]
+
+    def test_flags_in_and_out(self):
+        words = self._words()
+        segs = [{"source_in": 2.0, "source_out": 4.0}]
+        cw = rs.clip_words(words, segs, pad=1.0)
+        # words inside [2,4] are "in"; padding words [1,2) and (4,5] are "out"
+        in_times = [w["start"] for w in cw if w["in"]]
+        assert in_times and all(2.0 - 1e-6 <= t <= 4.0 + 1e-6 for t in in_times)
+        assert any(not w["in"] for w in cw)  # padding present
+
+    def test_round_trip_reconstructs_segments(self):
+        # rebuilding segments from contiguous in-words recovers the span
+        words = self._words()
+        segs = [{"source_in": 2.0, "source_out": 4.0}, {"source_in": 6.0, "source_out": 8.0}]
+        cw = rs.clip_words(words, segs, pad=1.0)
+        rebuilt, run = [], None
+        for w in cw:
+            if w["in"]:
+                run = run or {"source_in": w["start"], "source_out": w["end"]}
+                run["source_out"] = w["end"]
+            elif run:
+                rebuilt.append(run); run = None
+        if run:
+            rebuilt.append(run)
+        assert len(rebuilt) == 2
+        assert rebuilt[0]["source_in"] == 2.0
+        assert rebuilt[1]["source_in"] == 6.0
+
+    def test_empty_inputs(self):
+        assert rs.clip_words([], [{"source_in": 0, "source_out": 1}]) == []
+        assert rs.clip_words([{"text": "a", "start": 0, "end": 1}], []) == []
+
+
+class TestRunRoot:
+    def test_anchors_on_renders(self, tmp_path):
+        mp = tmp_path / "MyRun" / "renders" / "excerpt" / "draft" / "render-manifest.json"
+        assert rs.run_root_of(mp) == tmp_path / "MyRun"
+
+    def test_ad_mode_layout(self, tmp_path):
+        mp = tmp_path / "MyRun" / "renders" / "final" / "render-manifest.json"
+        assert rs.run_root_of(mp) == tmp_path / "MyRun"
+
+
 class TestVideoUrl:
     def test_none(self):
         assert rs.video_url(None) is None

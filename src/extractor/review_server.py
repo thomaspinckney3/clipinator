@@ -14,11 +14,13 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 from extractor.edit_list import (
+    apply_edits,
     clip_segments,
     export_captions,
     read_json,
     render_manifest_clip,
     title_card_seconds,
+    write_json,
 )
 from extractor.render_plan import transcript_words_from_data
 
@@ -138,6 +140,56 @@ def video_url(path: str | None) -> str | None:
     return "/video?path=" + quote(str(path), safe="")
 
 
+def run_root_of(manifest_path: Path) -> Path:
+    """The run root is the ancestor containing 'renders'."""
+    parts = manifest_path.parts
+    if "renders" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("renders")
+        return Path(*parts[:idx])
+    return manifest_path.parent.parent
+
+
+def probe_duration(video: Path) -> float | None:
+    """Source duration via ffprobe, or None if ffprobe is absent/fails (ffmpeg
+    is optional; without it, import skips the end-of-video bounds check)."""
+    import shutil
+    import subprocess
+    if shutil.which("ffprobe") is None:
+        return None
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video)],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def clip_words(words: list[dict[str, Any]], segments: list[dict[str, Any]], pad: float = 4.0) -> list[dict[str, Any]]:
+    """Transcript words spanning the clip (plus padding), each flagged in/out.
+
+    'in' = the word falls within one of the current segments. Padding words
+    (initially out) let the editor extend the clip. This is the transcript-first
+    edit surface: toggling words re-derives the segments on save.
+    """
+    if not segments or not words:
+        return []
+    lo = min(s["source_in"] for s in segments) - pad
+    hi = max(s["source_out"] for s in segments) + pad
+    out: list[dict[str, Any]] = []
+    for w in words:
+        start, end = float(w["start"]), float(w["end"])
+        if end < lo or start > hi:
+            continue
+        inside = any(s["source_in"] - 1e-6 <= start <= s["source_out"] + 1e-6 for s in segments)
+        out.append({"text": str(w.get("text", "")), "start": round(start, 3),
+                    "end": round(end, 3), "in": inside})
+    return out
+
+
 def project_detail(manifest_path: Path) -> dict[str, Any]:
     manifest = read_json(manifest_path)
     source = manifest.get("source_video")
@@ -164,6 +216,7 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
             "title_card_seconds": card,
             "segments": [{"source_in": s["source_in"], "source_out": s["source_out"]} for s in segments],
             "captions": export_captions(clip, card, segments, words),
+            "words": clip_words(words, segments),
             "preview_url": video_url(preview) if preview and Path(str(preview)).exists() else None,
             "uses_assets": has_assets,
         })
@@ -222,6 +275,25 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # never leak a traceback to the browser
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Something went wrong: {exc}")
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/save":
+                self._api_save()
+            else:
+                self._error(HTTPStatus.NOT_FOUND, "Not found.")
+        except BrokenPipeError:
+            pass
+        except RuntimeError as exc:  # validation / known errors -> plain message
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not save: {exc}")
+
+    def _read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
     # --- routes -----------------------------------------------------------
 
     def _api_projects(self) -> None:
@@ -240,6 +312,41 @@ class ReviewHandler(BaseHTTPRequestHandler):
         _, allowed = discover_projects(library_dir(load_config()))
         type(self).allowed_media = allowed
         self._json(project_detail(manifest_path))
+
+    def _api_save(self) -> None:
+        from urllib.parse import unquote
+        body = self._read_json_body()
+        manifest_path = Path(unquote(str(body.get("project_id", ""))))
+        if not manifest_path.exists():
+            raise RuntimeError("That project could not be found.")
+        manifest = read_json(manifest_path)
+        plan_path = manifest.get("stage3_output")
+        if not (plan_path and Path(str(plan_path)).exists()):
+            raise RuntimeError("The plan for this project is missing.")
+        plan = read_json(Path(str(plan_path)))
+        transcript_path = manifest.get("transcript")
+        words = (
+            transcript_words_from_data(read_json(Path(str(transcript_path))))
+            if transcript_path and Path(str(transcript_path)).exists() else []
+        )
+        source = manifest.get("source_video")
+        duration = probe_duration(Path(str(source))) if source and Path(str(source)).exists() else None
+
+        edits = {"clips": body.get("clips", [])}
+        revised = apply_edits(plan, edits, words, duration, source="clipinator-review-editor")
+
+        out_dir = run_root_of(manifest_path) / "review" / manifest_path.parent.name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "plan-output.human.json"
+        write_json(out_path, revised)
+        he = revised["human_edit"]
+        self._json({
+            "ok": True,
+            "output": str(out_path),
+            "kept": len(revised["clip_ads"]),
+            "dropped": he["dropped_clip_ids"],
+            "reworked": he["rework_clip_ids"],
+        })
 
     def _serve_static(self, rel: str) -> None:
         path = (STATIC_DIR / rel).resolve()

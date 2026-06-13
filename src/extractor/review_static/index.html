@@ -4,86 +4,179 @@
 <meta charset="utf-8">
 <title>Clipinator Review Editor</title>
 <style>
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; color: #1a1a1a; background: #f4f4f6; }
-  header { background: #1a1a2e; color: #fff; padding: 0.8rem 1.2rem; }
-  header h1 { font-size: 1.1rem; margin: 0; }
-  header .lib { font-size: 0.8rem; opacity: 0.7; margin-top: 0.2rem; }
-  .layout { display: flex; height: calc(100vh - 60px); }
-  .sidebar { width: 18rem; overflow-y: auto; background: #fff; border-right: 1px solid #ddd; }
-  .sidebar .proj { padding: 0.7rem 1rem; border-bottom: 1px solid #eee; cursor: pointer; font-size: 0.9rem; }
-  .sidebar .proj:hover { background: #eef2ff; }
-  .sidebar .proj.active { background: #dde6ff; }
-  .sidebar .proj .meta { font-size: 0.75rem; color: #888; }
-  .sidebar .proj.missing { color: #b00; }
-  main { flex: 1; overflow-y: auto; padding: 1.2rem 1.6rem; }
-  .clip { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; margin-bottom: 1.2rem; }
-  .clip h3 { margin: 0 0 0.4rem; font-size: 1rem; }
-  .players { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
-  video { max-width: 280px; max-height: 360px; background: #000; border-radius: 4px; }
-  table { border-collapse: collapse; font-size: 0.85rem; margin-top: 0.5rem; }
-  td, th { border: 1px solid #e3e3e3; padding: 0.25rem 0.55rem; }
-  .badge { display: inline-block; font-size: 0.72rem; background: #ffe9c7; color: #8a5a00; padding: 0.1rem 0.45rem; border-radius: 999px; margin-left: 0.4rem; }
-  .hint { color: #777; font-size: 0.85rem; }
-  .empty { color: #777; padding: 2rem; }
+  :root { --in:#dff3dd; --in-h:#bfe6ba; --accent:#3a5bd9; }
+  body { font-family:-apple-system,system-ui,sans-serif; margin:0; color:#1a1a1a; background:#f4f4f6; }
+  header { background:#1a1a2e; color:#fff; padding:.7rem 1.2rem; display:flex; align-items:baseline; gap:1rem; }
+  header h1 { font-size:1.05rem; margin:0; }
+  header .lib { font-size:.78rem; opacity:.7; }
+  .layout { display:flex; height:calc(100vh - 52px); }
+  .sidebar { width:17rem; overflow-y:auto; background:#fff; border-right:1px solid #ddd; }
+  .proj { padding:.65rem 1rem; border-bottom:1px solid #eee; cursor:pointer; font-size:.88rem; }
+  .proj:hover { background:#eef2ff; } .proj.active { background:#dde6ff; }
+  .proj .meta { font-size:.74rem; color:#888; } .proj.missing { color:#b00; }
+  main { flex:1; overflow-y:auto; padding:1rem 1.4rem 4rem; }
+  .clip { background:#fff; border:1px solid #ddd; border-radius:8px; padding:1rem 1.2rem; margin-bottom:1.2rem; }
+  .clip.dropped { opacity:.5; }
+  .cliphead { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+  .cliphead input.title { font-size:1rem; font-weight:600; border:1px solid transparent; border-radius:4px; padding:.2rem .4rem; flex:1; min-width:12rem; }
+  .cliphead input.title:hover, .cliphead input.title:focus { border-color:#ccc; background:#fafafa; }
+  .badge { font-size:.7rem; background:#ffe9c7; color:#8a5a00; padding:.1rem .45rem; border-radius:999px; }
+  .row { display:flex; gap:1.2rem; flex-wrap:wrap; align-items:flex-start; margin-top:.6rem; }
+  .col { flex:1; min-width:18rem; }
+  video { width:100%; max-width:300px; background:#000; border-radius:4px; }
+  .phone { aspect-ratio:9/16; max-width:220px; background:#000; border-radius:10px; overflow:hidden; position:relative; }
+  .phone video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; max-width:none; }
+  .phone .cap { position:absolute; left:6%; right:6%; bottom:14%; text-align:center; color:#fff;
+    font-weight:700; font-size:.8rem; text-shadow:0 1px 3px #000,0 0 6px #000; line-height:1.2; }
+  .transcript { line-height:2; font-size:.95rem; margin-top:.4rem; max-height:14rem; overflow-y:auto;
+    border:1px solid #eee; border-radius:6px; padding:.5rem .7rem; background:#fcfcfc; }
+  .w { cursor:pointer; padding:0 1px; border-radius:3px; }
+  .w.in { background:var(--in); } .w.in:hover { background:var(--in-h); }
+  .w.out { color:#bbb; text-decoration:line-through; } .w.out:hover { color:#666; }
+  .ctrls { display:flex; gap:.6rem; align-items:center; margin-top:.5rem; font-size:.85rem; flex-wrap:wrap; }
+  .ctrls label { display:flex; gap:.3rem; align-items:center; }
+  textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
+  .hint { color:#777; font-size:.82rem; }
+  .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
+    padding:.6rem 1.4rem; display:flex; gap:1rem; align-items:center; }
+  button.save { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:.5rem 1.1rem; font-size:.9rem; cursor:pointer; }
+  button.preview { border:1px solid #bbb; background:#fff; border-radius:6px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; }
+  .status { font-size:.85rem; color:#444; }
+  .empty { color:#777; padding:2rem; }
 </style>
 </head>
 <body>
-<header>
-  <h1>Clipinator Review Editor</h1>
-  <div class="lib" id="lib"></div>
-</header>
+<header><h1>Clipinator Review Editor</h1><div class="lib" id="lib"></div></header>
 <div class="layout">
-  <div class="sidebar" id="sidebar"><div class="empty">Loading projects…</div></div>
+  <div class="sidebar" id="sidebar"><div class="empty">Loading…</div></div>
   <main id="main"><div class="empty">Select a project on the left.</div></main>
 </div>
+<div class="savebar" id="savebar" style="display:none">
+  <button class="save" id="saveBtn">Save edits</button>
+  <span class="status" id="status"></span>
+</div>
 <script>
-const fmt = (s) => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+let CURRENT = null;            // current project detail
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
 
-async function loadProjects() {
-  const res = await fetch('/api/projects');
-  const data = await res.json();
-  document.getElementById('lib').textContent = 'Library: ' + data.library;
+async function loadProjects(){
+  const d = await (await fetch('/api/projects')).json();
+  document.getElementById('lib').textContent = 'Library: ' + d.library;
   const sb = document.getElementById('sidebar');
-  if (!data.projects.length) {
-    sb.innerHTML = '<div class="empty">No projects found in the library folder.</div>';
-    return;
-  }
-  sb.innerHTML = '';
-  for (const p of data.projects) {
-    const el = document.createElement('div');
-    el.className = 'proj' + (p.source_found ? '' : ' missing');
-    el.innerHTML = `<div>${p.label}</div><div class="meta">${p.clip_count} clip(s)` +
-      (p.source_found ? '' : ' · source missing') + `</div>`;
-    el.onclick = () => { document.querySelectorAll('.proj').forEach(e=>e.classList.remove('active')); el.classList.add('active'); loadProject(p.id); };
+  if(!d.projects.length){ sb.innerHTML='<div class="empty">No projects found. Drag a project folder onto the launcher.</div>'; return; }
+  sb.innerHTML='';
+  for(const p of d.projects){
+    const el=document.createElement('div');
+    el.className='proj'+(p.source_found?'':' missing');
+    el.innerHTML=`<div>${p.label}</div><div class="meta">${p.clip_count} clip(s)${p.source_found?'':' · source missing'}</div>`;
+    el.onclick=()=>{document.querySelectorAll('.proj').forEach(e=>e.classList.remove('active'));el.classList.add('active');loadProject(p.id);};
     sb.appendChild(el);
   }
 }
 
-async function loadProject(id) {
-  const main = document.getElementById('main');
-  main.innerHTML = '<div class="empty">Loading…</div>';
-  const res = await fetch('/api/project?id=' + encodeURIComponent(id));
-  const proj = await res.json();
-  if (proj.error) { main.innerHTML = `<div class="empty">${proj.error}</div>`; return; }
-  main.innerHTML = `<h2>${proj.label}</h2>` +
-    `<p class="hint">${proj.content_mode} · ${proj.clips.length} clips · ${proj.transcript_word_count} transcript words` +
-    (proj.source_found ? '' : ' · <b>source video not found</b>') + `</p>`;
-  for (const c of proj.clips) {
-    const div = document.createElement('div');
-    div.className = 'clip';
-    const segRows = c.segments.map((s,i)=>`<tr><td>${i+1}</td><td>${s.source_in.toFixed(2)}</td><td>${s.source_out.toFixed(2)}</td><td>${(s.source_out-s.source_in).toFixed(2)}s</td></tr>`).join('');
-    div.innerHTML =
-      `<h3>${c.title || c.clip_id}` + (c.uses_assets ? '<span class="badge">uses B-roll — render to confirm</span>' : '') + `</h3>` +
-      `<div class="hint">${c.clip_id} · title card ${c.title_card_seconds.toFixed(1)}s · ${c.captions.length} captions</div>` +
-      `<div class="players">` +
-        (c.preview_url ? `<div><div class="hint">current render</div><video src="${c.preview_url}" controls preload="metadata"></video></div>` : '<div class="hint">no preview rendered yet</div>') +
-        (proj.source_url ? `<div><div class="hint">source</div><video class="src" src="${proj.source_url}" controls preload="metadata"></video></div>` : '') +
-      `</div>` +
-      `<table><tr><th>#</th><th>in</th><th>out</th><th>len</th></tr>${segRows}</table>`;
-    main.appendChild(div);
-  }
+async function loadProject(id){
+  const main=document.getElementById('main'); main.innerHTML='<div class="empty">Loading…</div>';
+  const proj = await (await fetch('/api/project?id='+encodeURIComponent(id))).json();
+  if(proj.error){ main.innerHTML=`<div class="empty">${proj.error}</div>`; return; }
+  CURRENT = proj;
+  proj.clips.forEach(c=>{ c.decision='keep'; });  // edit state lives on the objects
+  main.innerHTML = `<h2>${proj.label}</h2><p class="hint">${proj.content_mode} · ${proj.clips.length} clips · ${proj.transcript_word_count} transcript words${proj.source_found?'':' · <b>source video not found</b>'}</p>`;
+  proj.clips.forEach((c,i)=>main.appendChild(renderClip(c,i)));
+  document.getElementById('savebar').style.display='flex';
+  document.getElementById('status').textContent='';
 }
 
+function currentSegments(c){
+  // contiguous runs of "in" words -> segments (in/out snap to word boundaries)
+  const segs=[]; let run=null;
+  for(const w of c.words){
+    if(w.in){ if(!run) run={source_in:w.start,source_out:w.end}; else run.source_out=w.end; }
+    else if(run){ segs.push(run); run=null; }
+  }
+  if(run) segs.push(run);
+  return segs;
+}
+
+function renderClip(c,idx){
+  const div=document.createElement('div'); div.className='clip'; div.dataset.idx=idx;
+  const words=c.words.map((w,wi)=>`<span class="w ${w.in?'in':'out'}" data-wi="${wi}">${w.text}</span>`).join(' ');
+  div.innerHTML=`
+    <div class="cliphead">
+      <input class="title" value="${(c.title||c.clip_id).replace(/"/g,'&quot;')}">
+      ${c.uses_assets?'<span class="badge">uses B-roll — render to confirm</span>':''}
+    </div>
+    <div class="hint">${c.clip_id} · title card ${c.title_card_seconds.toFixed(1)}s</div>
+    <div class="ctrls">
+      <label><input type="checkbox" class="keep" checked> keep</label>
+      <label><input type="radio" name="dec${idx}" class="rework"> rework</label>
+      <button class="preview">▶ preview cut</button>
+      <span class="hint seginfo"></span>
+    </div>
+    <div class="transcript">${words || '<span class="hint">no transcript words for this clip</span>'}</div>
+    <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
+    <div class="row">
+      <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
+      <div class="col"><div class="hint">cut preview (9:16, approximate)</div><div class="phone"><video class="pv" muted></video><div class="cap"></div></div></div>
+    </div>`;
+
+  // word toggling
+  div.querySelectorAll('.w').forEach(span=>{
+    span.onclick=()=>{ const w=c.words[+span.dataset.wi]; w.in=!w.in; span.className='w '+(w.in?'in':'out'); updateSegInfo(div,c); };
+  });
+  // keep/drop + rework
+  const keep=div.querySelector('.keep'), rework=div.querySelector('.rework');
+  keep.onchange=()=>{ c.decision=keep.checked?(rework.checked?'rework':'keep'):'drop'; div.classList.toggle('dropped',!keep.checked); if(!keep.checked) rework.checked=false; };
+  rework.onchange=()=>{ if(rework.checked && keep.checked) c.decision='rework'; };
+  // title/notes
+  div.querySelector('.title').oninput=e=>{ c.title=e.target.value; };
+  div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
+  // preview the cut from the source, segment by segment, with captions
+  div.querySelector('.preview').onclick=()=>previewCut(div,c);
+  updateSegInfo(div,c);
+  return div;
+}
+
+function updateSegInfo(div,c){
+  const segs=currentSegments(c);
+  const total=segs.reduce((a,s)=>a+(s.source_out-s.source_in),0)+c.title_card_seconds;
+  div.querySelector('.seginfo').textContent=`${segs.length} segment(s), ~${total.toFixed(1)}s`;
+}
+
+function previewCut(div,c){
+  if(!CURRENT.source_url){ alert('Source video not found, cannot preview.'); return; }
+  const segs=currentSegments(c); if(!segs.length){ alert('No words selected.'); return; }
+  const v=div.querySelector('.pv'); const cap=div.querySelector('.cap');
+  if(v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url;
+  let i=0;
+  const playSeg=()=>{ if(i>=segs.length){ cap.textContent=''; return; } v.currentTime=segs[i].source_in; v.play(); };
+  v.ontimeupdate=()=>{
+    const s=segs[i]; if(!s) return;
+    if(v.currentTime>=s.source_out){ i++; playSeg(); return; }
+    const t=v.currentTime;
+    const line=(c.captions||[]).find(x=>x.source_start<=t && t<=x.source_end);
+    cap.textContent=line?line.text:'';
+  };
+  i=0; playSeg();
+}
+
+async function save(){
+  if(!CURRENT) return;
+  const status=document.getElementById('status'); status.textContent='Saving…';
+  const clips=CURRENT.clips.map(c=>({
+    clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
+    title_card_seconds:c.title_card_seconds, notes:c.notes||'',
+    segments: c.decision==='drop'?[]:currentSegments(c),
+    captions: c.captions,
+  }));
+  try{
+    const res=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project_id:CURRENT.id, clips})});
+    const d=await res.json();
+    if(d.error){ status.textContent='Error: '+d.error; return; }
+    status.textContent=`Saved ✓  ${d.kept} kept, ${d.dropped.length} dropped → ${d.output}`;
+  }catch(e){ status.textContent='Error: '+e; }
+}
+document.getElementById('saveBtn').onclick=save;
 loadProjects();
 </script>
 </body>

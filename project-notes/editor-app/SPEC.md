@@ -82,14 +82,22 @@ external drive). Labels derive from run-root folder name + variant.
 - B-roll frequency unknown → default to showing the "render to confirm" badge,
   emphasized when a clip references assets.
 
-## Status (foundation built — 2026-06-13)
+## Status (2026-06-13)
 
 Built & tested: `review_server.py` (stdlib: discovery, range video serving,
-JSON API), the `Clipinator Review Editor.command` launcher, a minimal
-front-end, `tests/test_review_server.py`. Verified on the real Gemes run (range
-serving on the 672 MB source; path traversal blocked; pointing directly at a
-project). NOT yet built: transcript-first editing UI, save → `apply_edits`,
-"render this clip".
+JSON API), the `.command` launcher, `tests/test_review_server.py`.
+**Transcript-first editing UI built**: per clip the transcript shows every word
+in the clip span flagged in/out; clicking a word toggles it; on save contiguous
+in-runs become the segments (in/out snap to word boundaries). Keep/drop/rework,
+editable title, notes, and an instant 9:16 cut preview (source segments played
+back-to-back with a caption overlay). `POST /api/save` builds the edit overlay,
+runs `edit_list.apply_edits`, and writes `<run>/review/<variant>/
+plan-output.human.json`. Verified end-to-end on the Gemes run (word flags, save
+with a drop → valid human plan; word-boundary reconstruction faithful, merges
+sub-second gaps as expected). Inline JS syntax-checked.
+
+NOT yet built: "render this clip" endpoint (single-clip `render-plan` + progress
+UI); inline AI critique suggestions; conversational rework via LLM.
 
 ## Why this shape (innovation thesis)
 
