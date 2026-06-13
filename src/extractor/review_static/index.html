@@ -42,6 +42,15 @@
   .expand { display:flex; gap:.5rem; align-items:center; margin-top:.5rem; font-size:.82rem; flex-wrap:wrap; }
   .expand button { border:1px solid #bbb; background:#fff; border-radius:5px; padding:.15rem .5rem; cursor:pointer; font-size:.78rem; }
   .expand button:disabled { opacity:.4; cursor:default; }
+  .critique { border:1px solid #e0d4b8; background:#fdf8ee; border-radius:6px; padding:.5rem .7rem; margin-top:.5rem; font-size:.85rem; }
+  .critique.ok { border-color:#cfe6cb; background:#f3faf1; }
+  .critique .crow { display:flex; gap:.6rem; align-items:baseline; }
+  .critique .cv { font-weight:600; }
+  .critique .cscore { color:#888; font-size:.8rem; }
+  .critique .cass { color:#444; margin:.25rem 0; }
+  .isslist { margin:.3rem 0 0; padding-left:1.1rem; }
+  .iss { margin:.2rem 0; } .iss.sev-high { color:#8a2b2b; } .iss.sev-medium { color:#8a5a00; }
+  .iss .fix { color:#555; font-size:.8rem; margin-left:.2rem; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
   .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
@@ -126,6 +135,25 @@ function currentSegments(c){
   return segs;
 }
 
+const VERDICT_OK=new Set(['keep_as_is','keep','minor_revision','approve','pass']);
+function critiqueHtml(cr){
+  if(!cr) return '';
+  const v=(cr.verdict||'').replace(/_/g,' ');
+  const good=VERDICT_OK.has((cr.verdict||'').toLowerCase());
+  const cls=good?'ok':'warn';
+  const issues=(cr.issues||[]).map(i=>{
+    const sev=(i.severity||'').toLowerCase();
+    return `<li class="iss sev-${esc(sev)}"><b>${esc(i.category||'')}</b>${i.severity?` · ${esc(i.severity)}`:''} — ${esc(i.why||'')}`+
+      (i.fix?`<div class="fix">fix: ${esc(i.fix)}</div>`:'')+`</li>`;
+  }).join('');
+  return `<div class="critique ${cls}">`+
+    `<div class="crow"><span class="cv">AI review: ${esc(v)||'—'}</span>`+
+    (cr.score!=null?`<span class="cscore">${cr.score}/100</span>`:'')+`</div>`+
+    (cr.assessment?`<div class="cass">${esc(cr.assessment)}</div>`:'')+
+    (issues?`<ul class="isslist">${issues}</ul>`:'')+
+  `</div>`;
+}
+
 function renderWords(div,c){
   const W=CURRENT.W, t=div.querySelector('.transcript');
   let html=''; let any=false;
@@ -154,6 +182,7 @@ function renderClip(c,idx){
       ${c.uses_assets?'<span class="badge">uses B-roll — render to confirm</span>':''}
     </div>
     <div class="hint">${c.clip_id} · title card ${c.title_card_seconds.toFixed(1)}s</div>
+    ${critiqueHtml(c.critique)}
     <div class="ctrls">
       <label><input type="checkbox" class="keep" checked> keep</label>
       <label><input type="radio" name="dec${idx}" class="rework"> rework</label>
