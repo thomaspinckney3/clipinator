@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from extractor.timebase import probe_frame_rate, quantize_plan_times
 from extractor.preprocess_video import (
     DEFAULT_FFMPEG_BIN,
     DEFAULT_FFMPEG_HWACCEL,
@@ -87,9 +88,9 @@ def should_skip_timeline_item(item: dict[str, Any]) -> bool:
     return False
 
 
-def source_windows_from_stage3(stage3_output: dict[str, Any]) -> list[SourceWindow]:
+def source_windows_from_plan(plan_output: dict[str, Any]) -> list[SourceWindow]:
     windows: list[SourceWindow] = []
-    for clip in stage3_output.get("clip_ads", []) or []:
+    for clip in plan_output.get("clip_ads", []) or []:
         clip_id = str(clip.get("clip_id") or "clip")
         timeline = sorted(
             clip.get("timeline", []) or [],
@@ -111,7 +112,7 @@ def source_windows_from_stage3(stage3_output: dict[str, Any]) -> list[SourceWind
                     timeline_order=int(item.get("order", 0) or 0),
                     source_start=source_start,
                     source_end=source_end,
-                    reason="stage3_timeline",
+                    reason="plan_timeline",
                 )
             )
     return merge_duplicate_windows(windows)
@@ -539,15 +540,18 @@ def analyze_frames(frames: list[bytes], width: int, height: int) -> dict[str, An
 
 def build_subject_index(args: argparse.Namespace) -> dict[str, Any]:
     video = args.video.expanduser().resolve()
-    stage3_output = args.stage3_output.expanduser().resolve()
+    plan_output = args.plan_output.expanduser().resolve()
     if not video.exists():
         raise FileNotFoundError(video)
-    if not stage3_output.exists():
-        raise FileNotFoundError(stage3_output)
+    if not plan_output.exists():
+        raise FileNotFoundError(plan_output)
 
-    plan = read_json(stage3_output)
-    windows = source_windows_from_stage3(plan)
-    run_id = safe_name(args.run_id or stage3_output.parent.name or video.stem)
+    plan = read_json(plan_output)
+    source_frame_rate = probe_frame_rate(video)
+    if source_frame_rate is not None:
+        quantize_plan_times(plan, source_frame_rate)
+    windows = source_windows_from_plan(plan)
+    run_id = safe_name(args.run_id or plan_output.parent.name or video.stem)
     output_root = args.output_dir.expanduser().resolve()
     run_dir = output_root / run_id
     entries: list[dict[str, Any]] = []
@@ -585,7 +589,7 @@ def build_subject_index(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": datetime.now(UTC).isoformat(),
         "api_calls": False,
         "video": str(video),
-        "stage3_output": str(stage3_output),
+        "plan_output": str(plan_output),
         "run_id": run_id,
         "sample": {
             "width": args.sample_width,
@@ -610,7 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build a local subject/crop index for Stage 3 render plans."
     )
     parser.add_argument("video", type=Path)
-    parser.add_argument("--stage3-output", type=Path, required=True)
+    parser.add_argument("--plan-output", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--sample-width", type=int, default=DEFAULT_SAMPLE_WIDTH)

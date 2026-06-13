@@ -4,13 +4,12 @@ import argparse
 import json
 import os
 import sys
-from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from extractor import stage_cache
-from extractor.openai_stage1 import (
+from extractor.openai_strategy import (
     CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
@@ -24,10 +23,11 @@ from extractor.openai_stage1 import (
     DEFAULT_REASONING_EFFORT,
     Pricing,
     actual_cost,
-    build_source_materials as build_video_source_materials,
+    build_source_materials,
     cache_entry_dir,
     cache_entry_exists,
-    estimated_request_cost,
+    cost_from_counts,
+    estimate_text_tokens,
     image_data_url,
     read_json,
     response_output_text,
@@ -37,12 +37,14 @@ from extractor.openai_stage1 import (
     usage_dict,
     write_json,
 )
-from extractor.openai_stage3 import STAGE3_SCHEMA
+from extractor.preprocess_video import format_time
 from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
+from extractor.openai_responses import create_response_streaming
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
-DEFAULT_MAX_OUTPUT_TOKENS = 32_000
+DEFAULT_MAX_OUTPUT_TOKENS = 16_000
+DEFAULT_VISUAL_INDEX_MAX_IMAGES = 24
 
 
 def cache_source_files() -> list[Path]:
@@ -51,120 +53,158 @@ def cache_source_files() -> list[Path]:
         Path(__file__).resolve(),
         root / "prompt_templates.py",
         prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
-        prompt_template_path("stage5_ad.md"),
-        prompt_template_path("stage5_excerpt.md"),
+        prompt_template_path("moments_ad.md"),
+        prompt_template_path("moments_excerpt.md"),
         root / "stage_cache.py",
-        root / "openai_stage1.py",
-        root / "openai_stage3.py",
-        root / "render_stage3.py",
+        root / "openai_strategy.py",
+        root / "preprocess_video.py",
         root / "transcribe.py",
     ]
 
 
-DEVELOPER_PROMPT_TEMPLATE = "stage5_developer.md"
+DEVELOPER_PROMPT_TEMPLATE = "moments_developer.md"
 
 
 def developer_instructions() -> str:
     return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
-RENDER_SETTINGS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "transition_duration": {"type": "number"},
-        "internal_visual_transition_duration": {"type": "number"},
-        "foreground_scale": {"type": "number"},
-        "foreground_brightness": {"type": "number"},
-        "foreground_contrast": {"type": "number"},
-        "foreground_saturation": {"type": "number"},
-        "burn_captions": {"type": "boolean"},
-        "notes": {"type": "array", "items": {"type": "string"}},
-    },
-}
-
-
-def stage3_schema_for_stage5() -> dict[str, Any]:
-    schema = deepcopy(STAGE3_SCHEMA)
-    schema["properties"]["render_settings"] = deepcopy(RENDER_SETTINGS_SCHEMA)
-    clip_schema = schema["properties"]["clip_ads"]["items"]
-    clip_schema["properties"]["caption_plan_source"] = {
-        "type": "string",
-        "enum": ["absolute_render_time", "render_time", "srt"],
-    }
-    clip_schema["properties"]["use_caption_plan_for_srt"] = {"type": "boolean"}
-    clip_schema["properties"]["render_settings"] = deepcopy(RENDER_SETTINGS_SCHEMA)
-    clip_schema["properties"]["stage5_revision_notes"] = {
-        "type": "array",
-        "items": {"type": "string"},
-    }
-    return schema
-
-
-STAGE5_SCHEMA: dict[str, Any] = {
+MOMENTS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "stage5_summary",
-        "revision_policy",
-        "clip_revision_reports",
-        "render_queue",
-        "revised_stage3_output",
+        "content_mode",
+        "video_title",
+        "analysis_summary",
+        "angle_moment_sets",
+        "cross_angle_ranked_moments",
+        "transcript_quality_actions",
+        "notes_for_edit_plan",
     ],
     "properties": {
-        "stage5_summary": {"type": "string"},
-        "revision_policy": {"type": "array", "items": {"type": "string"}},
-        "clip_revision_reports": {
+        "content_mode": {"type": "string", "enum": ["ad", "excerpt"]},
+        "video_title": {"type": "string"},
+        "analysis_summary": {"type": "string"},
+        "angle_moment_sets": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
-                    "clip_id",
-                    "prior_clip_id",
-                    "action",
-                    "issues_addressed",
-                    "applied_changes",
-                    "rejected_or_unresolved_feedback",
-                    "remaining_risks",
-                    "should_render",
-                    "should_review_again",
+                    "stage1_rank",
+                    "angle",
+                    "best_candidate_id",
+                    "candidate_windows",
+                    "weak_or_rejected_windows",
                 ],
                 "properties": {
-                    "clip_id": {"type": "string"},
-                    "prior_clip_id": {"type": "string"},
-                    "action": {
-                        "type": "string",
-                        "enum": ["keep_as_is", "revise", "merge", "reject", "defer"],
-                    },
-                    "issues_addressed": {"type": "array", "items": {"type": "string"}},
-                    "applied_changes": {"type": "array", "items": {"type": "string"}},
-                    "rejected_or_unresolved_feedback": {
+                    "stage1_rank": {"type": "integer"},
+                    "angle": {"type": "string"},
+                    "best_candidate_id": {"type": "string"},
+                    "candidate_windows": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "candidate_id",
+                                "start",
+                                "end",
+                                "duration",
+                                "working_title",
+                                "opening_hook",
+                                "story_function",
+                                "transcript_excerpt",
+                                "why_clipworthy",
+                                "required_context",
+                                "payoff",
+                                "visual_expectation",
+                                "speaker_or_audio_notes",
+                                "caption_notes",
+                                "qa_risks",
+                                "recommended_use",
+                                "confidence",
+                            ],
+                            "properties": {
+                                "candidate_id": {"type": "string"},
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "duration": {"type": "number"},
+                                "working_title": {"type": "string"},
+                                "opening_hook": {"type": "string"},
+                                "story_function": {"type": "string"},
+                                "transcript_excerpt": {"type": "string"},
+                                "why_clipworthy": {"type": "string"},
+                                "required_context": {"type": "string"},
+                                "payoff": {"type": "string"},
+                                "visual_expectation": {"type": "string"},
+                                "speaker_or_audio_notes": {"type": "string"},
+                                "caption_notes": {"type": "string"},
+                                "qa_risks": {"type": "array", "items": {"type": "string"}},
+                                "recommended_use": {
+                                    "type": "string",
+                                    "enum": ["primary", "alternate", "supporting_broll", "review_only"],
+                                },
+                                "confidence": {"type": "number"},
+                            },
+                        },
                     },
-                    "remaining_risks": {"type": "array", "items": {"type": "string"}},
-                    "render_settings": deepcopy(RENDER_SETTINGS_SCHEMA),
-                    "should_render": {"type": "boolean"},
-                    "should_review_again": {"type": "boolean"},
+                    "weak_or_rejected_windows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["start", "end", "reason"],
+                            "properties": {
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "reason": {"type": "string"},
+                            },
+                        },
+                    },
                 },
             },
         },
-        "render_queue": {
+        "cross_angle_ranked_moments": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["clip_id", "priority", "reason", "render_settings"],
+                "required": [
+                    "rank",
+                    "candidate_id",
+                    "angle",
+                    "start",
+                    "end",
+                    "why_this_ranks_here",
+                    "edit_implication",
+                ],
                 "properties": {
-                    "clip_id": {"type": "string"},
-                    "priority": {"type": "integer"},
-                    "reason": {"type": "string"},
-                    "render_settings": deepcopy(RENDER_SETTINGS_SCHEMA),
+                    "rank": {"type": "integer"},
+                    "candidate_id": {"type": "string"},
+                    "angle": {"type": "string"},
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "why_this_ranks_here": {"type": "string"},
+                    "edit_implication": {"type": "string"},
                 },
             },
         },
-        "revised_stage3_output": stage3_schema_for_stage5(),
+        "transcript_quality_actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["start", "end", "issue", "action"],
+                "properties": {
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "issue": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+            },
+        },
+        "notes_for_edit_plan": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -173,160 +213,109 @@ def response_text_config() -> dict[str, Any]:
     return {
         "format": {
             "type": "json_schema",
-            "name": "stage5_reedit_plan",
-            "schema": STAGE5_SCHEMA,
-            "strict": False,
+            "name": "stage2_transcript_moments",
+            "schema": MOMENTS_SCHEMA,
+            "strict": True,
         },
         "verbosity": "medium",
     }
 
 
-def filter_stage3_output(stage3_output: dict[str, Any], clip_ids: set[str]) -> dict[str, Any]:
-    if not clip_ids:
-        return stage3_output
-    filtered = deepcopy(stage3_output)
-    filtered["clip_ads"] = [
-        clip for clip in filtered.get("clip_ads", []) or [] if str(clip.get("clip_id")) in clip_ids
-    ]
-    return filtered
-
-
-def filter_stage4_output(stage4_output: dict[str, Any], clip_ids: set[str]) -> dict[str, Any]:
-    if not clip_ids:
-        return stage4_output
-    filtered = deepcopy(stage4_output)
-    filtered["clip_reviews"] = [
-        review
-        for review in filtered.get("clip_reviews", []) or []
-        if str(review.get("clip_id")) in clip_ids
-    ]
-    filtered["recommended_rerender_order"] = [
-        item
-        for item in filtered.get("recommended_rerender_order", []) or []
-        if str(item.get("clip_id")) in clip_ids
-    ]
-    return filtered
-
-
-def compact_render_manifest(render_manifest: dict[str, Any], clip_ids: set[str]) -> dict[str, Any]:
-    clips = render_manifest.get("clips", []) or []
-    if clip_ids:
-        clips = [clip for clip in clips if str(clip.get("clip_id")) in clip_ids]
-    compact_clips: list[dict[str, Any]] = []
-    for clip in clips:
-        probe = clip.get("probe") or {}
-        media_format = probe.get("format") or {}
-        compact_clips.append(
+def compact_visual_index_manifest(manifest_path: Path, max_images: int) -> dict[str, Any]:
+    manifest = read_json(manifest_path)
+    candidate_sheets = manifest.get("candidate_sheets", []) or []
+    compact_sheets: list[dict[str, Any]] = []
+    for sheet in candidate_sheets[:max_images]:
+        compact_sheets.append(
             {
-                "clip_id": clip.get("clip_id"),
-                "concept_title": clip.get("concept_title"),
-                "output_path": clip.get("output_path"),
-                "srt_path": clip.get("srt_path"),
-                "duration_seconds": media_format.get("duration"),
-                "implemented_edit_features": clip.get("implemented_edit_features"),
-                "transition_duration": clip.get("transition_duration"),
-                "internal_visual_transition_duration": clip.get(
-                    "internal_visual_transition_duration"
-                ),
-                "foreground_scale": clip.get("foreground_scale"),
-                "foreground_brightness": clip.get("foreground_brightness"),
-                "foreground_contrast": clip.get("foreground_contrast"),
-                "foreground_saturation": clip.get("foreground_saturation"),
-                "caption_plan_source": clip.get("caption_plan_source"),
-                "caption_entries": clip.get("caption_entries"),
-                "segment_plans": clip.get("segment_plans"),
-            }
-        )
-    return {
-        "source_video": render_manifest.get("source_video"),
-        "stage3_output": render_manifest.get("stage3_output"),
-        "resolution": render_manifest.get("resolution"),
-        "renderer": render_manifest.get("renderer"),
-        "clips": compact_clips,
-    }
-
-
-def compact_transition_sheet(sheet: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(sheet, dict):
-        return None
-    return {
-        "columns": sheet.get("columns"),
-        "read_order": sheet.get("read_order"),
-        "sampled_frames": [
-            {
-                "transition_index": frame.get("transition_index"),
-                "transition_type": frame.get("transition_type"),
-                "from_segment_order": frame.get("from_segment_order"),
-                "to_segment_order": frame.get("to_segment_order"),
-                "from_visual_span_index": frame.get("from_visual_span_index"),
-                "to_visual_span_index": frame.get("to_visual_span_index"),
-                "render_time_seconds": frame.get("render_time_seconds"),
-                "offset_from_transition_mid_seconds": frame.get(
-                    "offset_from_transition_mid_seconds"
-                ),
-            }
-            for frame in sheet.get("sampled_frames", []) or []
-        ],
-    }
-
-
-def compact_review_package(package: dict[str, Any], clip_ids: set[str]) -> dict[str, Any]:
-    clips = package.get("clips", []) or []
-    if clip_ids:
-        clips = [clip for clip in clips if str(clip.get("clip_id")) in clip_ids]
-    compact_clips: list[dict[str, Any]] = []
-    for clip in clips:
-        compact_clips.append(
-            {
-                "clip_id": clip.get("clip_id"),
-                "rendered_video_path": clip.get("rendered_video_path"),
-                "local_timing_evidence": clip.get("local_timing_evidence"),
-                "srt_entries": clip.get("srt_entries"),
-                "sampled_frames": [
+                "candidate_id": sheet.get("candidate_id"),
+                "title": sheet.get("title"),
+                "path": sheet.get("path"),
+                "columns": sheet.get("columns"),
+                "frame_count": sheet.get("frame_count"),
+                "read_order": sheet.get("read_order"),
+                "angle": sheet.get("angle"),
+                "candidate_window": sheet.get("candidate_window"),
+                "sheet_start": sheet.get("sheet_start"),
+                "sheet_end": sheet.get("sheet_end"),
+                "sheet_display_range": sheet.get("sheet_display_range"),
+                "frames": [
                     {
-                        "index": frame.get("index"),
-                        "render_time_seconds": frame.get("render_time_seconds"),
+                        "timestamp": frame.get("timestamp"),
+                        "display_time": frame.get("display_time"),
+                        "sheet_row": frame.get("sheet_row"),
+                        "sheet_column": frame.get("sheet_column"),
                     }
-                    for frame in clip.get("sampled_frames", []) or []
+                    for frame in sheet.get("frames", []) or []
                 ],
-                "transition_sheet": compact_transition_sheet(clip.get("transition_sheet")),
             }
         )
     return {
-        "schema_version": package.get("schema_version"),
-        "human_feedback_rubric": package.get("human_feedback_rubric"),
-        "review_evidence_note": package.get("review_evidence_note"),
-        "clips": compact_clips,
+        "schema_version": manifest.get("schema_version"),
+        "video": manifest.get("video"),
+        "frame_interval_seconds": manifest.get("frame_interval_seconds"),
+        "frame_count": manifest.get("frame_count"),
+        "included_candidate_sheet_count": len(compact_sheets),
+        "total_candidate_sheet_count": len(candidate_sheets),
+        "candidate_sheets": compact_sheets,
+        "usage_note": manifest.get("usage_note"),
     }
 
 
-def build_task_prompt(
-    stage3_output: dict[str, Any],
-    stage4_output: dict[str, Any],
-    render_manifest: dict[str, Any],
-    review_package: dict[str, Any] | None,
-    include_video_source_materials: bool,
-    content_mode: str,
-) -> str:
-    evidence_scope = (
-        "The stable video transcript and preprocessing evidence are included, so you may "
-        "use them to choose better sentence boundaries or source ranges."
-        if include_video_source_materials
-        else "No full transcript/source prefix is included. Do not invent new source ranges; "
-        "revise only from the prior plan, render manifest, and Stage 4 critique."
-    )
-    review_package_json = (
-        json.dumps(review_package, ensure_ascii=False, indent=2)
-        if review_package is not None
-        else "No review package JSON supplied."
-    )
+def visual_index_root(manifest_path: Path) -> Path:
+    return manifest_path.parent.parent
+
+
+def visual_index_image_paths(manifest_path: Path, max_images: int) -> list[Path]:
+    manifest = read_json(manifest_path)
+    root = visual_index_root(manifest_path)
+    paths: list[Path] = []
+    for sheet in (manifest.get("candidate_sheets", []) or [])[:max_images]:
+        sheet_path = sheet.get("path")
+        if not sheet_path:
+            continue
+        path = Path(str(sheet_path))
+        if not path.is_absolute():
+            path = root / path
+        if path.exists():
+            paths.append(path)
+    return paths
+
+
+def estimated_moments_cost(
+    source_materials: str,
+    task_prompt: str,
+    image_count: int,
+    max_output_tokens: int,
+    image_token_allowance: int,
+    pricing: Pricing,
+) -> dict[str, Any]:
+    text_tokens = estimate_text_tokens(source_materials) + estimate_text_tokens(task_prompt)
+    image_tokens = image_count * image_token_allowance
+    input_tokens = text_tokens + image_tokens
+    return {
+        "method": "rough upper-bound estimate using chars/4 for text, configured per-image allowance, and max_output_tokens",
+        "text_tokens_estimate": text_tokens,
+        "image_count": image_count,
+        "image_tokens_allowance": image_tokens,
+        "input_tokens_estimate": input_tokens,
+        "max_output_tokens": max_output_tokens,
+        "estimated_usd": round(
+            cost_from_counts(
+                input_tokens=input_tokens,
+                cached_input_tokens=0,
+                output_tokens=max_output_tokens,
+                pricing=pricing,
+            ),
+            6,
+        ),
+    }
+
+
+def build_task_prompt(strategy_output: dict[str, Any], content_mode: str) -> str:
     return render_prompt_template(
-        f"stage5_{content_mode}.md",
-        evidence_scope=evidence_scope,
-        stage3_output_json=json.dumps(stage3_output, ensure_ascii=False, indent=2),
-        render_manifest_json=json.dumps(render_manifest, ensure_ascii=False, indent=2),
-        stage4_output_json=json.dumps(stage4_output, ensure_ascii=False, indent=2),
-        review_package_json=review_package_json,
+        f"moments_{content_mode}.md",
+        stage1_output_json=json.dumps(strategy_output, ensure_ascii=False, indent=2),
     )
 
 
@@ -335,12 +324,16 @@ def request_fingerprint_payload(
     source_materials: str,
     task_prompt: str,
     contact_sheet_hash: str | None,
-    stage3_output_hash: str,
-    stage4_output_hash: str,
-    render_manifest_hash: str,
-    review_package_hash: str | None,
+    visual_index_image_hashes: list[str],
+    strategy_output_hash: str,
+    visual_index_hash: str | None,
 ) -> dict[str, Any]:
-    content: list[dict[str, Any]] = [{"type": "input_text", "sha256": sha256_text(source_materials)}]
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "sha256": sha256_text(source_materials),
+        }
+    ]
     if contact_sheet_hash is not None:
         content.append(
             {
@@ -349,24 +342,37 @@ def request_fingerprint_payload(
                 "detail": args.image_detail,
             }
         )
+    for image_hash in visual_index_image_hashes:
+        content.append(
+            {
+                "type": "input_image",
+                "sha256": image_hash,
+                "detail": args.image_detail,
+                "source": "candidate_visual_index_sheet",
+            }
+        )
     return {
-        "cache_schema_version": 1,
-        "stage": "stage5_reedit_plan",
+        "cache_schema_version": 2,
+        "stage": "moments_analysis",
         "api": "openai.responses.create",
         "model": args.model,
         "input": [
-            {"role": "developer", "content": developer_instructions()},
-            {"role": "user", "content": content},
+            {
+                "role": "developer",
+                "content": developer_instructions(),
+            },
+            {
+                "role": "user",
+                "content": content,
+            },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "input_text",
                         "sha256": sha256_text(task_prompt),
-                        "stage3_output_sha256": stage3_output_hash,
-                        "stage4_output_sha256": stage4_output_hash,
-                        "render_manifest_sha256": render_manifest_hash,
-                        "review_package_sha256": review_package_hash,
+                        "strategy_output_sha256": strategy_output_hash,
+                        "visual_index_sha256": visual_index_hash,
                     }
                 ],
             },
@@ -402,8 +408,7 @@ def write_cache_entry(
     )
     write_json(entry_dir / "raw-response.json", response_dict)
     (entry_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(entry_dir / "stage5-output.json", parsed_output)
-    write_json(entry_dir / "stage3-output.json", parsed_output["revised_stage3_output"])
+    write_json(entry_dir / "moments-output.json", parsed_output)
     write_json(entry_dir / "usage-and-cost.json", usage_and_cost)
 
 
@@ -415,7 +420,7 @@ def load_cached_response(entry_dir: Path) -> dict[str, Any]:
         if output_text_path.exists()
         else response_output_text(None, response_dict)
     )
-    parsed_path = entry_dir / "stage5-output.json"
+    parsed_path = entry_dir / "moments-output.json"
     parsed_output = read_json(parsed_path) if parsed_path.exists() else json.loads(output_text)
     return {
         "response_dict": response_dict,
@@ -431,40 +436,54 @@ def write_markdown(
     cache_info: dict[str, Any] | None = None,
 ) -> None:
     lines = [
-        "# Stage 5 Re-Edit Plan",
+        f"# {output.get('video_title', 'Stage 2 Transcript Moment Analysis')}",
+        "",
+        f"- Content mode: `{output.get('content_mode', 'ad')}`",
         "",
         "## Summary",
         "",
-        str(output.get("stage5_summary", "")).strip(),
+        str(output.get("analysis_summary", "")).strip(),
         "",
-        "## Clip Revisions",
+        "## Top Moments",
         "",
     ]
-    for report in output.get("clip_revision_reports", []) or []:
-        lines.append(f"### {report.get('clip_id', '')}")
-        lines.append(f"- Prior clip: `{report.get('prior_clip_id', '')}`")
-        lines.append(f"- Action: `{report.get('action', '')}`")
-        lines.append(f"- Render again: `{str(report.get('should_render', False)).lower()}`")
-        if report.get("issues_addressed"):
-            lines.append("- Issues addressed:")
-            for issue in report.get("issues_addressed", []) or []:
-                lines.append(f"  - {issue}")
-        if report.get("applied_changes"):
-            lines.append("- Applied changes:")
-            for change in report.get("applied_changes", []) or []:
-                lines.append(f"  - {change}")
-        if report.get("remaining_risks"):
-            lines.append("- Remaining risks:")
-            for risk in report.get("remaining_risks", []) or []:
-                lines.append(f"  - {risk}")
+    for item in output.get("cross_angle_ranked_moments", []) or []:
+        start = item.get("start")
+        end = item.get("end")
+        timing = ""
+        if isinstance(start, int | float) and isinstance(end, int | float):
+            timing = f"`{format_time(float(start))}-{format_time(float(end))}` "
+        lines.append(f"{item.get('rank', '?')}. {timing}{item.get('angle', '')}")
+        lines.append(f"   - Candidate: `{item.get('candidate_id', '')}`")
+        lines.append(f"   - Why: {item.get('why_this_ranks_here', '')}")
+        lines.append(f"   - Edit implication: {item.get('edit_implication', '')}")
         lines.append("")
-    if output.get("render_queue"):
-        lines.extend(["## Render Queue", ""])
-        for item in output.get("render_queue", []) or []:
-            lines.append(
-                f"- `{item.get('priority', '')}` `{item.get('clip_id', '')}`: "
-                f"{item.get('reason', '')}"
-            )
+    lines.extend(["## Angle Candidate Windows", ""])
+    for angle_set in output.get("angle_moment_sets", []) or []:
+        lines.append(f"### {angle_set.get('stage1_rank', '?')}. {angle_set.get('angle', '')}")
+        lines.append(f"- Best: `{angle_set.get('best_candidate_id', '')}`")
+        for window in angle_set.get("candidate_windows", []) or []:
+            start = window.get("start")
+            end = window.get("end")
+            timing = ""
+            if isinstance(start, int | float) and isinstance(end, int | float):
+                timing = f"`{format_time(float(start))}-{format_time(float(end))}` "
+            lines.append(f"- {timing}`{window.get('candidate_id', '')}` {window.get('working_title', '')}")
+            lines.append(f"  Hook: {window.get('opening_hook', '')}")
+            lines.append(f"  Use: `{window.get('recommended_use', '')}` confidence `{window.get('confidence', '')}`")
+        lines.append("")
+    if output.get("transcript_quality_actions"):
+        lines.extend(["## Transcript QA Actions", ""])
+        for action in output.get("transcript_quality_actions", []) or []:
+            start = action.get("start")
+            end = action.get("end")
+            if isinstance(start, int | float) and isinstance(end, int | float):
+                lines.append(
+                    f"- `{format_time(float(start))}-{format_time(float(end))}`: "
+                    f"{action.get('issue', '')} -> {action.get('action', '')}"
+                )
+            else:
+                lines.append(f"- {action.get('issue', '')} -> {action.get('action', '')}")
         lines.append("")
     lines.extend(["## Cost", ""])
     if cache_info and cache_info.get("hit"):
@@ -505,75 +524,72 @@ def write_response_artifacts(
 ) -> None:
     write_json(run_dir / "raw-response.json", response_dict)
     (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(run_dir / "stage5-output.json", parsed_output)
-    write_json(run_dir / "stage3-output.json", parsed_output["revised_stage3_output"])
+    write_json(run_dir / "moments-output.json", parsed_output)
     write_json(run_dir / "usage-and-cost.json", usage_and_cost)
     write_markdown(run_dir / "summary.md", parsed_output, summary_cost, cache_info=cache_info)
 
 
-def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
-    stage3_path = args.stage3_output.expanduser().resolve()
-    stage4_path = args.stage4_output.expanduser().resolve()
-    render_manifest_path = args.render_manifest.expanduser().resolve()
-    review_package_path = args.review_package.expanduser().resolve() if args.review_package else None
-    transcript_path = args.transcript.expanduser().resolve() if args.transcript else None
-    manifest_path = args.manifest.expanduser().resolve() if args.manifest else None
+def run_moments(args: argparse.Namespace) -> dict[str, Any]:
+    transcript_path = args.transcript.expanduser().resolve()
+    manifest_path = args.manifest.expanduser().resolve()
+    strategy_path = args.strategy_output.expanduser().resolve()
     contact_sheet_path = args.contact_sheet.expanduser().resolve() if args.contact_sheet else None
+    visual_index_path = args.visual_index_manifest.expanduser().resolve() if args.visual_index_manifest else None
+    if not transcript_path.exists():
+        raise FileNotFoundError(transcript_path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(manifest_path)
+    if not strategy_path.exists():
+        raise FileNotFoundError(strategy_path)
+    if contact_sheet_path is not None and not contact_sheet_path.exists():
+        raise FileNotFoundError(contact_sheet_path)
+    if visual_index_path is not None and not visual_index_path.exists():
+        raise FileNotFoundError(visual_index_path)
 
-    for path in [stage3_path, stage4_path, render_manifest_path]:
-        if not path.exists():
-            raise FileNotFoundError(path)
-    for optional_path in [review_package_path, transcript_path, manifest_path, contact_sheet_path]:
-        if optional_path is not None and not optional_path.exists():
-            raise FileNotFoundError(optional_path)
-    if (transcript_path is None) != (manifest_path is None):
-        raise RuntimeError("--transcript and --manifest must be supplied together.")
-    if contact_sheet_path is not None and transcript_path is None:
-        raise RuntimeError("--contact-sheet requires --transcript and --manifest.")
-
-    clip_ids = set(args.clip_id)
     pricing = Pricing(
         input_usd_per_million=args.input_usd_per_million,
         cached_input_usd_per_million=args.cached_input_usd_per_million,
         output_usd_per_million=args.output_usd_per_million,
     )
-
-    source_materials = (
-        build_video_source_materials(
-            manifest_path=manifest_path,
-            transcript_path=transcript_path,
-            contact_sheet_path=contact_sheet_path,
+    strategy_output = read_json(strategy_path)
+    content_mode = args.content_mode or str(strategy_output.get("content_mode") or "ad")
+    strategy_output_text = stable_json(strategy_output)
+    source_materials = build_source_materials(
+        manifest_path=manifest_path,
+        transcript_path=transcript_path,
+        contact_sheet_path=contact_sheet_path,
+    )
+    visual_index_images: list[Path] = []
+    visual_index_text = ""
+    if visual_index_path is not None:
+        visual_index = compact_visual_index_manifest(
+            manifest_path=visual_index_path,
+            max_images=args.visual_index_max_images,
         )
-        if transcript_path is not None and manifest_path is not None
-        else "No optional full-video transcript/preprocessing prefix supplied for Stage 5."
-    )
-    stage3_output = filter_stage3_output(read_json(stage3_path), clip_ids)
-    stage4_output = filter_stage4_output(read_json(stage4_path), clip_ids)
-    render_manifest = compact_render_manifest(read_json(render_manifest_path), clip_ids)
-    review_package = (
-        compact_review_package(read_json(review_package_path), clip_ids)
-        if review_package_path is not None
-        else None
-    )
-    content_mode = args.content_mode or str(
-        stage3_output.get("content_mode")
-        or stage4_output.get("content_mode")
-        or render_manifest.get("content_mode")
-        or (review_package or {}).get("content_mode")
-        or "ad"
-    )
-    task_prompt = build_task_prompt(
-        stage3_output=stage3_output,
-        stage4_output=stage4_output,
-        render_manifest=render_manifest,
-        review_package=review_package,
-        include_video_source_materials=transcript_path is not None,
-        content_mode=content_mode,
-    )
-    preflight_cost = estimated_request_cost(
+        visual_index_images = [] if args.no_visual_index_images else visual_index_image_paths(
+            manifest_path=visual_index_path,
+            max_images=args.visual_index_max_images,
+        )
+        visual_index_text = stable_json(visual_index)
+        source_materials = "\n\n".join(
+            [
+                source_materials,
+                "DENSE CANDIDATE VISUAL INDEX",
+                (
+                    "Candidate visual-index contact sheets are attached after the main contact sheet "
+                    "in the same order as candidate_sheets below. Use these 1 fps sheets to verify "
+                    "concrete objects/actions when selecting candidate windows."
+                ),
+                "COMPACT VISUAL INDEX JSON:",
+                json.dumps(visual_index, ensure_ascii=False, indent=2),
+            ]
+        )
+    task_prompt = build_task_prompt(strategy_output, content_mode)
+    image_count = (1 if contact_sheet_path is not None else 0) + len(visual_index_images)
+    preflight_cost = estimated_moments_cost(
         source_materials=source_materials,
         task_prompt=task_prompt,
-        include_image=contact_sheet_path is not None,
+        image_count=image_count,
         max_output_tokens=args.max_output_tokens,
         image_token_allowance=args.image_token_allowance,
         pricing=pricing,
@@ -587,33 +603,32 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
     print(
         f"  estimated input tokens: {preflight_cost['input_tokens_estimate']} "
         f"({preflight_cost['text_tokens_estimate']} text + "
-        f"{preflight_cost['image_tokens_allowance']} image allowance)"
+        f"{preflight_cost['image_tokens_allowance']} image allowance across "
+        f"{preflight_cost['image_count']} images)"
     )
     print(f"  estimated upper-bound cost: ${preflight_cost['estimated_usd']:.6f}")
 
     contact_sheet_hash = sha256_file(contact_sheet_path) if contact_sheet_path else None
-    stage3_output_text = stable_json(stage3_output)
-    stage4_output_text = stable_json(stage4_output)
-    render_manifest_text = stable_json(render_manifest)
-    review_package_text = stable_json(review_package) if review_package is not None else ""
+    visual_index_image_hashes = [sha256_file(path) for path in visual_index_images]
+    visual_index_hash = sha256_text(visual_index_text) if visual_index_text else None
     stable_prefix_cache_material = "\n".join(
         [
             source_materials,
             args.model,
             args.reasoning_effort,
             contact_sheet_hash or "",
+            *visual_index_image_hashes,
         ]
     )
-    prompt_cache_key = args.prompt_cache_key or f"stage5-{sha256_text(stable_prefix_cache_material)[:48]}"
+    prompt_cache_key = args.prompt_cache_key or f"strategy-{sha256_text(stable_prefix_cache_material)[:48]}"
     fingerprint_payload = request_fingerprint_payload(
         args=args,
         source_materials=source_materials,
         task_prompt=task_prompt,
         contact_sheet_hash=contact_sheet_hash,
-        stage3_output_hash=sha256_text(stage3_output_text),
-        stage4_output_hash=sha256_text(stage4_output_text),
-        render_manifest_hash=sha256_text(render_manifest_text),
-        review_package_hash=sha256_text(review_package_text) if review_package_text else None,
+        visual_index_image_hashes=visual_index_image_hashes,
+        strategy_output_hash=sha256_text(strategy_output_text),
+        visual_index_hash=visual_index_hash,
     )
     cache_mode = "off" if args.no_local_cache else args.cache_mode
     cache_identity = stage_cache.build_cache_identity(
@@ -639,12 +654,8 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
             "preflight_cost": preflight_cost,
             "source_materials_sha256": sha256_text(source_materials),
             "task_prompt_sha256": sha256_text(task_prompt),
-            "stage3_output_sha256": sha256_text(stage3_output_text),
-            "stage4_output_sha256": sha256_text(stage4_output_text),
-            "render_manifest_sha256": sha256_text(render_manifest_text),
-            "review_package_sha256": sha256_text(review_package_text)
-            if review_package_text
-            else None,
+            "strategy_output_sha256": sha256_text(strategy_output_text),
+            "visual_index_sha256": visual_index_hash,
             "prompt_cache_key": prompt_cache_key,
             "local_response_cache": stage_cache.response_cache_status_payload(
                 enabled=cache_dir is not None,
@@ -671,7 +682,7 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
     output_root = args.output_dir.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or (
-        f"{stage4_path.parent.name}.stage5.{args.model}.{args.reasoning_effort}."
+        f"{transcript_path.stem}.moments.{args.model}.{args.reasoning_effort}."
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     )
     run_dir = output_root / run_id
@@ -681,33 +692,28 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
         run_dir / "request-manifest.json",
         {
             "created_at": datetime.now(UTC).isoformat(),
-            "stage": "stage5_reedit_plan",
+            "stage": "moments_analysis",
             "model": args.model,
             "reasoning_effort": args.reasoning_effort,
             "max_output_tokens": args.max_output_tokens,
-            "image_detail": args.image_detail if contact_sheet_path else None,
+            "image_detail": args.image_detail if image_count else None,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": args.prompt_cache_retention,
-            "clip_ids": sorted(clip_ids),
             "paths": {
-                "stage3_output": str(stage3_path),
-                "stage4_output": str(stage4_path),
-                "render_manifest": str(render_manifest_path),
-                "review_package": str(review_package_path) if review_package_path else None,
-                "transcript": str(transcript_path) if transcript_path else None,
-                "manifest": str(manifest_path) if manifest_path else None,
+                "transcript": str(transcript_path),
+                "manifest": str(manifest_path),
                 "contact_sheet": str(contact_sheet_path) if contact_sheet_path else None,
+                "strategy_output": str(strategy_path),
+                "visual_index_manifest": str(visual_index_path) if visual_index_path else None,
+                "visual_index_images": [str(path) for path in visual_index_images],
             },
             "hashes": {
                 "source_materials_sha256": sha256_text(source_materials),
                 "task_prompt_sha256": sha256_text(task_prompt),
-                "stage3_output_sha256": sha256_text(stage3_output_text),
-                "stage4_output_sha256": sha256_text(stage4_output_text),
-                "render_manifest_sha256": sha256_text(render_manifest_text),
-                "review_package_sha256": sha256_text(review_package_text)
-                if review_package_text
-                else None,
+                "strategy_output_sha256": sha256_text(strategy_output_text),
                 "contact_sheet_sha256": contact_sheet_hash,
+                "visual_index_sha256": visual_index_hash,
+                "visual_index_image_sha256s": visual_index_image_hashes,
             },
             "preflight_cost": preflight_cost,
             "pricing": {
@@ -784,8 +790,8 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
         )
         print(f"Local response cache hit: {entry_dir}")
         print("No OpenAI API call made.")
-        print(f"Wrote {run_dir / 'stage5-output.json'}")
-        print(f"Wrote {run_dir / 'stage3-output.json'}")
+        print(f"Wrote {run_dir / 'moments-output.json'}")
+        print(f"Wrote {run_dir / 'summary.md'}")
         return {
             "run_dir": str(run_dir),
             "output": cached["parsed_output"],
@@ -806,10 +812,24 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
                 "detail": args.image_detail,
             }
         )
+    for path in visual_index_images:
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": image_data_url(path),
+                "detail": args.image_detail,
+            }
+        )
     input_messages: list[dict[str, Any]] = [
-        {"role": "developer", "content": developer_instructions()},
+        {
+            "role": "developer",
+            "content": developer_instructions(),
+        },
         {"role": "user", "content": content},
-        {"role": "user", "content": [{"type": "input_text", "text": task_prompt}]},
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": task_prompt}],
+        },
     ]
 
     print(
@@ -817,7 +837,9 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
         f"estimated cost: ${preflight_cost['estimated_usd']:.6f}"
     )
     print(f"Writing run artifacts to {run_dir}")
-    response = client.responses.create(
+    response = create_response_streaming(
+        client,
+        label="moments",
         model=args.model,
         input=input_messages,
         reasoning={"effort": args.reasoning_effort},
@@ -830,43 +852,15 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
 
     response_dict = response.model_dump(mode="json") if hasattr(response, "model_dump") else {}
     output_text = response_output_text(response, response_dict)
-    usage = usage_dict(response_dict)
-    cost = actual_cost(usage, pricing)
+    write_json(run_dir / "raw-response.json", response_dict)
+    (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
     try:
         parsed_output = json.loads(output_text)
     except json.JSONDecodeError as exc:
-        write_json(run_dir / "raw-response.json", response_dict)
-        (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-        write_json(
-            run_dir / "usage-and-cost.json",
-            {
-                "api_call_made": True,
-                "cache": {
-                    "hit": False,
-                    "stored": False,
-                    "key": local_cache_key if entry_dir else None,
-                    "entry_dir": str(entry_dir) if entry_dir else None,
-                    "mode": cache_identity["mode"],
-                    "query_hash": cache_identity["query_hash"],
-                    "implementation_hash": cache_identity["implementation_hash"],
-                },
-                "usage": usage,
-                "cost": cost,
-                "pricing": {
-                    "input_usd_per_million": pricing.input_usd_per_million,
-                    "cached_input_usd_per_million": pricing.cached_input_usd_per_million,
-                    "output_usd_per_million": pricing.output_usd_per_million,
-                },
-                "parse_error": str(exc),
-            },
-        )
-        print(
-            f"Actual token usage: input={cost['input_tokens']}, "
-            f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
-        )
-        print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
         raise RuntimeError(f"Model output was not valid JSON. Raw response saved to {run_dir}") from exc
 
+    usage = usage_dict(response_dict)
+    cost = actual_cost(usage, pricing)
     usage_and_cost = {
         "api_call_made": True,
         "cache": {
@@ -921,8 +915,7 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
         f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
     )
     print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
-    print(f"Wrote {run_dir / 'stage5-output.json'}")
-    print(f"Wrote {run_dir / 'stage3-output.json'}")
+    print(f"Wrote {run_dir / 'moments-output.json'}")
     print(f"Wrote {run_dir / 'summary.md'}")
     return {
         "run_dir": str(run_dir),
@@ -934,18 +927,21 @@ def run_stage5(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run OpenAI stage 5: revise edit plans from Stage 4 critique."
+        description="Run OpenAI stage 2: transcript moment analysis for clip-ad angles."
     )
     parser.add_argument("--env-file", type=Path, default=Path(DEFAULT_ENV_FILE))
-    parser.add_argument("--stage3-output", type=Path, required=True)
-    parser.add_argument("--stage4-output", type=Path, required=True)
-    parser.add_argument("--render-manifest", type=Path, required=True)
-    parser.add_argument("--review-package", type=Path, default=None)
+    parser.add_argument("--transcript", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--strategy-output", type=Path, required=True)
     parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
-    parser.add_argument("--transcript", type=Path, default=None)
-    parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--contact-sheet", type=Path, default=None)
-    parser.add_argument("--clip-id", action="append", default=[])
+    parser.add_argument("--visual-index-manifest", type=Path, default=None)
+    parser.add_argument("--visual-index-max-images", type=int, default=None)
+    parser.add_argument(
+        "--no-visual-index-images",
+        action="store_true",
+        help="Include visual-index metadata but do not attach candidate contact sheet images.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
@@ -988,50 +984,54 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_env_defaults(args: argparse.Namespace) -> None:
     if args.output_dir is None:
-        args.output_dir = Path(env_value("STAGE5_OUTPUT_DIR") or env_value("STAGE1_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
+        args.output_dir = Path(env_value("MOMENTS_OUTPUT_DIR") or env_value("STRATEGY_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
     if args.cache_dir is None:
         args.cache_dir = Path(
-            env_value("STAGE5_CACHE_DIR")
-            or env_value("STAGE4_CACHE_DIR")
-            or env_value("STAGE1_CACHE_DIR")
+            env_value("MOMENTS_CACHE_DIR")
+            or env_value("STRATEGY_CACHE_DIR")
             or env_value("OPENAI_RESPONSE_CACHE_DIR")
             or (args.output_dir / DEFAULT_CACHE_SUBDIR)
         )
     if args.model is None:
-        args.model = env_value("STAGE5_MODEL") or env_value("STAGE1_MODEL") or DEFAULT_MODEL
+        args.model = env_value("MOMENTS_MODEL") or env_value("STRATEGY_MODEL") or DEFAULT_MODEL
     if args.reasoning_effort is None:
         args.reasoning_effort = (
-            env_value("STAGE5_REASONING_EFFORT")
-            or env_value("STAGE1_REASONING_EFFORT")
+            env_value("MOMENTS_REASONING_EFFORT")
+            or env_value("STRATEGY_REASONING_EFFORT")
             or DEFAULT_REASONING_EFFORT
         )
     if args.max_output_tokens is None:
-        args.max_output_tokens = env_int("STAGE5_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
+        args.max_output_tokens = env_int("MOMENTS_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
+    if args.visual_index_max_images is None:
+        args.visual_index_max_images = env_int(
+            "MOMENTS_VISUAL_INDEX_MAX_IMAGES",
+            DEFAULT_VISUAL_INDEX_MAX_IMAGES,
+        )
     if args.image_detail is None:
-        args.image_detail = env_value("STAGE5_IMAGE_DETAIL") or env_value("STAGE1_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
+        args.image_detail = env_value("MOMENTS_IMAGE_DETAIL") or env_value("STRATEGY_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
     if args.image_token_allowance is None:
         args.image_token_allowance = env_int(
-            "STAGE5_IMAGE_TOKEN_ALLOWANCE",
-            env_int("STAGE1_IMAGE_TOKEN_ALLOWANCE", DEFAULT_IMAGE_TOKEN_ALLOWANCE),
+            "MOMENTS_IMAGE_TOKEN_ALLOWANCE",
+            env_int("STRATEGY_IMAGE_TOKEN_ALLOWANCE", DEFAULT_IMAGE_TOKEN_ALLOWANCE),
         )
     if args.input_usd_per_million is None:
         args.input_usd_per_million = env_float(
-            "STAGE5_INPUT_USD_PER_MILLION",
-            env_float("STAGE1_INPUT_USD_PER_MILLION", DEFAULT_GPT55_INPUT_USD_PER_MILLION),
+            "MOMENTS_INPUT_USD_PER_MILLION",
+            env_float("STRATEGY_INPUT_USD_PER_MILLION", DEFAULT_GPT55_INPUT_USD_PER_MILLION),
         )
     if args.cached_input_usd_per_million is None:
         args.cached_input_usd_per_million = env_float(
-            "STAGE5_CACHED_INPUT_USD_PER_MILLION",
-            env_float("STAGE1_CACHED_INPUT_USD_PER_MILLION", DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION),
+            "MOMENTS_CACHED_INPUT_USD_PER_MILLION",
+            env_float("STRATEGY_CACHED_INPUT_USD_PER_MILLION", DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION),
         )
     if args.output_usd_per_million is None:
         args.output_usd_per_million = env_float(
-            "STAGE5_OUTPUT_USD_PER_MILLION",
-            env_float("STAGE1_OUTPUT_USD_PER_MILLION", DEFAULT_GPT55_OUTPUT_USD_PER_MILLION),
+            "MOMENTS_OUTPUT_USD_PER_MILLION",
+            env_float("STRATEGY_OUTPUT_USD_PER_MILLION", DEFAULT_GPT55_OUTPUT_USD_PER_MILLION),
         )
     if args.cache_mode is None:
         args.cache_mode = (
-            env_value("STAGE5_CACHE_MODE")
+            env_value("MOMENTS_CACHE_MODE")
             or env_value("OPENAI_RESPONSE_CACHE_MODE")
             or stage_cache.DEFAULT_CACHE_MODE
         )
@@ -1044,7 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         load_env_file(args.env_file)
         apply_env_defaults(args)
-        run_stage5(args)
+        run_moments(args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

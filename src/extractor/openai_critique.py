@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from extractor import stage_cache
-from extractor.openai_stage1 import (
+from extractor.openai_strategy import (
     CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
@@ -44,7 +44,8 @@ from extractor.prompt_templates import (
     prompt_template_path,
     render_prompt_template,
 )
-from extractor.render_stage3 import ffprobe_summary, require_command, run_command, safe_name
+from extractor.render_plan import ffprobe_summary, require_command, run_command, safe_name
+from extractor.openai_responses import create_response_streaming
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
@@ -66,26 +67,26 @@ def cache_source_files() -> list[Path]:
         Path(__file__).resolve(),
         root / "prompt_templates.py",
         prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
-        prompt_template_path("stage4_ad.md"),
-        prompt_template_path("stage4_excerpt.md"),
-        prompt_template_path("stage4_rubric_ad.md"),
-        prompt_template_path("stage4_rubric_excerpt.md"),
-        prompt_template_path("stage4_rubric_common.md"),
+        prompt_template_path("critique_ad.md"),
+        prompt_template_path("critique_excerpt.md"),
+        prompt_template_path("critique_rubric_ad.md"),
+        prompt_template_path("critique_rubric_excerpt.md"),
+        prompt_template_path("critique_rubric_common.md"),
         root / "stage_cache.py",
-        root / "openai_stage1.py",
-        root / "render_stage3.py",
+        root / "openai_strategy.py",
+        root / "render_plan.py",
         root / "transcribe.py",
     ]
 
 
-DEVELOPER_PROMPT_TEMPLATE = "stage4_developer.md"
+DEVELOPER_PROMPT_TEMPLATE = "critique_developer.md"
 
 
 def developer_instructions() -> str:
     return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
-STAGE4_SCHEMA: dict[str, Any] = {
+CRITIQUE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
@@ -236,7 +237,7 @@ def response_text_config() -> dict[str, Any]:
         "format": {
             "type": "json_schema",
             "name": "stage4_render_review",
-            "schema": STAGE4_SCHEMA,
+            "schema": CRITIQUE_SCHEMA,
             "strict": False,
         },
         "verbosity": "medium",
@@ -770,10 +771,10 @@ def compact_clip_for_prompt(clip: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def find_stage3_clip(stage3_output: dict[str, Any] | None, clip_id: str) -> dict[str, Any] | None:
-    if not stage3_output:
+def find_plan_clip(plan_output: dict[str, Any] | None, clip_id: str) -> dict[str, Any] | None:
+    if not plan_output:
         return None
-    for clip in stage3_output.get("clip_ads", []) or []:
+    for clip in plan_output.get("clip_ads", []) or []:
         if clip.get("clip_id") == clip_id:
             return clip
     return None
@@ -781,7 +782,7 @@ def find_stage3_clip(stage3_output: dict[str, Any] | None, clip_id: str) -> dict
 
 def build_review_package(
     render_manifest_path: Path,
-    stage3_output_path: Path | None,
+    plan_output_path: Path | None,
     clip_ids: set[str],
     assets_dir: Path,
     max_frames_per_clip: int,
@@ -796,9 +797,9 @@ def build_review_package(
     include_waveform: bool,
 ) -> tuple[dict[str, Any], list[Path]]:
     render_manifest = read_json(render_manifest_path)
-    stage3_output = read_json(stage3_output_path) if stage3_output_path else None
+    plan_output = read_json(plan_output_path) if plan_output_path else None
     content_mode = str(
-        (stage3_output or {}).get("content_mode")
+        (plan_output or {}).get("content_mode")
         or render_manifest.get("content_mode")
         or "ad"
     )
@@ -877,7 +878,7 @@ def build_review_package(
         )
         visual_overlap_warnings = visual_source_overlap_warnings(segments)
 
-        stage3_clip = find_stage3_clip(stage3_output, clip_id)
+        plan_clip = find_plan_clip(plan_output, clip_id)
         package_clips.append(
             {
                 "clip_id": clip_id,
@@ -905,7 +906,7 @@ def build_review_package(
                     "visual_source_overlap_warnings": visual_overlap_warnings,
                 },
                 "render_manifest_clip": compact_clip_for_prompt(clip),
-                "stage3_plan_clip": stage3_clip,
+                "stage3_plan_clip": plan_clip,
             }
         )
 
@@ -914,7 +915,7 @@ def build_review_package(
         "content_mode": content_mode,
         "created_at": datetime.now(UTC).isoformat(),
         "render_manifest_path": str(render_manifest_path),
-        "stage3_output_path": str(stage3_output_path) if stage3_output_path else None,
+        "stage3_output_path": str(plan_output_path) if plan_output_path else None,
         "review_assets_dir": str(assets_dir),
         "review_evidence_note": (
             "Attached images include storyboard sheets, edit-transition strips, and audio waveform timelines. "
@@ -927,11 +928,11 @@ def build_review_package(
             "if a motion-only issue still cannot be verified from local evidence, mark it as needs_playback_review."
         ),
         "evidence_images": [str(path) for path in evidence_images],
-        "human_feedback_rubric": load_prompt_lines(f"stage4_rubric_{content_mode}.md")
-        + load_prompt_lines("stage4_rubric_common.md"),
+        "human_feedback_rubric": load_prompt_lines(f"critique_rubric_{content_mode}.md")
+        + load_prompt_lines("critique_rubric_common.md"),
         "clips": package_clips,
     }
-    write_json(assets_dir / "review-package.json", package)
+    write_json(assets_dir / "critique-package.json", package)
     return package, evidence_images
 
 
@@ -952,10 +953,10 @@ def build_source_materials(package: dict[str, Any]) -> str:
 
 
 def build_task_prompt(content_mode: str) -> str:
-    return render_prompt_template(f"stage4_{content_mode}.md")
+    return render_prompt_template(f"critique_{content_mode}.md")
 
 
-def estimated_stage4_cost(
+def estimated_critique_cost(
     source_materials: str,
     task_prompt: str,
     image_count: int,
@@ -993,7 +994,7 @@ def request_fingerprint_payload(
 ) -> dict[str, Any]:
     return {
         "cache_schema_version": 3,
-        "stage": "stage4_render_review",
+        "stage": "critique_render_review",
         "api": "openai.responses.create",
         "model": args.model,
         "input": [
@@ -1048,7 +1049,7 @@ def write_cache_entry(
     )
     write_json(entry_dir / "raw-response.json", response_dict)
     (entry_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(entry_dir / "stage4-output.json", parsed_output)
+    write_json(entry_dir / "critique-output.json", parsed_output)
     write_json(entry_dir / "usage-and-cost.json", usage_and_cost)
 
 
@@ -1060,7 +1061,7 @@ def load_cached_response(entry_dir: Path) -> dict[str, Any]:
         if output_text_path.exists()
         else response_output_text(None, response_dict)
     )
-    parsed_path = entry_dir / "stage4-output.json"
+    parsed_path = entry_dir / "critique-output.json"
     parsed_output = read_json(parsed_path) if parsed_path.exists() else json.loads(output_text)
     return {
         "response_dict": response_dict,
@@ -1141,18 +1142,18 @@ def write_response_artifacts(
 ) -> None:
     write_json(run_dir / "raw-response.json", response_dict)
     (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(run_dir / "stage4-output.json", parsed_output)
+    write_json(run_dir / "critique-output.json", parsed_output)
     write_json(run_dir / "usage-and-cost.json", usage_and_cost)
     write_markdown(run_dir / "summary.md", parsed_output, summary_cost, cache_info=cache_info)
 
 
-def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
+def run_critique(args: argparse.Namespace) -> dict[str, Any]:
     render_manifest_path = args.render_manifest.expanduser().resolve()
-    stage3_output_path = args.stage3_output.expanduser().resolve() if args.stage3_output else None
+    plan_output_path = args.plan_output.expanduser().resolve() if args.plan_output else None
     if not render_manifest_path.exists():
         raise FileNotFoundError(render_manifest_path)
-    if stage3_output_path and not stage3_output_path.exists():
-        raise FileNotFoundError(stage3_output_path)
+    if plan_output_path and not plan_output_path.exists():
+        raise FileNotFoundError(plan_output_path)
 
     require_command("ffmpeg")
     require_command("ffprobe")
@@ -1167,11 +1168,11 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
     assets_dir = (
         args.assets_dir.expanduser().resolve()
         if args.assets_dir
-        else output_root / "_stage4-review-assets" / safe_name(render_manifest_path.parent.name)
+        else output_root / "_critique-assets" / safe_name(render_manifest_path.parent.name)
     )
     package, evidence_images = build_review_package(
         render_manifest_path=render_manifest_path,
-        stage3_output_path=stage3_output_path,
+        plan_output_path=plan_output_path,
         clip_ids=set(args.clip_id),
         assets_dir=assets_dir,
         max_frames_per_clip=args.frames_per_clip,
@@ -1188,7 +1189,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
     source_materials = build_source_materials(package)
     content_mode = args.content_mode or str(package.get("content_mode") or "ad")
     task_prompt = build_task_prompt(content_mode)
-    preflight_cost = estimated_stage4_cost(
+    preflight_cost = estimated_critique_cost(
         source_materials=source_materials,
         task_prompt=task_prompt,
         image_count=len(evidence_images),
@@ -1202,7 +1203,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
         f"  model: {args.model}; reasoning: {args.reasoning_effort}; "
         f"max output tokens: {args.max_output_tokens}"
     )
-    print(f"  review package: {assets_dir / 'review-package.json'}")
+    print(f"  review package: {assets_dir / 'critique-package.json'}")
     print(
         f"  estimated input tokens: {preflight_cost['input_tokens_estimate']} "
         f"({preflight_cost['text_tokens_estimate']} text + "
@@ -1219,7 +1220,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
             "\n".join(sha256_file(path) for path in evidence_images),
         ]
     )
-    prompt_cache_key = args.prompt_cache_key or f"stage4-{sha256_text(stable_prefix_cache_material)[:48]}"
+    prompt_cache_key = args.prompt_cache_key or f"critique-{sha256_text(stable_prefix_cache_material)[:48]}"
     fingerprint_payload = request_fingerprint_payload(
         args=args,
         source_materials=source_materials,
@@ -1248,7 +1249,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
     if args.dry_run:
         return {
             "preflight_cost": preflight_cost,
-            "review_package": str(assets_dir / "review-package.json"),
+            "review_package": str(assets_dir / "critique-package.json"),
             "evidence_images": [str(path) for path in evidence_images],
             "source_materials_sha256": sha256_text(source_materials),
             "task_prompt_sha256": sha256_text(task_prompt),
@@ -1276,7 +1277,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("OPENAI_API_KEY is required unless --dry-run is used.")
 
     run_id = args.run_id or (
-        f"{render_manifest_path.parent.name}.stage4.{args.model}.{args.reasoning_effort}."
+        f"{render_manifest_path.parent.name}.critique.{args.model}.{args.reasoning_effort}."
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     )
     run_dir = output_root / run_id
@@ -1286,7 +1287,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
         run_dir / "request-manifest.json",
         {
             "created_at": datetime.now(UTC).isoformat(),
-            "stage": "stage4_render_review",
+            "stage": "critique_render_review",
             "model": args.model,
             "reasoning_effort": args.reasoning_effort,
             "max_output_tokens": args.max_output_tokens,
@@ -1305,7 +1306,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
             "prompt_cache_retention": args.prompt_cache_retention,
             "paths": {
                 "render_manifest": str(render_manifest_path),
-                "stage3_output": str(stage3_output_path) if stage3_output_path else None,
+                "plan_output": str(plan_output_path) if plan_output_path else None,
                 "review_assets_dir": str(assets_dir),
                 "evidence_images": [str(path) for path in evidence_images],
             },
@@ -1337,7 +1338,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
     )
     (run_dir / "source-materials.txt").write_text(source_materials, encoding="utf-8")
     (run_dir / "task-prompt.txt").write_text(task_prompt, encoding="utf-8")
-    write_json(run_dir / "review-package.json", package)
+    write_json(run_dir / "critique-package.json", package)
 
     if cache_hit:
         assert entry_dir is not None
@@ -1390,7 +1391,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
         )
         print(f"Local response cache hit: {entry_dir}")
         print("No OpenAI API call made.")
-        print(f"Wrote {run_dir / 'stage4-output.json'}")
+        print(f"Wrote {run_dir / 'critique-output.json'}")
         print(f"Wrote {run_dir / 'summary.md'}")
         return {
             "run_dir": str(run_dir),
@@ -1423,7 +1424,9 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
         f"estimated cost: ${preflight_cost['estimated_usd']:.6f}"
     )
     print(f"Writing run artifacts to {run_dir}")
-    response = client.responses.create(
+    response = create_response_streaming(
+        client,
+        label="critique",
         model=args.model,
         input=input_messages,
         reasoning={"effort": args.reasoning_effort},
@@ -1497,7 +1500,7 @@ def run_stage4(args: argparse.Namespace) -> dict[str, Any]:
         f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
     )
     print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
-    print(f"Wrote {run_dir / 'stage4-output.json'}")
+    print(f"Wrote {run_dir / 'critique-output.json'}")
     print(f"Wrote {run_dir / 'summary.md'}")
     return {
         "run_dir": str(run_dir),
@@ -1513,7 +1516,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--env-file", type=Path, default=Path(DEFAULT_ENV_FILE))
     parser.add_argument("--render-manifest", type=Path, required=True)
-    parser.add_argument("--stage3-output", type=Path, default=None)
+    parser.add_argument("--plan-output", type=Path, default=None)
     parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
     parser.add_argument("--clip-id", action="append", default=[])
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -1569,89 +1572,89 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_env_defaults(args: argparse.Namespace) -> None:
     if args.output_dir is None:
-        args.output_dir = Path(env_value("STAGE4_OUTPUT_DIR") or env_value("STAGE1_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
+        args.output_dir = Path(env_value("CRITIQUE_OUTPUT_DIR") or env_value("STRATEGY_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
     if args.cache_dir is None:
         args.cache_dir = Path(
-            env_value("STAGE4_CACHE_DIR")
-            or env_value("STAGE3_CACHE_DIR")
+            env_value("CRITIQUE_CACHE_DIR")
+            or env_value("PLAN_CACHE_DIR")
             or env_value("OPENAI_RESPONSE_CACHE_DIR")
             or (args.output_dir / DEFAULT_CACHE_SUBDIR)
         )
     if args.model is None:
-        args.model = env_value("STAGE4_MODEL") or env_value("STAGE1_MODEL") or DEFAULT_MODEL
+        args.model = env_value("CRITIQUE_MODEL") or env_value("STRATEGY_MODEL") or DEFAULT_MODEL
     if args.reasoning_effort is None:
         args.reasoning_effort = (
-            env_value("STAGE4_REASONING_EFFORT")
-            or env_value("STAGE1_REASONING_EFFORT")
+            env_value("CRITIQUE_REASONING_EFFORT")
+            or env_value("STRATEGY_REASONING_EFFORT")
             or DEFAULT_REASONING_EFFORT
         )
     if args.max_output_tokens is None:
-        args.max_output_tokens = env_int("STAGE4_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
+        args.max_output_tokens = env_int("CRITIQUE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
     if args.frames_per_clip is None:
-        args.frames_per_clip = env_int("STAGE4_FRAMES_PER_CLIP", DEFAULT_FRAMES_PER_CLIP)
+        args.frames_per_clip = env_int("CRITIQUE_FRAMES_PER_CLIP", DEFAULT_FRAMES_PER_CLIP)
     if args.contact_sheet_columns is None:
-        args.contact_sheet_columns = env_int("STAGE4_CONTACT_SHEET_COLUMNS", DEFAULT_CONTACT_SHEET_COLUMNS)
+        args.contact_sheet_columns = env_int("CRITIQUE_CONTACT_SHEET_COLUMNS", DEFAULT_CONTACT_SHEET_COLUMNS)
     if args.transition_strip_frames is None:
-        args.transition_strip_frames = env_int("STAGE4_TRANSITION_STRIP_FRAMES", DEFAULT_TRANSITION_STRIP_FRAMES)
+        args.transition_strip_frames = env_int("CRITIQUE_TRANSITION_STRIP_FRAMES", DEFAULT_TRANSITION_STRIP_FRAMES)
     if args.transition_window_seconds is None:
         args.transition_window_seconds = env_float(
-            "STAGE4_TRANSITION_WINDOW_SECONDS",
+            "CRITIQUE_TRANSITION_WINDOW_SECONDS",
             DEFAULT_TRANSITION_WINDOW_SECONDS,
         )
     if args.waveform_width is None:
-        args.waveform_width = env_int("STAGE4_WAVEFORM_WIDTH", DEFAULT_WAVEFORM_WIDTH)
+        args.waveform_width = env_int("CRITIQUE_WAVEFORM_WIDTH", DEFAULT_WAVEFORM_WIDTH)
     if args.waveform_height is None:
-        args.waveform_height = env_int("STAGE4_WAVEFORM_HEIGHT", DEFAULT_WAVEFORM_HEIGHT)
+        args.waveform_height = env_int("CRITIQUE_WAVEFORM_HEIGHT", DEFAULT_WAVEFORM_HEIGHT)
     if args.silence_noise_db is None:
-        args.silence_noise_db = env_float("STAGE4_SILENCE_NOISE_DB", DEFAULT_SILENCE_NOISE_DB)
+        args.silence_noise_db = env_float("CRITIQUE_SILENCE_NOISE_DB", DEFAULT_SILENCE_NOISE_DB)
     if args.silence_min_duration is None:
         args.silence_min_duration = env_float(
-            "STAGE4_SILENCE_MIN_DURATION",
+            "CRITIQUE_SILENCE_MIN_DURATION",
             DEFAULT_SILENCE_MIN_DURATION,
         )
     if args.image_detail is None:
-        args.image_detail = env_value("STAGE4_IMAGE_DETAIL") or env_value("STAGE1_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
+        args.image_detail = env_value("CRITIQUE_IMAGE_DETAIL") or env_value("STRATEGY_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
     if args.image_token_allowance is None:
         args.image_token_allowance = env_int(
-            "STAGE4_IMAGE_TOKEN_ALLOWANCE",
-            env_int("STAGE1_IMAGE_TOKEN_ALLOWANCE", DEFAULT_IMAGE_TOKEN_ALLOWANCE),
+            "CRITIQUE_IMAGE_TOKEN_ALLOWANCE",
+            env_int("STRATEGY_IMAGE_TOKEN_ALLOWANCE", DEFAULT_IMAGE_TOKEN_ALLOWANCE),
         )
     if args.input_usd_per_million is None:
         args.input_usd_per_million = env_float(
-            "STAGE4_INPUT_USD_PER_MILLION",
-            env_float("STAGE1_INPUT_USD_PER_MILLION", DEFAULT_GPT55_INPUT_USD_PER_MILLION),
+            "CRITIQUE_INPUT_USD_PER_MILLION",
+            env_float("STRATEGY_INPUT_USD_PER_MILLION", DEFAULT_GPT55_INPUT_USD_PER_MILLION),
         )
     if args.cached_input_usd_per_million is None:
         args.cached_input_usd_per_million = env_float(
-            "STAGE4_CACHED_INPUT_USD_PER_MILLION",
-            env_float("STAGE1_CACHED_INPUT_USD_PER_MILLION", DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION),
+            "CRITIQUE_CACHED_INPUT_USD_PER_MILLION",
+            env_float("STRATEGY_CACHED_INPUT_USD_PER_MILLION", DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION),
         )
     if args.output_usd_per_million is None:
         args.output_usd_per_million = env_float(
-            "STAGE4_OUTPUT_USD_PER_MILLION",
-            env_float("STAGE1_OUTPUT_USD_PER_MILLION", DEFAULT_GPT55_OUTPUT_USD_PER_MILLION),
+            "CRITIQUE_OUTPUT_USD_PER_MILLION",
+            env_float("STRATEGY_OUTPUT_USD_PER_MILLION", DEFAULT_GPT55_OUTPUT_USD_PER_MILLION),
         )
     if args.cache_mode is None:
         args.cache_mode = (
-            env_value("STAGE4_CACHE_MODE")
+            env_value("CRITIQUE_CACHE_MODE")
             or env_value("OPENAI_RESPONSE_CACHE_MODE")
             or stage_cache.DEFAULT_CACHE_MODE
         )
     args.cache_mode = stage_cache.normalize_cache_mode(args.cache_mode)
     if args.frames_per_clip <= 0:
-        raise ValueError("STAGE4_FRAMES_PER_CLIP / --frames-per-clip must be positive.")
+        raise ValueError("CRITIQUE_FRAMES_PER_CLIP / --frames-per-clip must be positive.")
     if args.contact_sheet_columns <= 0:
-        raise ValueError("STAGE4_CONTACT_SHEET_COLUMNS / --contact-sheet-columns must be positive.")
+        raise ValueError("CRITIQUE_CONTACT_SHEET_COLUMNS / --contact-sheet-columns must be positive.")
     if args.transition_strip_frames <= 0:
-        raise ValueError("STAGE4_TRANSITION_STRIP_FRAMES / --transition-strip-frames must be positive.")
+        raise ValueError("CRITIQUE_TRANSITION_STRIP_FRAMES / --transition-strip-frames must be positive.")
     if args.transition_window_seconds < 0:
-        raise ValueError("STAGE4_TRANSITION_WINDOW_SECONDS / --transition-window-seconds must be non-negative.")
+        raise ValueError("CRITIQUE_TRANSITION_WINDOW_SECONDS / --transition-window-seconds must be non-negative.")
     if args.waveform_width <= 0:
-        raise ValueError("STAGE4_WAVEFORM_WIDTH / --waveform-width must be positive.")
+        raise ValueError("CRITIQUE_WAVEFORM_WIDTH / --waveform-width must be positive.")
     if args.waveform_height <= 0:
-        raise ValueError("STAGE4_WAVEFORM_HEIGHT / --waveform-height must be positive.")
+        raise ValueError("CRITIQUE_WAVEFORM_HEIGHT / --waveform-height must be positive.")
     if args.silence_min_duration <= 0:
-        raise ValueError("STAGE4_SILENCE_MIN_DURATION / --silence-min-duration must be positive.")
+        raise ValueError("CRITIQUE_SILENCE_MIN_DURATION / --silence-min-duration must be positive.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1660,7 +1663,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         load_env_file(args.env_file)
         apply_env_defaults(args)
-        run_stage4(args)
+        run_critique(args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

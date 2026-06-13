@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from extractor.openai_stage1 import (
+from extractor.openai_strategy import (
     Pricing,
     cost_from_counts,
     estimate_text_tokens,
@@ -20,7 +20,7 @@ from extractor.openai_stage1 import (
     usage_dict,
     write_json,
 )
-from extractor.render_stage3 import ffprobe_summary, require_command, run_command, safe_name
+from extractor.render_plan import ffprobe_summary, require_command, run_command, safe_name
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 

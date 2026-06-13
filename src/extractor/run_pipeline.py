@@ -42,9 +42,9 @@ DEFAULT_CONTACT_SHEET_FRAME_WIDTH = 180
 DEFAULT_CONTACT_SHEET_COLUMNS = 12
 CONTENT_MODE_CHOICES = ("ad", "excerpt")
 EXCERPT_SECONDS_PER_CLIP = 10 * 60
-STAGE3_DEFAULT_MAX_OUTPUT_TOKENS = 18_000
-STAGE3_MAX_OUTPUT_TOKENS = 32_000
-STAGE3_OUTPUT_TOKENS_PER_EXTRACT = 6_000
+PLAN_DEFAULT_MAX_OUTPUT_TOKENS = 18_000
+PLAN_MAX_OUTPUT_TOKENS = 32_000
+PLAN_OUTPUT_TOKENS_PER_EXTRACT = 6_000
 
 
 @dataclass
@@ -168,71 +168,71 @@ class PipelinePaths:
         return self.run_root / "subject-index"
 
     @property
-    def stage3_subject_index_manifest(self) -> Path:
-        return self.subject_index_dir / self.stage3_run_id / "manifest.json"
+    def draft_subject_index_manifest(self) -> Path:
+        return self.subject_index_dir / self.plan_run_id / "manifest.json"
 
     @property
     def final_subject_index_manifest(self) -> Path:
-        return self.subject_index_dir / self.stage5_run_id / "manifest.json"
+        return self.subject_index_dir / self.revise_run_id / "manifest.json"
 
     @property
-    def stage1_run_id(self) -> str:
-        return f"{self.run_id_base}-stage1"
+    def strategy_run_id(self) -> str:
+        return f"{self.run_id_base}-strategy"
 
     @property
-    def stage2_run_id(self) -> str:
-        return f"{self.run_id_base}-stage2"
+    def moments_run_id(self) -> str:
+        return f"{self.run_id_base}-moments"
 
     @property
-    def stage3_run_id(self) -> str:
-        return f"{self.run_id_base}-stage3"
+    def plan_run_id(self) -> str:
+        return f"{self.run_id_base}-plan"
 
     @property
-    def stage4_run_id(self) -> str:
-        return f"{self.run_id_base}-stage4"
+    def critique_run_id(self) -> str:
+        return f"{self.run_id_base}-critique"
 
     @property
-    def stage5_run_id(self) -> str:
-        return f"{self.run_id_base}-stage5"
+    def revise_run_id(self) -> str:
+        return f"{self.run_id_base}-revise"
 
     @property
-    def stage1_output(self) -> Path:
-        return self.openai_runs_dir / self.stage1_run_id / "stage1-output.json"
+    def strategy_output(self) -> Path:
+        return self.openai_runs_dir / self.strategy_run_id / "strategy-output.json"
 
     @property
-    def stage2_output(self) -> Path:
-        return self.openai_runs_dir / self.stage2_run_id / "stage2-output.json"
+    def moments_output(self) -> Path:
+        return self.openai_runs_dir / self.moments_run_id / "moments-output.json"
 
     @property
-    def stage3_output(self) -> Path:
-        return self.openai_runs_dir / self.stage3_run_id / "stage3-output.json"
+    def plan_output(self) -> Path:
+        return self.openai_runs_dir / self.plan_run_id / "plan-output.json"
 
     @property
-    def stage4_output(self) -> Path:
-        return self.openai_runs_dir / self.stage4_run_id / "stage4-output.json"
+    def critique_output(self) -> Path:
+        return self.openai_runs_dir / self.critique_run_id / "critique-output.json"
 
     @property
-    def stage4_review_package(self) -> Path:
-        return self.openai_runs_dir / self.stage4_run_id / "review-package.json"
+    def critique_package(self) -> Path:
+        return self.openai_runs_dir / self.critique_run_id / "critique-package.json"
 
     @property
-    def stage5_stage3_output(self) -> Path:
-        return self.openai_runs_dir / self.stage5_run_id / "stage3-output.json"
+    def revised_plan_output(self) -> Path:
+        return self.openai_runs_dir / self.revise_run_id / "plan-output.json"
 
     @property
-    def stage3_render_dir(self) -> Path:
-        stage_dir = f"{self.render_variant}-stage3" if self.render_variant else "stage3"
+    def draft_render_dir(self) -> Path:
+        stage_dir = f"{self.render_variant}-draft" if self.render_variant else "draft"
         if self.content_mode != "ad":
             return self.run_root / "renders" / self.content_mode / stage_dir
         return self.run_root / "renders" / stage_dir
 
     @property
-    def stage3_render_manifest(self) -> Path:
-        return self.stage3_render_dir / "render-manifest.json"
+    def draft_render_manifest(self) -> Path:
+        return self.draft_render_dir / "render-manifest.json"
 
     @property
     def final_render_dir(self) -> Path:
-        stage_dir = f"{self.render_variant}-stage5" if self.render_variant else "stage5"
+        stage_dir = f"{self.render_variant}-final" if self.render_variant else "final"
         if self.content_mode != "ad":
             return self.run_root / "renders" / self.content_mode / stage_dir
         return self.run_root / "renders" / stage_dir
@@ -461,8 +461,8 @@ def visual_index_rebuild_decision(
     if not isinstance(video_info, dict) or not paths_match(video_info.get("path"), paths.video):
         return True, True, "source video changed"
 
-    if not paths_match(manifest.get("stage2_output"), paths.stage2_output):
-        return True, False, "stage2 output path changed"
+    if not paths_match(manifest.get("moments_output"), paths.moments_output):
+        return True, False, "moments output path changed"
 
     if not numbers_match(manifest.get("frame_interval_seconds"), args.frame_interval_seconds):
         return True, True, "frame interval changed"
@@ -480,8 +480,8 @@ def visual_index_rebuild_decision(
     manifest_mtime = manifest_path.stat().st_mtime
     if paths.video.stat().st_mtime > manifest_mtime + 1.0:
         return True, True, "source video is newer than visual-index manifest"
-    if paths.stage2_output.stat().st_mtime > manifest_mtime + 1.0:
-        return True, False, "stage2 output is newer than visual-index manifest"
+    if paths.moments_output.stat().st_mtime > manifest_mtime + 1.0:
+        return True, False, "moments output is newer than visual-index manifest"
 
     if not manifest_sheet_paths_exist(manifest_path, manifest):
         return True, False, "visual-index sheet image is missing"
@@ -510,18 +510,18 @@ def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
         "video_evidence_manifest": str(paths.evidence_manifest),
         "visual_index_manifest": str(paths.visual_index_manifest),
         "subject_index_manifests": {
-            "stage3": str(paths.stage3_subject_index_manifest),
+            "draft": str(paths.draft_subject_index_manifest),
             "final": str(paths.final_subject_index_manifest),
         },
         "stage_outputs": {
-            "stage1": str(paths.stage1_output),
-            "stage2": str(paths.stage2_output),
-            "stage3": str(paths.stage3_output),
-            "stage4": str(paths.stage4_output),
-            "stage5_stage3": str(paths.stage5_stage3_output),
+            "strategy": str(paths.strategy_output),
+            "moments": str(paths.moments_output),
+            "plan": str(paths.plan_output),
+            "critique": str(paths.critique_output),
+            "revised_plan": str(paths.revised_plan_output),
         },
         "renders": {
-            "stage3": str(paths.stage3_render_manifest),
+            "draft": str(paths.draft_render_manifest),
             "final": str(paths.final_render_manifest),
         },
         "approved_cap_usd": state.approved_cap_usd,
@@ -677,16 +677,16 @@ def excerpt_clip_count_for_duration(duration_seconds: float | None) -> int:
     return max(1, int(math.ceil(duration_seconds / EXCERPT_SECONDS_PER_CLIP)))
 
 
-def stage3_clip_count(paths: PipelinePaths) -> int:
+def plan_clip_count(paths: PipelinePaths) -> int:
     if paths.content_mode != "excerpt":
         return 3
     return excerpt_clip_count_for_duration(effective_duration_from_manifest(paths.evidence_manifest))
 
 
-def stage3_max_output_tokens(clip_count: int) -> int:
+def plan_max_output_tokens(clip_count: int) -> int:
     return min(
-        STAGE3_MAX_OUTPUT_TOKENS,
-        max(STAGE3_DEFAULT_MAX_OUTPUT_TOKENS, clip_count * STAGE3_OUTPUT_TOKENS_PER_EXTRACT),
+        PLAN_MAX_OUTPUT_TOKENS,
+        max(PLAN_DEFAULT_MAX_OUTPUT_TOKENS, clip_count * PLAN_OUTPUT_TOKENS_PER_EXTRACT),
     )
 
 
@@ -759,13 +759,13 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             force=args.force,
         )
         stage_transcript = transcript_for_api_stages(paths)
-        stage3_count = stage3_clip_count(paths)
-        stage3_count_args = (
+        plan_count = plan_clip_count(paths)
+        plan_count_args = (
             [
                 "--clip-count",
-                str(stage3_count),
+                str(plan_count),
                 "--max-output-tokens",
-                str(stage3_max_output_tokens(stage3_count)),
+                str(plan_max_output_tokens(plan_count)),
             ]
             if paths.content_mode == "excerpt"
             else []
@@ -776,8 +776,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             else []
         )
 
-        stage1 = [
-            *python_module("extractor.openai_stage1"),
+        strategy = [
+            *python_module("extractor.openai_strategy"),
             "--env-file",
             str(args.env_file),
             "--transcript",
@@ -791,14 +791,14 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
-            paths.stage1_run_id,
+            paths.strategy_run_id,
             *response_cache_args(paths),
             *cache_mode_args(args),
         ]
-        run_api_step(state, "stage1", stage1, stage1, paths.stage1_output)
+        run_api_step(state, "strategy", strategy, strategy, paths.strategy_output)
 
-        stage2 = [
-            *python_module("extractor.openai_stage2"),
+        moments = [
+            *python_module("extractor.openai_moments"),
             "--env-file",
             str(args.env_file),
             "--transcript",
@@ -807,28 +807,28 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.evidence_manifest),
             "--contact-sheet",
             str(paths.contact_sheet),
-            "--stage1-output",
-            str(paths.stage1_output),
+            "--strategy-output",
+            str(paths.strategy_output),
             "--content-mode",
             args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
-            paths.stage2_run_id,
+            paths.moments_run_id,
             "--max-output-tokens",
             "24000",
             *response_cache_args(paths),
             *cache_mode_args(args),
         ]
-        run_api_step(state, "stage2", stage2, stage2, paths.stage2_output)
+        run_api_step(state, "moments", moments, moments, paths.moments_output)
 
         visual_index_command = [
             *python_module("extractor.visual_index"),
             str(paths.video),
             "--output-dir",
             str(paths.visual_index_dir),
-            "--stage2-output",
-            str(paths.stage2_output),
+            "--moments-output",
+            str(paths.moments_output),
             "--frame-interval-seconds",
             str(args.frame_interval_seconds),
             "--frame-width",
@@ -855,8 +855,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             force=rebuild_visual_index,
         )
 
-        stage3 = [
-            *python_module("extractor.openai_stage3"),
+        plan = [
+            *python_module("extractor.openai_plan"),
             "--env-file",
             str(args.env_file),
             "--transcript",
@@ -867,92 +867,92 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.contact_sheet),
             "--visual-index-manifest",
             str(paths.visual_index_manifest),
-            "--stage1-output",
-            str(paths.stage1_output),
-            "--stage2-output",
-            str(paths.stage2_output),
+            "--strategy-output",
+            str(paths.strategy_output),
+            "--moments-output",
+            str(paths.moments_output),
             "--content-mode",
             args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
-            paths.stage3_run_id,
-            *stage3_count_args,
+            paths.plan_run_id,
+            *plan_count_args,
             *augmentation_assets_args,
             *response_cache_args(paths),
             *cache_mode_args(args),
         ]
-        run_api_step(state, "stage3", stage3, stage3, paths.stage3_output)
+        run_api_step(state, "plan", plan, plan, paths.plan_output)
 
         run_local_step(
-            "subject-index-stage3",
+            "subject-index-draft",
             [
                 *python_module("extractor.subject_index"),
                 str(paths.video),
-                "--stage3-output",
-                str(paths.stage3_output),
+                "--plan-output",
+                str(paths.plan_output),
                 "--output-dir",
                 str(paths.subject_index_dir),
                 "--run-id",
-                paths.stage3_run_id,
+                paths.plan_run_id,
                 "--ffmpeg-bin",
                 args.ffmpeg_bin,
                 "--ffmpeg-hwaccel",
                 args.ffmpeg_hwaccel,
             ],
-            paths.stage3_subject_index_manifest,
+            paths.draft_subject_index_manifest,
             force=args.force,
         )
 
         run_local_step(
-            "render-stage3",
+            "draft-render",
             [
-                *python_module("extractor.render_stage3"),
+                *python_module("extractor.render_plan"),
                 "--source-video",
                 str(paths.video),
-                "--stage3-output",
-                str(paths.stage3_output),
+                "--plan-output",
+                str(paths.plan_output),
                 "--transcript",
                 str(stage_transcript),
                 "--output-dir",
-                str(paths.stage3_render_dir),
+                str(paths.draft_render_dir),
                 "--use-plan-render-settings",
                 "--auto-foreground-scale",
                 "--subject-index-manifest",
-                str(paths.stage3_subject_index_manifest),
+                str(paths.draft_subject_index_manifest),
                 *augmentation_assets_args,
                 "--ffmpeg-bin",
                 args.ffmpeg_bin,
                 "--ffmpeg-hwaccel",
                 args.ffmpeg_hwaccel,
             ],
-            paths.stage3_render_manifest,
+            paths.draft_render_manifest,
             force=args.force,
         )
 
-        stage4 = [
-            *python_module("extractor.openai_stage4_review"),
+        critique = [
+            *python_module("extractor.openai_critique"),
             "--env-file",
             str(args.env_file),
             "--render-manifest",
-            str(paths.stage3_render_manifest),
-            "--stage3-output",
-            str(paths.stage3_output),
+            str(paths.draft_render_manifest),
+            "--plan-output",
+            str(paths.plan_output),
             "--content-mode",
             args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--assets-dir",
-            str(paths.openai_runs_dir / "_stage4-review-assets" / paths.stage4_run_id),
+            str(paths.openai_runs_dir / "_critique-assets" / paths.critique_run_id),
             "--run-id",
-            paths.stage4_run_id,
+            paths.critique_run_id,
             *response_cache_args(paths),
             *cache_mode_args(args),
         ]
-        run_api_step(state, "stage4", stage4, stage4, paths.stage4_output)
+        run_api_step(state, "critique", critique, critique, paths.critique_output)
 
-        stage5 = [
-            *python_module("extractor.openai_stage5_reedit"),
+        revise = [
+            *python_module("extractor.openai_revise"),
             "--env-file",
             str(args.env_file),
             "--transcript",
@@ -961,36 +961,36 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             str(paths.evidence_manifest),
             "--contact-sheet",
             str(paths.contact_sheet),
-            "--stage3-output",
-            str(paths.stage3_output),
+            "--plan-output",
+            str(paths.plan_output),
             "--render-manifest",
-            str(paths.stage3_render_manifest),
-            "--stage4-output",
-            str(paths.stage4_output),
-            "--review-package",
-            str(paths.stage4_review_package),
+            str(paths.draft_render_manifest),
+            "--critique-output",
+            str(paths.critique_output),
+            "--critique-package",
+            str(paths.critique_package),
             "--content-mode",
             args.content_mode,
             "--output-dir",
             str(paths.openai_runs_dir),
             "--run-id",
-            paths.stage5_run_id,
+            paths.revise_run_id,
             *response_cache_args(paths),
             *cache_mode_args(args),
         ]
-        run_api_step(state, "stage5", stage5, stage5, paths.stage5_stage3_output)
+        run_api_step(state, "revise", revise, revise, paths.revised_plan_output)
 
         run_local_step(
             "subject-index-final",
             [
                 *python_module("extractor.subject_index"),
                 str(paths.video),
-                "--stage3-output",
-                str(paths.stage5_stage3_output),
+                "--plan-output",
+                str(paths.revised_plan_output),
                 "--output-dir",
                 str(paths.subject_index_dir),
                 "--run-id",
-                paths.stage5_run_id,
+                paths.revise_run_id,
                 "--ffmpeg-bin",
                 args.ffmpeg_bin,
                 "--ffmpeg-hwaccel",
@@ -1003,15 +1003,17 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
         run_local_step(
             "render-final",
             [
-                *python_module("extractor.render_stage3"),
+                *python_module("extractor.render_plan"),
                 "--source-video",
                 str(paths.video),
-                "--stage3-output",
-                str(paths.stage5_stage3_output),
+                "--plan-output",
+                str(paths.revised_plan_output),
                 "--transcript",
                 str(stage_transcript),
                 "--output-dir",
                 str(paths.final_render_dir),
+                "--output-label",
+                "",
                 "--use-plan-render-settings",
                 "--auto-foreground-scale",
                 "--subject-index-manifest",

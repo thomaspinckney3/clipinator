@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from extractor import stage_cache
-from extractor.openai_stage1 import (
+from extractor.openai_strategy import (
     CONTENT_MODE_CHOICES,
     DEFAULT_CACHE_SUBDIR,
     DEFAULT_ENV_FILE,
@@ -39,10 +39,14 @@ from extractor.openai_stage1 import (
 )
 from extractor.preprocess_video import format_time
 from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
+from extractor.openai_responses import create_response_streaming
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
-DEFAULT_MAX_OUTPUT_TOKENS = 16_000
+DEFAULT_MAX_OUTPUT_TOKENS = 18_000
+DEFAULT_CLIP_COUNT = 3
+DEFAULT_TARGET_ASPECT_RATIO = "9:16"
+DEFAULT_TARGET_SECONDS = 45
 DEFAULT_VISUAL_INDEX_MAX_IMAGES = 24
 
 
@@ -52,158 +56,259 @@ def cache_source_files() -> list[Path]:
         Path(__file__).resolve(),
         root / "prompt_templates.py",
         prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
-        prompt_template_path("stage2_ad.md"),
-        prompt_template_path("stage2_excerpt.md"),
+        prompt_template_path("plan_ad.md"),
+        prompt_template_path("plan_excerpt.md"),
         root / "stage_cache.py",
-        root / "openai_stage1.py",
+        root / "openai_strategy.py",
+        root / "openai_moments.py",
         root / "preprocess_video.py",
         root / "transcribe.py",
     ]
 
 
-DEVELOPER_PROMPT_TEMPLATE = "stage2_developer.md"
+DEVELOPER_PROMPT_TEMPLATE = "plan_developer.md"
 
 
 def developer_instructions() -> str:
     return load_prompt_template(DEVELOPER_PROMPT_TEMPLATE)
 
 
-STAGE2_SCHEMA: dict[str, Any] = {
+MEDIA_REQUEST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "id",
+        "request_type",
+        "desired_asset_type",
+        "purpose",
+        "placement_notes",
+        "license_requirements",
+        "rights_risk",
+    ],
+    "properties": {
+        "id": {"type": "string"},
+        "request_type": {
+            "type": "string",
+            "enum": [
+                "third_party_media",
+                "generated_video",
+                "generated_image",
+                "generated_graphic",
+                "generated_audio",
+            ],
+        },
+        "desired_asset_type": {
+            "type": "string",
+            "enum": ["video", "image", "graphic", "audio"],
+        },
+        "purpose": {"type": "string"},
+        "placement_notes": {"type": "string"},
+        "search_query": {"type": "string"},
+        "suggested_sources": {"type": "array", "items": {"type": "string"}},
+        "generation_prompt": {"type": "string"},
+        "negative_prompt": {"type": "string"},
+        "duration_seconds": {"type": "number"},
+        "aspect_ratio": {"type": "string"},
+        "style_notes": {"type": "string"},
+        "license_requirements": {"type": "string"},
+        "rights_risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "review_notes": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
+PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
         "content_mode",
         "video_title",
-        "analysis_summary",
-        "angle_moment_sets",
-        "cross_angle_ranked_moments",
-        "transcript_quality_actions",
-        "notes_for_edit_plan",
+        "plan_summary",
+        "global_editing_rules",
+        "clip_ads",
+        "media_requests",
+        "manual_review_queue",
+        "deferred_candidates",
+        "notes_for_rendering",
     ],
     "properties": {
         "content_mode": {"type": "string", "enum": ["ad", "excerpt"]},
         "video_title": {"type": "string"},
-        "analysis_summary": {"type": "string"},
-        "angle_moment_sets": {
+        "plan_summary": {"type": "string"},
+        "global_editing_rules": {"type": "array", "items": {"type": "string"}},
+        "clip_ads": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
-                    "stage1_rank",
-                    "angle",
-                    "best_candidate_id",
-                    "candidate_windows",
-                    "weak_or_rejected_windows",
+                    "clip_id",
+                    "source_candidate_id",
+                    "concept_title",
+                    "target_platform",
+                    "target_aspect_ratio",
+                    "target_duration_seconds",
+                    "editorial_objective",
+                    "why_this_ad_sells_the_full_video",
+                    "source_ranges",
+                    "opening_hook",
+                    "timeline",
+                    "caption_plan",
+                    "audio_plan",
+                    "visual_plan",
+                    "media_request_ids",
+                    "verification_steps",
+                    "risk_notes",
+                    "success_criteria",
                 ],
                 "properties": {
-                    "stage1_rank": {"type": "integer"},
-                    "angle": {"type": "string"},
-                    "best_candidate_id": {"type": "string"},
-                    "candidate_windows": {
+                    "clip_id": {"type": "string"},
+                    "source_candidate_id": {"type": "string"},
+                    "concept_title": {"type": "string"},
+                    "target_platform": {"type": "string"},
+                    "target_aspect_ratio": {"type": "string"},
+                    "target_duration_seconds": {"type": "number"},
+                    "editorial_objective": {"type": "string"},
+                    "why_this_ad_sells_the_full_video": {"type": "string"},
+                    "excerpt_type": {"type": "string"},
+                    "excerpt_scope": {
+                        "type": "string",
+                        "enum": ["atomic_excerpt", "chapter_extract", "multi_part_extract"],
+                    },
+                    "coherence_unit": {"type": "string"},
+                    "merge_or_split_rationale": {"type": "string"},
+                    "depends_on_prior_excerpt": {"type": "boolean"},
+                    "self_contained_score": {"type": "number"},
+                    "context_needed": {"type": "string"},
+                    "source_order_preserved": {"type": "boolean"},
+                    "cta_policy": {"type": "string"},
+                    "source_ranges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["start", "end", "role", "reason"],
+                            "properties": {
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "role": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                        },
+                    },
+                    "opening_hook": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["text", "visual", "audio", "duration_seconds"],
+                        "properties": {
+                            "text": {"type": "string"},
+                            "visual": {"type": "string"},
+                            "audio": {"type": "string"},
+                            "duration_seconds": {"type": "number"},
+                        },
+                    },
+                    "timeline": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
                             "required": [
-                                "candidate_id",
-                                "start",
-                                "end",
-                                "duration",
-                                "working_title",
-                                "opening_hook",
-                                "story_function",
-                                "transcript_excerpt",
-                                "why_clipworthy",
-                                "required_context",
-                                "payoff",
-                                "visual_expectation",
-                                "speaker_or_audio_notes",
-                                "caption_notes",
-                                "qa_risks",
-                                "recommended_use",
-                                "confidence",
+                                "order",
+                                "screen_time_start",
+                                "screen_time_end",
+                                "source_start",
+                                "source_end",
+                                "audio_source",
+                                "visual_source",
+                                "edit_action",
+                                "caption_or_overlay",
+                                "purpose",
                             ],
                             "properties": {
-                                "candidate_id": {"type": "string"},
-                                "start": {"type": "number"},
-                                "end": {"type": "number"},
-                                "duration": {"type": "number"},
-                                "working_title": {"type": "string"},
-                                "opening_hook": {"type": "string"},
-                                "story_function": {"type": "string"},
-                                "transcript_excerpt": {"type": "string"},
-                                "why_clipworthy": {"type": "string"},
-                                "required_context": {"type": "string"},
-                                "payoff": {"type": "string"},
-                                "visual_expectation": {"type": "string"},
-                                "speaker_or_audio_notes": {"type": "string"},
-                                "caption_notes": {"type": "string"},
-                                "qa_risks": {"type": "array", "items": {"type": "string"}},
-                                "recommended_use": {
-                                    "type": "string",
-                                    "enum": ["primary", "alternate", "supporting_broll", "review_only"],
-                                },
-                                "confidence": {"type": "number"},
+                                "order": {"type": "integer"},
+                                "screen_time_start": {"type": "number"},
+                                "screen_time_end": {"type": "number"},
+                                "source_start": {"type": "number"},
+                                "source_end": {"type": "number"},
+                                "audio_source": {"type": "string"},
+                                "visual_source": {"type": "string"},
+                                "edit_action": {"type": "string"},
+                                "caption_or_overlay": {"type": "string"},
+                                "purpose": {"type": "string"},
                             },
                         },
                     },
-                    "weak_or_rejected_windows": {
+                    "caption_plan": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["start", "end", "reason"],
+                            "required": ["start_offset", "end_offset", "text", "style_note"],
                             "properties": {
-                                "start": {"type": "number"},
-                                "end": {"type": "number"},
-                                "reason": {"type": "string"},
+                                "start_offset": {"type": "number"},
+                                "end_offset": {"type": "number"},
+                                "text": {"type": "string"},
+                                "style_note": {"type": "string"},
                             },
                         },
                     },
+                    "audio_plan": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["primary_audio", "sync_strategy", "music_or_roomtone", "cleanup_notes"],
+                        "properties": {
+                            "primary_audio": {"type": "string"},
+                            "sync_strategy": {"type": "string"},
+                            "music_or_roomtone": {"type": "string"},
+                            "cleanup_notes": {"type": "string"},
+                        },
+                    },
+                    "visual_plan": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["first_frame", "b_roll_strategy", "crop_strategy", "needed_visual_checks"],
+                        "properties": {
+                            "first_frame": {"type": "string"},
+                            "b_roll_strategy": {"type": "string"},
+                            "crop_strategy": {"type": "string"},
+                            "needed_visual_checks": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    "media_request_ids": {"type": "array", "items": {"type": "string"}},
+                    "verification_steps": {"type": "array", "items": {"type": "string"}},
+                    "risk_notes": {"type": "array", "items": {"type": "string"}},
+                    "success_criteria": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
-        "cross_angle_ranked_moments": {
+        "media_requests": {"type": "array", "items": MEDIA_REQUEST_SCHEMA},
+        "manual_review_queue": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": [
-                    "rank",
-                    "candidate_id",
-                    "angle",
-                    "start",
-                    "end",
-                    "why_this_ranks_here",
-                    "edit_implication",
-                ],
+                "required": ["start", "end", "reason", "required_action"],
                 "properties": {
-                    "rank": {"type": "integer"},
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "reason": {"type": "string"},
+                    "required_action": {"type": "string"},
+                },
+            },
+        },
+        "deferred_candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["candidate_id", "reason"],
+                "properties": {
                     "candidate_id": {"type": "string"},
-                    "angle": {"type": "string"},
-                    "start": {"type": "number"},
-                    "end": {"type": "number"},
-                    "why_this_ranks_here": {"type": "string"},
-                    "edit_implication": {"type": "string"},
+                    "reason": {"type": "string"},
                 },
             },
         },
-        "transcript_quality_actions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["start", "end", "issue", "action"],
-                "properties": {
-                    "start": {"type": "number"},
-                    "end": {"type": "number"},
-                    "issue": {"type": "string"},
-                    "action": {"type": "string"},
-                },
-            },
-        },
-        "notes_for_edit_plan": {"type": "array", "items": {"type": "string"}},
+        "notes_for_rendering": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -212,9 +317,9 @@ def response_text_config() -> dict[str, Any]:
     return {
         "format": {
             "type": "json_schema",
-            "name": "stage2_transcript_moments",
-            "schema": STAGE2_SCHEMA,
-            "strict": True,
+            "name": "stage3_edit_plans",
+            "schema": PLAN_SCHEMA,
+            "strict": False,
         },
         "verbosity": "medium",
     }
@@ -281,7 +386,53 @@ def visual_index_image_paths(manifest_path: Path, max_images: int) -> list[Path]
     return paths
 
 
-def estimated_stage2_cost(
+def compact_augmentation_assets(path: Path) -> dict[str, Any]:
+    data = read_json(path)
+    raw_assets = data.get("assets", data)
+    if isinstance(raw_assets, dict):
+        items = [
+            {"id": asset_id, **asset}
+            for asset_id, asset in raw_assets.items()
+            if isinstance(asset, dict)
+        ]
+    elif isinstance(raw_assets, list):
+        items = [asset for asset in raw_assets if isinstance(asset, dict)]
+    else:
+        raise RuntimeError("Augmentation assets manifest must contain an assets list or object.")
+
+    compact: list[dict[str, Any]] = []
+    for asset in items:
+        asset_id = str(asset.get("id", "")).strip()
+        if not asset_id:
+            continue
+        compact.append(
+            {
+                "id": asset_id,
+                "type": asset.get("type"),
+                "description": asset.get("description"),
+                "tags": asset.get("tags", []),
+                "license": asset.get("license"),
+                "license_url": asset.get("license_url"),
+                "source_url": asset.get("source_url"),
+                "creator": asset.get("creator"),
+                "usage_notes": asset.get("usage_notes"),
+                "default_volume": asset.get("volume", asset.get("default_volume")),
+                "has_local_path": bool(asset.get("path")),
+            }
+        )
+    return {
+        "asset_count": len(compact),
+        "usage_contract": (
+            "Reference a local video/image/graphic asset in timeline.visual_source as "
+            "asset://id or asset://id#t=SECONDS. Reference an audio asset in "
+            "timeline.audio_source only as an explicit quiet bed or standalone silent-card "
+            "audio source. Preserve source dialogue sync."
+        ),
+        "assets": compact,
+    }
+
+
+def estimated_plan_cost(
     source_materials: str,
     task_prompt: str,
     image_count: int,
@@ -311,10 +462,21 @@ def estimated_stage2_cost(
     }
 
 
-def build_task_prompt(stage1_output: dict[str, Any], content_mode: str) -> str:
+def build_task_prompt(
+    strategy_output: dict[str, Any],
+    moments_output: dict[str, Any],
+    clip_count: int,
+    target_aspect_ratio: str,
+    target_seconds: int,
+    content_mode: str,
+) -> str:
     return render_prompt_template(
-        f"stage2_{content_mode}.md",
-        stage1_output_json=json.dumps(stage1_output, ensure_ascii=False, indent=2),
+        f"plan_{content_mode}.md",
+        clip_count=clip_count,
+        target_seconds=target_seconds,
+        target_aspect_ratio=target_aspect_ratio,
+        stage1_output_json=json.dumps(strategy_output, ensure_ascii=False, indent=2),
+        stage2_output_json=json.dumps(moments_output, ensure_ascii=False, indent=2),
     )
 
 
@@ -324,7 +486,8 @@ def request_fingerprint_payload(
     task_prompt: str,
     contact_sheet_hash: str | None,
     visual_index_image_hashes: list[str],
-    stage1_output_hash: str,
+    strategy_output_hash: str,
+    moments_output_hash: str,
     visual_index_hash: str | None,
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [
@@ -352,7 +515,7 @@ def request_fingerprint_payload(
         )
     return {
         "cache_schema_version": 2,
-        "stage": "stage2_transcript_moment_analysis",
+        "stage": "plan_edits",
         "api": "openai.responses.create",
         "model": args.model,
         "input": [
@@ -370,7 +533,8 @@ def request_fingerprint_payload(
                     {
                         "type": "input_text",
                         "sha256": sha256_text(task_prompt),
-                        "stage1_output_sha256": stage1_output_hash,
+                        "strategy_output_sha256": strategy_output_hash,
+                        "moments_output_sha256": moments_output_hash,
                         "visual_index_sha256": visual_index_hash,
                     }
                 ],
@@ -407,7 +571,7 @@ def write_cache_entry(
     )
     write_json(entry_dir / "raw-response.json", response_dict)
     (entry_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(entry_dir / "stage2-output.json", parsed_output)
+    write_json(entry_dir / "plan-output.json", parsed_output)
     write_json(entry_dir / "usage-and-cost.json", usage_and_cost)
 
 
@@ -419,7 +583,7 @@ def load_cached_response(entry_dir: Path) -> dict[str, Any]:
         if output_text_path.exists()
         else response_output_text(None, response_dict)
     )
-    parsed_path = entry_dir / "stage2-output.json"
+    parsed_path = entry_dir / "plan-output.json"
     parsed_output = read_json(parsed_path) if parsed_path.exists() else json.loads(output_text)
     return {
         "response_dict": response_dict,
@@ -435,54 +599,71 @@ def write_markdown(
     cache_info: dict[str, Any] | None = None,
 ) -> None:
     lines = [
-        f"# {output.get('video_title', 'Stage 2 Transcript Moment Analysis')}",
+        f"# {output.get('video_title', 'Stage 3 Edit Plans')}",
         "",
         f"- Content mode: `{output.get('content_mode', 'ad')}`",
         "",
         "## Summary",
         "",
-        str(output.get("analysis_summary", "")).strip(),
+        str(output.get("plan_summary", "")).strip(),
         "",
-        "## Top Moments",
+        "## Clip Ads" if output.get("content_mode") != "excerpt" else "## Excerpt Plans",
         "",
     ]
-    for item in output.get("cross_angle_ranked_moments", []) or []:
-        start = item.get("start")
-        end = item.get("end")
-        timing = ""
-        if isinstance(start, int | float) and isinstance(end, int | float):
-            timing = f"`{format_time(float(start))}-{format_time(float(end))}` "
-        lines.append(f"{item.get('rank', '?')}. {timing}{item.get('angle', '')}")
-        lines.append(f"   - Candidate: `{item.get('candidate_id', '')}`")
-        lines.append(f"   - Why: {item.get('why_this_ranks_here', '')}")
-        lines.append(f"   - Edit implication: {item.get('edit_implication', '')}")
+    for clip in output.get("clip_ads", []) or []:
+        lines.append(f"### {clip.get('clip_id', '')}: {clip.get('concept_title', '')}")
+        lines.append(f"- Candidate: `{clip.get('source_candidate_id', '')}`")
+        lines.append(f"- Target: `{clip.get('target_duration_seconds', '')}s` `{clip.get('target_aspect_ratio', '')}`")
+        lines.append(f"- Objective: {clip.get('editorial_objective', '')}")
+        hook = clip.get("opening_hook") or {}
+        lines.append(f"- Hook: {hook.get('text', '')}")
         lines.append("")
-    lines.extend(["## Angle Candidate Windows", ""])
-    for angle_set in output.get("angle_moment_sets", []) or []:
-        lines.append(f"### {angle_set.get('stage1_rank', '?')}. {angle_set.get('angle', '')}")
-        lines.append(f"- Best: `{angle_set.get('best_candidate_id', '')}`")
-        for window in angle_set.get("candidate_windows", []) or []:
-            start = window.get("start")
-            end = window.get("end")
-            timing = ""
-            if isinstance(start, int | float) and isinstance(end, int | float):
-                timing = f"`{format_time(float(start))}-{format_time(float(end))}` "
-            lines.append(f"- {timing}`{window.get('candidate_id', '')}` {window.get('working_title', '')}")
-            lines.append(f"  Hook: {window.get('opening_hook', '')}")
-            lines.append(f"  Use: `{window.get('recommended_use', '')}` confidence `{window.get('confidence', '')}`")
+        lines.append("Timeline:")
+        for item in clip.get("timeline", []) or []:
+            screen_start = item.get("screen_time_start")
+            screen_end = item.get("screen_time_end")
+            source_start = item.get("source_start")
+            source_end = item.get("source_end")
+            screen = f"{screen_start}-{screen_end}s"
+            source = ""
+            if isinstance(source_start, int | float) and isinstance(source_end, int | float):
+                source = f"`{format_time(float(source_start))}-{format_time(float(source_end))}`"
+            lines.append(
+                f"- `{screen}` {source}: {item.get('edit_action', '')} "
+                f"({item.get('purpose', '')})"
+            )
         lines.append("")
-    if output.get("transcript_quality_actions"):
-        lines.extend(["## Transcript QA Actions", ""])
-        for action in output.get("transcript_quality_actions", []) or []:
-            start = action.get("start")
-            end = action.get("end")
+        if clip.get("verification_steps"):
+            lines.append("Verification:")
+            for step in clip.get("verification_steps", []) or []:
+                lines.append(f"- {step}")
+            lines.append("")
+        if clip.get("media_request_ids"):
+            lines.append(f"Media requests: `{', '.join(clip.get('media_request_ids', []))}`")
+            lines.append("")
+    if output.get("media_requests"):
+        lines.extend(["## Media Requests", ""])
+        for item in output.get("media_requests", []) or []:
+            lines.append(
+                f"- `{item.get('id', '')}` `{item.get('request_type', '')}` "
+                f"`{item.get('desired_asset_type', '')}` risk `{item.get('rights_risk', '')}`: "
+                f"{item.get('purpose', '')}"
+            )
+            if item.get("search_query"):
+                lines.append(f"  Search: {item.get('search_query')}")
+            if item.get("generation_prompt"):
+                lines.append(f"  Generate: {item.get('generation_prompt')}")
+        lines.append("")
+    if output.get("manual_review_queue"):
+        lines.extend(["## Manual Review Queue", ""])
+        for item in output.get("manual_review_queue", []) or []:
+            start = item.get("start")
+            end = item.get("end")
             if isinstance(start, int | float) and isinstance(end, int | float):
-                lines.append(
-                    f"- `{format_time(float(start))}-{format_time(float(end))}`: "
-                    f"{action.get('issue', '')} -> {action.get('action', '')}"
-                )
+                timing = f"`{format_time(float(start))}-{format_time(float(end))}`"
             else:
-                lines.append(f"- {action.get('issue', '')} -> {action.get('action', '')}")
+                timing = "`unknown`"
+            lines.append(f"- {timing}: {item.get('reason', '')} -> {item.get('required_action', '')}")
         lines.append("")
     lines.extend(["## Cost", ""])
     if cache_info and cache_info.get("hit"):
@@ -523,36 +704,45 @@ def write_response_artifacts(
 ) -> None:
     write_json(run_dir / "raw-response.json", response_dict)
     (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(run_dir / "stage2-output.json", parsed_output)
+    write_json(run_dir / "plan-output.json", parsed_output)
     write_json(run_dir / "usage-and-cost.json", usage_and_cost)
     write_markdown(run_dir / "summary.md", parsed_output, summary_cost, cache_info=cache_info)
 
 
-def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
+def run_plan(args: argparse.Namespace) -> dict[str, Any]:
     transcript_path = args.transcript.expanduser().resolve()
     manifest_path = args.manifest.expanduser().resolve()
-    stage1_path = args.stage1_output.expanduser().resolve()
+    strategy_path = args.strategy_output.expanduser().resolve()
+    moments_path = args.moments_output.expanduser().resolve()
     contact_sheet_path = args.contact_sheet.expanduser().resolve() if args.contact_sheet else None
     visual_index_path = args.visual_index_manifest.expanduser().resolve() if args.visual_index_manifest else None
-    if not transcript_path.exists():
-        raise FileNotFoundError(transcript_path)
-    if not manifest_path.exists():
-        raise FileNotFoundError(manifest_path)
-    if not stage1_path.exists():
-        raise FileNotFoundError(stage1_path)
+    augmentation_assets_path = (
+        args.augmentation_assets.expanduser().resolve()
+        if args.augmentation_assets
+        else None
+    )
+    for path in [transcript_path, manifest_path, strategy_path, moments_path]:
+        if not path.exists():
+            raise FileNotFoundError(path)
     if contact_sheet_path is not None and not contact_sheet_path.exists():
         raise FileNotFoundError(contact_sheet_path)
     if visual_index_path is not None and not visual_index_path.exists():
         raise FileNotFoundError(visual_index_path)
+    if augmentation_assets_path is not None and not augmentation_assets_path.exists():
+        raise FileNotFoundError(augmentation_assets_path)
 
     pricing = Pricing(
         input_usd_per_million=args.input_usd_per_million,
         cached_input_usd_per_million=args.cached_input_usd_per_million,
         output_usd_per_million=args.output_usd_per_million,
     )
-    stage1_output = read_json(stage1_path)
-    content_mode = args.content_mode or str(stage1_output.get("content_mode") or "ad")
-    stage1_output_text = stable_json(stage1_output)
+    strategy_output = read_json(strategy_path)
+    moments_output = read_json(moments_path)
+    content_mode = args.content_mode or str(
+        moments_output.get("content_mode") or strategy_output.get("content_mode") or "ad"
+    )
+    strategy_output_text = stable_json(strategy_output)
+    moments_output_text = stable_json(moments_output)
     source_materials = build_source_materials(
         manifest_path=manifest_path,
         transcript_path=transcript_path,
@@ -577,15 +767,39 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
                 (
                     "Candidate visual-index contact sheets are attached after the main contact sheet "
                     "in the same order as candidate_sheets below. Use these 1 fps sheets to verify "
-                    "concrete objects/actions when selecting candidate windows."
+                    "concrete objects/actions before creating a render plan."
                 ),
                 "COMPACT VISUAL INDEX JSON:",
                 json.dumps(visual_index, ensure_ascii=False, indent=2),
             ]
         )
-    task_prompt = build_task_prompt(stage1_output, content_mode)
+    augmentation_assets_text = ""
+    if augmentation_assets_path is not None:
+        augmentation_assets = compact_augmentation_assets(augmentation_assets_path)
+        augmentation_assets_text = stable_json(augmentation_assets)
+        source_materials = "\n\n".join(
+            [
+                source_materials,
+                "OPTIONAL AUGMENTATION ASSET CATALOG",
+                (
+                    "These local, rights-reviewed assets may be used as related cutaway, "
+                    "graphic, or quiet audio-bed material. Use only asset ids listed here, "
+                    "and only when the usage notes and license metadata make the asset "
+                    "appropriate for the excerpt."
+                ),
+                json.dumps(augmentation_assets, ensure_ascii=False, indent=2),
+            ]
+        )
+    task_prompt = build_task_prompt(
+        strategy_output=strategy_output,
+        moments_output=moments_output,
+        clip_count=args.clip_count,
+        target_aspect_ratio=args.target_aspect_ratio,
+        target_seconds=args.target_seconds,
+        content_mode=content_mode,
+    )
     image_count = (1 if contact_sheet_path is not None else 0) + len(visual_index_images)
-    preflight_cost = estimated_stage2_cost(
+    preflight_cost = estimated_plan_cost(
         source_materials=source_materials,
         task_prompt=task_prompt,
         image_count=image_count,
@@ -619,14 +833,15 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
             *visual_index_image_hashes,
         ]
     )
-    prompt_cache_key = args.prompt_cache_key or f"stage1-{sha256_text(stable_prefix_cache_material)[:48]}"
+    prompt_cache_key = args.prompt_cache_key or f"strategy-{sha256_text(stable_prefix_cache_material)[:48]}"
     fingerprint_payload = request_fingerprint_payload(
         args=args,
         source_materials=source_materials,
         task_prompt=task_prompt,
         contact_sheet_hash=contact_sheet_hash,
         visual_index_image_hashes=visual_index_image_hashes,
-        stage1_output_hash=sha256_text(stage1_output_text),
+        strategy_output_hash=sha256_text(strategy_output_text),
+        moments_output_hash=sha256_text(moments_output_text),
         visual_index_hash=visual_index_hash,
     )
     cache_mode = "off" if args.no_local_cache else args.cache_mode
@@ -653,7 +868,8 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
             "preflight_cost": preflight_cost,
             "source_materials_sha256": sha256_text(source_materials),
             "task_prompt_sha256": sha256_text(task_prompt),
-            "stage1_output_sha256": sha256_text(stage1_output_text),
+            "strategy_output_sha256": sha256_text(strategy_output_text),
+            "moments_output_sha256": sha256_text(moments_output_text),
             "visual_index_sha256": visual_index_hash,
             "prompt_cache_key": prompt_cache_key,
             "local_response_cache": stage_cache.response_cache_status_payload(
@@ -681,7 +897,7 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
     output_root = args.output_dir.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or (
-        f"{transcript_path.stem}.stage2.{args.model}.{args.reasoning_effort}."
+        f"{transcript_path.stem}.plan.{args.model}.{args.reasoning_effort}."
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     )
     run_dir = output_root / run_id
@@ -691,10 +907,13 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
         run_dir / "request-manifest.json",
         {
             "created_at": datetime.now(UTC).isoformat(),
-            "stage": "stage2_transcript_moment_analysis",
+            "stage": "plan_edits",
             "model": args.model,
             "reasoning_effort": args.reasoning_effort,
             "max_output_tokens": args.max_output_tokens,
+            "clip_count": args.clip_count,
+            "target_aspect_ratio": args.target_aspect_ratio,
+            "target_seconds": args.target_seconds,
             "image_detail": args.image_detail if image_count else None,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": args.prompt_cache_retention,
@@ -702,18 +921,24 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
                 "transcript": str(transcript_path),
                 "manifest": str(manifest_path),
                 "contact_sheet": str(contact_sheet_path) if contact_sheet_path else None,
-                "stage1_output": str(stage1_path),
-                "visual_index_manifest": str(visual_index_path) if visual_index_path else None,
-                "visual_index_images": [str(path) for path in visual_index_images],
-            },
+                "strategy_output": str(strategy_path),
+                "moments_output": str(moments_path),
+            "visual_index_manifest": str(visual_index_path) if visual_index_path else None,
+            "visual_index_images": [str(path) for path in visual_index_images],
+            "augmentation_assets": str(augmentation_assets_path) if augmentation_assets_path else None,
+        },
             "hashes": {
                 "source_materials_sha256": sha256_text(source_materials),
                 "task_prompt_sha256": sha256_text(task_prompt),
-                "stage1_output_sha256": sha256_text(stage1_output_text),
+                "strategy_output_sha256": sha256_text(strategy_output_text),
+                "moments_output_sha256": sha256_text(moments_output_text),
                 "contact_sheet_sha256": contact_sheet_hash,
-                "visual_index_sha256": visual_index_hash,
-                "visual_index_image_sha256s": visual_index_image_hashes,
-            },
+            "visual_index_sha256": visual_index_hash,
+            "visual_index_image_sha256s": visual_index_image_hashes,
+            "augmentation_assets_sha256": (
+                sha256_text(augmentation_assets_text) if augmentation_assets_text else None
+            ),
+        },
             "preflight_cost": preflight_cost,
             "pricing": {
                 "input_usd_per_million": pricing.input_usd_per_million,
@@ -789,7 +1014,7 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
         )
         print(f"Local response cache hit: {entry_dir}")
         print("No OpenAI API call made.")
-        print(f"Wrote {run_dir / 'stage2-output.json'}")
+        print(f"Wrote {run_dir / 'plan-output.json'}")
         print(f"Wrote {run_dir / 'summary.md'}")
         return {
             "run_dir": str(run_dir),
@@ -836,7 +1061,9 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
         f"estimated cost: ${preflight_cost['estimated_usd']:.6f}"
     )
     print(f"Writing run artifacts to {run_dir}")
-    response = client.responses.create(
+    response = create_response_streaming(
+        client,
+        label="plan",
         model=args.model,
         input=input_messages,
         reasoning={"effort": args.reasoning_effort},
@@ -849,15 +1076,43 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
 
     response_dict = response.model_dump(mode="json") if hasattr(response, "model_dump") else {}
     output_text = response_output_text(response, response_dict)
-    write_json(run_dir / "raw-response.json", response_dict)
-    (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
+    usage = usage_dict(response_dict)
+    cost = actual_cost(usage, pricing)
     try:
         parsed_output = json.loads(output_text)
     except json.JSONDecodeError as exc:
+        write_json(run_dir / "raw-response.json", response_dict)
+        (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
+        write_json(
+            run_dir / "usage-and-cost.json",
+            {
+                "api_call_made": True,
+                "cache": {
+                    "hit": False,
+                    "stored": False,
+                    "key": local_cache_key if entry_dir else None,
+                    "entry_dir": str(entry_dir) if entry_dir else None,
+                    "mode": cache_identity["mode"],
+                    "query_hash": cache_identity["query_hash"],
+                    "implementation_hash": cache_identity["implementation_hash"],
+                },
+                "usage": usage,
+                "cost": cost,
+                "pricing": {
+                    "input_usd_per_million": pricing.input_usd_per_million,
+                    "cached_input_usd_per_million": pricing.cached_input_usd_per_million,
+                    "output_usd_per_million": pricing.output_usd_per_million,
+                },
+                "parse_error": str(exc),
+            },
+        )
+        print(
+            f"Actual token usage: input={cost['input_tokens']}, "
+            f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
+        )
+        print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
         raise RuntimeError(f"Model output was not valid JSON. Raw response saved to {run_dir}") from exc
 
-    usage = usage_dict(response_dict)
-    cost = actual_cost(usage, pricing)
     usage_and_cost = {
         "api_call_made": True,
         "cache": {
@@ -912,7 +1167,7 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
         f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
     )
     print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
-    print(f"Wrote {run_dir / 'stage2-output.json'}")
+    print(f"Wrote {run_dir / 'plan-output.json'}")
     print(f"Wrote {run_dir / 'summary.md'}")
     return {
         "run_dir": str(run_dir),
@@ -924,15 +1179,25 @@ def run_stage2(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run OpenAI stage 2: transcript moment analysis for clip-ad angles."
+        description="Run OpenAI stage 3: concrete clip-ad edit plans."
     )
     parser.add_argument("--env-file", type=Path, default=Path(DEFAULT_ENV_FILE))
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--stage1-output", type=Path, required=True)
+    parser.add_argument("--strategy-output", type=Path, required=True)
+    parser.add_argument("--moments-output", type=Path, required=True)
     parser.add_argument("--content-mode", choices=CONTENT_MODE_CHOICES, default=None)
     parser.add_argument("--contact-sheet", type=Path, default=None)
     parser.add_argument("--visual-index-manifest", type=Path, default=None)
+    parser.add_argument(
+        "--augmentation-assets",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON catalog of local, rights-reviewed assets that Stage 3 "
+            "may reference as asset://id in visual_source/audio_source."
+        ),
+    )
     parser.add_argument("--visual-index-max-images", type=int, default=None)
     parser.add_argument(
         "--no-visual-index-images",
@@ -945,6 +1210,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None)
     parser.add_argument("--reasoning-effort", default=None)
     parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument("--clip-count", type=int, default=None)
+    parser.add_argument("--target-aspect-ratio", default=None)
+    parser.add_argument("--target-seconds", type=int, default=None)
     parser.add_argument("--image-detail", choices=["low", "high", "auto", "original"], default=None)
     parser.add_argument("--image-token-allowance", type=int, default=None)
     parser.add_argument("--prompt-cache-key", default=None)
@@ -981,54 +1249,61 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_env_defaults(args: argparse.Namespace) -> None:
     if args.output_dir is None:
-        args.output_dir = Path(env_value("STAGE2_OUTPUT_DIR") or env_value("STAGE1_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
+        args.output_dir = Path(env_value("PLAN_OUTPUT_DIR") or env_value("STRATEGY_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
     if args.cache_dir is None:
         args.cache_dir = Path(
-            env_value("STAGE2_CACHE_DIR")
-            or env_value("STAGE1_CACHE_DIR")
+            env_value("PLAN_CACHE_DIR")
+            or env_value("MOMENTS_CACHE_DIR")
+            or env_value("STRATEGY_CACHE_DIR")
             or env_value("OPENAI_RESPONSE_CACHE_DIR")
             or (args.output_dir / DEFAULT_CACHE_SUBDIR)
         )
     if args.model is None:
-        args.model = env_value("STAGE2_MODEL") or env_value("STAGE1_MODEL") or DEFAULT_MODEL
+        args.model = env_value("PLAN_MODEL") or env_value("STRATEGY_MODEL") or DEFAULT_MODEL
     if args.reasoning_effort is None:
         args.reasoning_effort = (
-            env_value("STAGE2_REASONING_EFFORT")
-            or env_value("STAGE1_REASONING_EFFORT")
+            env_value("PLAN_REASONING_EFFORT")
+            or env_value("STRATEGY_REASONING_EFFORT")
             or DEFAULT_REASONING_EFFORT
         )
     if args.max_output_tokens is None:
-        args.max_output_tokens = env_int("STAGE2_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
+        args.max_output_tokens = env_int("PLAN_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
+    if args.clip_count is None:
+        args.clip_count = env_int("PLAN_CLIP_COUNT", DEFAULT_CLIP_COUNT)
+    if args.target_aspect_ratio is None:
+        args.target_aspect_ratio = env_value("PLAN_TARGET_ASPECT_RATIO") or DEFAULT_TARGET_ASPECT_RATIO
+    if args.target_seconds is None:
+        args.target_seconds = env_int("PLAN_TARGET_SECONDS", DEFAULT_TARGET_SECONDS)
     if args.visual_index_max_images is None:
         args.visual_index_max_images = env_int(
-            "STAGE2_VISUAL_INDEX_MAX_IMAGES",
+            "PLAN_VISUAL_INDEX_MAX_IMAGES",
             DEFAULT_VISUAL_INDEX_MAX_IMAGES,
         )
     if args.image_detail is None:
-        args.image_detail = env_value("STAGE2_IMAGE_DETAIL") or env_value("STAGE1_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
+        args.image_detail = env_value("PLAN_IMAGE_DETAIL") or env_value("STRATEGY_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
     if args.image_token_allowance is None:
         args.image_token_allowance = env_int(
-            "STAGE2_IMAGE_TOKEN_ALLOWANCE",
-            env_int("STAGE1_IMAGE_TOKEN_ALLOWANCE", DEFAULT_IMAGE_TOKEN_ALLOWANCE),
+            "PLAN_IMAGE_TOKEN_ALLOWANCE",
+            env_int("STRATEGY_IMAGE_TOKEN_ALLOWANCE", DEFAULT_IMAGE_TOKEN_ALLOWANCE),
         )
     if args.input_usd_per_million is None:
         args.input_usd_per_million = env_float(
-            "STAGE2_INPUT_USD_PER_MILLION",
-            env_float("STAGE1_INPUT_USD_PER_MILLION", DEFAULT_GPT55_INPUT_USD_PER_MILLION),
+            "PLAN_INPUT_USD_PER_MILLION",
+            env_float("STRATEGY_INPUT_USD_PER_MILLION", DEFAULT_GPT55_INPUT_USD_PER_MILLION),
         )
     if args.cached_input_usd_per_million is None:
         args.cached_input_usd_per_million = env_float(
-            "STAGE2_CACHED_INPUT_USD_PER_MILLION",
-            env_float("STAGE1_CACHED_INPUT_USD_PER_MILLION", DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION),
+            "PLAN_CACHED_INPUT_USD_PER_MILLION",
+            env_float("STRATEGY_CACHED_INPUT_USD_PER_MILLION", DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION),
         )
     if args.output_usd_per_million is None:
         args.output_usd_per_million = env_float(
-            "STAGE2_OUTPUT_USD_PER_MILLION",
-            env_float("STAGE1_OUTPUT_USD_PER_MILLION", DEFAULT_GPT55_OUTPUT_USD_PER_MILLION),
+            "PLAN_OUTPUT_USD_PER_MILLION",
+            env_float("STRATEGY_OUTPUT_USD_PER_MILLION", DEFAULT_GPT55_OUTPUT_USD_PER_MILLION),
         )
     if args.cache_mode is None:
         args.cache_mode = (
-            env_value("STAGE2_CACHE_MODE")
+            env_value("PLAN_CACHE_MODE")
             or env_value("OPENAI_RESPONSE_CACHE_MODE")
             or stage_cache.DEFAULT_CACHE_MODE
         )
@@ -1041,7 +1316,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         load_env_file(args.env_file)
         apply_env_defaults(args)
-        run_stage2(args)
+        run_plan(args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

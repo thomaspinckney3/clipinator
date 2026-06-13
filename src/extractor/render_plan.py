@@ -12,6 +12,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from extractor.timebase import OUTPUT_FRAME_RATE, probe_frame_rate, quantize_plan_times
 from extractor.preprocess_video import (
     DEFAULT_FFMPEG_BIN,
     DEFAULT_FFMPEG_HWACCEL,
@@ -1277,10 +1278,10 @@ def transcript_words_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(words, key=lambda item: (float(item["start"]), float(item["end"])))
 
 
-def infer_transcript_path(source_video: Path, stage3_path: Path) -> Path | None:
+def infer_transcript_path(source_video: Path, plan_path: Path) -> Path | None:
     roots = []
-    if len(stage3_path.parents) >= 3:
-        roots.append(stage3_path.parents[2])
+    if len(plan_path.parents) >= 3:
+        roots.append(plan_path.parents[2])
     roots.append(source_video.parent)
 
     seen: set[Path] = set()
@@ -3561,7 +3562,12 @@ def render_clip(
     foreground_saturation: float,
     require_opening_title_card: bool,
     subject_index: dict[str, Any] | None,
+    output_label: str = "draft",
 ) -> dict[str, Any]:
+    # Filename infix marking the render stage: ".draft" for preview renders,
+    # empty for final deliverables. The directory already separates draft from
+    # final, so finals carry no stage word in the filename.
+    label_suffix = f".{output_label}" if output_label else ""
     clip, opening_title_card_inserted = ensure_opening_title_card(
         clip,
         required=require_opening_title_card,
@@ -3633,13 +3639,22 @@ def render_clip(
     if caption_source_mode == "transcript":
         caption_entries = transcript_caption_entries
         caption_source = "transcript_words" if caption_entries else "none"
-    elif caption_source_mode == "auto" and transcript_caption_entries:
-        caption_entries = transcript_caption_entries
-        caption_source = "transcript_words"
+    elif caption_source_mode == "auto":
+        # Verbatim transcript words are the default for spoken content. Honor an
+        # explicit caption_plan over the transcript only when it is flagged
+        # human-edited; the LLM's advisory caption_plan (often paraphrased) does
+        # not override verbatim captions.
+        if clip.get("human_edited_captions") and caption_entries:
+            caption_source = "caption_plan"
+        elif transcript_caption_entries:
+            caption_entries = transcript_caption_entries
+            caption_source = "transcript_words"
+        else:
+            caption_source = "caption_plan" if caption_entries else "none"
     else:
         caption_source = "caption_plan" if caption_entries else "none"
-    output_path = output_dir / f"{clip_id}.draft.mp4"
-    pre_fade_output_path = output_dir / f"{clip_id}.draft.pre-video-fade.mp4"
+    output_path = output_dir / f"{clip_id}{label_suffix}.mp4"
+    pre_fade_output_path = output_dir / f"{clip_id}{label_suffix}.pre-video-fade.mp4"
     concat_segments_with_crossfade(
         segment_paths,
         pre_fade_output_path,
@@ -3669,7 +3684,7 @@ def render_clip(
         start_key="start",
         end_key="end",
     )
-    srt_path = output_dir / f"{clip_id}.draft.srt"
+    srt_path = output_dir / f"{clip_id}{label_suffix}.srt"
     if caption_entries:
         write_srt_entries(srt_path, caption_entries)
         srt_timeline = caption_entries
@@ -3711,8 +3726,8 @@ def render_clip(
         else:
             burned_caption_entries = caption_entries
         if burned_caption_entries:
-            ass_path = output_dir / f"{clip_id}.draft.burned.ass"
-            captioned_path = output_dir / f"{clip_id}.draft.burned.pre-video-fade.mp4"
+            ass_path = output_dir / f"{clip_id}{label_suffix}.burned.ass"
+            captioned_path = output_dir / f"{clip_id}{label_suffix}.burned.pre-video-fade.mp4"
             write_ass_entries(ass_path, burned_caption_entries, width, height)
             burn_ass_captions(pre_fade_output_path, ass_path, captioned_path)
             final_fade_input_path = captioned_path
@@ -3728,7 +3743,7 @@ def render_clip(
     if final_fade_input_path != pre_fade_output_path:
         pre_fade_output_path.unlink(missing_ok=True)
 
-    subtitled_path = output_dir / f"{clip_id}.draft.subtitled.mp4"
+    subtitled_path = output_dir / f"{clip_id}{label_suffix}.subtitled.mp4"
     subtitles_burned = False
     if burn_captions:
         shutil.copy2(output_path, subtitled_path)
@@ -3737,7 +3752,7 @@ def render_clip(
     else:
         subtitle_entries = sidecar_timeline_to_caption_entries(srt_timeline)
         if subtitle_entries:
-            subtitled_ass_path = output_dir / f"{clip_id}.draft.subtitled.ass"
+            subtitled_ass_path = output_dir / f"{clip_id}{label_suffix}.subtitled.ass"
             write_ass_entries(subtitled_ass_path, subtitle_entries, width, height)
             burn_ass_captions(output_path, subtitled_ass_path, subtitled_path)
             subtitles_muxed = False
@@ -3969,14 +3984,14 @@ def validate_render_settings(settings: dict[str, Any]) -> None:
         raise RuntimeError("foreground_saturation must be >= 0")
 
 
-def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
+def render_plan(args: argparse.Namespace) -> dict[str, Any]:
     source_video = args.source_video.expanduser().resolve()
-    stage3_path = args.stage3_output.expanduser().resolve()
+    plan_path = args.plan_output.expanduser().resolve()
     font_file = args.font_file.expanduser().resolve()
     if not source_video.exists():
         raise FileNotFoundError(source_video)
-    if not stage3_path.exists():
-        raise FileNotFoundError(stage3_path)
+    if not plan_path.exists():
+        raise FileNotFoundError(plan_path)
     if not font_file.exists():
         raise FileNotFoundError(font_file)
     augmentation_assets_path = (
@@ -3992,10 +4007,19 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
     )
     subject_index = load_subject_index(subject_index_path)
 
-    plan = read_json(stage3_path)
+    plan = read_json(plan_path)
+    source_frame_rate = probe_frame_rate(source_video)
+    quantized_time_count = 0
+    if source_frame_rate is not None:
+        quantized_time_count = quantize_plan_times(plan, source_frame_rate)
+        if quantized_time_count:
+            print(
+                f"Snapped {quantized_time_count} plan times to frame boundaries "
+                f"({source_frame_rate} fps source, {OUTPUT_FRAME_RATE} fps output)."
+            )
     transcript_path = args.transcript.expanduser().resolve() if args.transcript else None
     if transcript_path is None:
-        transcript_path = infer_transcript_path(source_video, stage3_path)
+        transcript_path = infer_transcript_path(source_video, plan_path)
     transcript_words: list[dict[str, Any]] = []
     if transcript_path is not None:
         if not transcript_path.exists():
@@ -4046,15 +4070,21 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
                 foreground_saturation=float(settings["foreground_saturation"]),
                 require_opening_title_card=content_mode == "excerpt",
                 subject_index=subject_index,
+                output_label=args.output_label,
             )
         )
     manifest = {
         "source_video": str(source_video),
-        "stage3_output": str(stage3_path),
+        "stage3_output": str(plan_path),
         "transcript": str(transcript_path) if transcript_path else None,
         "content_mode": content_mode,
         "output_dir": str(output_dir),
         "resolution": {"width": args.width, "height": args.height},
+        "timebase": {
+            "source_frame_rate": str(source_frame_rate) if source_frame_rate else None,
+            "output_frame_rate": str(OUTPUT_FRAME_RATE),
+            "plan_times_quantized": quantized_time_count,
+        },
         "renderer": {
             "type": "ffmpeg_draft_renderer",
             "ffmpeg_bin": FFMPEG_BIN,
@@ -4073,7 +4103,7 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
             "transcript_caption_word_count": len(transcript_words),
             "sidecar_captions": True,
             "notes": [
-                "Uses stage3 timeline source ranges in order.",
+                "Uses plan timeline source ranges in order.",
                 "Separates dialogue audio from visual B-roll when visual_source provides usable time cues.",
                 "Builds multi-cut B-roll segments from parsed visual ranges and anchors.",
                 "Can repair planned silent leads by borrowing immediate narration from the following beat.",
@@ -4091,7 +4121,7 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
                 "Can use explicit caption_plan render-time entries when transcript words are unavailable or requested.",
                 "Uses blurred 9:16 background with centered original landscape frame.",
                 "Burns captions in a phone-safe lower-third band above common short-form app controls.",
-                "Creates a burned-caption .draft.subtitled.mp4 so subtitle placement is deterministic.",
+                "Creates a burned-caption subtitled mp4 so subtitle placement is deterministic.",
                 "Adds simple overlay text from caption_or_overlay when ffmpeg drawtext is available.",
                 "Writes sidecar SRT captions for every rendered clip.",
                 "Does not add licensed music or advanced motion graphics.",
@@ -4113,7 +4143,7 @@ def render_stage3(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render draft local clips from OpenAI stage 3 edit plans.")
     parser.add_argument("--source-video", type=Path, required=True)
-    parser.add_argument("--stage3-output", type=Path, required=True)
+    parser.add_argument("--plan-output", type=Path, required=True)
     parser.add_argument(
         "--transcript",
         type=Path,
@@ -4133,6 +4163,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-label",
+        default="draft",
+        help=(
+            "Filename infix marking the render stage (e.g. clip.draft.mp4). "
+            "Pass an empty string for clean final-deliverable names (clip.mp4)."
+        ),
+    )
     parser.add_argument("--clip-id", default=None)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
@@ -4248,7 +4286,7 @@ def main(argv: list[str] | None = None) -> int:
         ) or "none"
         configure_ffmpeg(args.ffmpeg_bin, args.ffmpeg_hwaccel)
         require_command("ffprobe")
-        manifest = render_stage3(args)
+        manifest = render_plan(args)
         print(f"Wrote {manifest['output_dir']}")
         for clip in manifest["clips"]:
             probe = clip["probe"]

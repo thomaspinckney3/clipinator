@@ -321,9 +321,9 @@ def create_periodic_sheets(
     return sheets
 
 
-def iter_stage2_candidates(stage2_output: dict[str, Any]) -> list[dict[str, Any]]:
+def iter_moments_candidates(moments_output: dict[str, Any]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    for angle_set in stage2_output.get("angle_moment_sets", []) or []:
+    for angle_set in moments_output.get("angle_moment_sets", []) or []:
         angle = angle_set.get("angle")
         for candidate in angle_set.get("candidate_windows", []) or []:
             if not isinstance(candidate, dict):
@@ -339,16 +339,16 @@ def create_candidate_sheets(
     frames: list[IndexedFrame],
     root: Path,
     sheets_dir: Path,
-    stage2_output_path: Path | None,
+    moments_output_path: Path | None,
     duration: float,
     pad_seconds: float,
     columns: int,
 ) -> list[dict[str, Any]]:
-    if stage2_output_path is None:
+    if moments_output_path is None:
         return []
-    stage2_output = read_json(stage2_output_path)
+    moments_output = read_json(moments_output_path)
     candidate_sheets: list[dict[str, Any]] = []
-    for candidate in iter_stage2_candidates(stage2_output):
+    for candidate in iter_moments_candidates(moments_output):
         candidate_id = str(candidate.get("candidate_id") or "candidate")
         start = max(0.0, float(candidate.get("start") or 0) - pad_seconds)
         end = min(duration, float(candidate.get("end") or 0) + pad_seconds)
@@ -416,9 +416,9 @@ def build_visual_index(args: argparse.Namespace) -> dict[str, Any]:
     video_path = args.video.expanduser().resolve()
     if not video_path.exists():
         raise FileNotFoundError(video_path)
-    stage2_output = args.stage2_output.expanduser().resolve() if args.stage2_output else None
-    if stage2_output is not None and not stage2_output.exists():
-        raise FileNotFoundError(stage2_output)
+    moments_output = args.moments_output.expanduser().resolve() if args.moments_output else None
+    if moments_output is not None and not moments_output.exists():
+        raise FileNotFoundError(moments_output)
 
     output_root = args.output_dir.expanduser().resolve()
     video_root = output_root / safe_name(video_path.stem)
@@ -455,7 +455,7 @@ def build_visual_index(args: argparse.Namespace) -> dict[str, Any]:
         frames=frames,
         root=output_root,
         sheets_dir=sheets_dir,
-        stage2_output_path=stage2_output,
+        moments_output_path=moments_output,
         duration=duration,
         pad_seconds=args.candidate_pad_seconds,
         columns=args.candidate_sheet_columns,
@@ -483,7 +483,7 @@ def build_visual_index(args: argparse.Namespace) -> dict[str, Any]:
         "frames": [frame.to_dict(output_root) for frame in frames],
         "periodic_sheets": periodic_sheets,
         "candidate_sheets": candidate_sheets,
-        "stage2_output": str(stage2_output) if stage2_output else None,
+        "moments_output": str(moments_output) if moments_output else None,
         "usage_note": (
             "Use candidate_sheets as visual proof packages for concrete-object/action clip "
             "planning. The model should cite exact timestamps from the sheet before rendering."
@@ -501,7 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("video", type=Path)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--stage2-output", type=Path, default=None)
+    parser.add_argument("--moments-output", type=Path, default=None)
     parser.add_argument("--frame-interval-seconds", type=float, default=DEFAULT_FRAME_INTERVAL_SECONDS)
     parser.add_argument("--frame-width", type=int, default=DEFAULT_FRAME_WIDTH)
     parser.add_argument(

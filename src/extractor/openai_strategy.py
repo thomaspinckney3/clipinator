@@ -15,6 +15,7 @@ from typing import Any
 from extractor import stage_cache
 from extractor.preprocess_video import format_time
 from extractor.prompt_templates import load_prompt_template, prompt_template_path, render_prompt_template
+from extractor.openai_responses import create_response_streaming
 from extractor.transcribe import env_float, env_int, env_value, load_env_file
 
 
@@ -40,7 +41,7 @@ class Pricing:
     output_usd_per_million: float
 
 
-STAGE1_SCHEMA: dict[str, Any] = {
+STRATEGY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
@@ -334,10 +335,10 @@ def build_source_materials(
 
 
 def build_task_prompt(content_mode: str) -> str:
-    return render_prompt_template(f"stage1_{content_mode}.md")
+    return render_prompt_template(f"strategy_{content_mode}.md")
 
 
-DEVELOPER_PROMPT_TEMPLATE = "stage1_developer.md"
+DEVELOPER_PROMPT_TEMPLATE = "strategy_developer.md"
 
 
 def developer_instructions() -> str:
@@ -349,7 +350,7 @@ def response_text_config() -> dict[str, Any]:
         "format": {
             "type": "json_schema",
             "name": "stage1_video_brief",
-            "schema": STAGE1_SCHEMA,
+            "schema": STRATEGY_SCHEMA,
             "strict": False,
         },
         "verbosity": "medium",
@@ -425,8 +426,8 @@ def cache_source_files() -> list[Path]:
         root / "prompt_templates.py",
         prompt_template_path("source_materials.md"),
         prompt_template_path(DEVELOPER_PROMPT_TEMPLATE),
-        prompt_template_path("stage1_ad.md"),
-        prompt_template_path("stage1_excerpt.md"),
+        prompt_template_path("strategy_ad.md"),
+        prompt_template_path("strategy_excerpt.md"),
         root / "stage_cache.py",
         root / "preprocess_video.py",
         root / "transcribe.py",
@@ -466,7 +467,7 @@ def write_cache_entry(
     )
     write_json(entry_dir / "raw-response.json", response_dict)
     (entry_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(entry_dir / "stage1-output.json", parsed_output)
+    write_json(entry_dir / "strategy-output.json", parsed_output)
     write_json(entry_dir / "usage-and-cost.json", usage_and_cost)
 
 
@@ -477,7 +478,7 @@ def load_cached_response(entry_dir: Path) -> dict[str, Any]:
         output_text = output_text_path.read_text(encoding="utf-8")
     else:
         output_text = response_output_text(None, response_dict)
-    parsed_path = entry_dir / "stage1-output.json"
+    parsed_path = entry_dir / "strategy-output.json"
     if parsed_path.exists():
         parsed_output = read_json(parsed_path)
     else:
@@ -506,7 +507,7 @@ def write_response_artifacts(
 ) -> None:
     write_json(run_dir / "raw-response.json", response_dict)
     (run_dir / "output-text.json").write_text(output_text.rstrip() + "\n", encoding="utf-8")
-    write_json(run_dir / "stage1-output.json", parsed_output)
+    write_json(run_dir / "strategy-output.json", parsed_output)
     write_json(run_dir / "usage-and-cost.json", usage_and_cost)
     write_markdown(run_dir / "summary.md", parsed_output, summary_cost, cache_info=cache_info)
 
@@ -567,8 +568,8 @@ def seed_cache_from_run(
         else response_output_text(None, response_dict)
     )
     parsed_output = (
-        read_json(source_run_dir / "stage1-output.json")
-        if (source_run_dir / "stage1-output.json").exists()
+        read_json(source_run_dir / "strategy-output.json")
+        if (source_run_dir / "strategy-output.json").exists()
         else json.loads(output_text)
     )
     usage = usage_dict(response_dict)
@@ -702,7 +703,7 @@ def write_markdown(
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
+def run_strategy(args: argparse.Namespace) -> dict[str, Any]:
     transcript_path = args.transcript.expanduser().resolve()
     manifest_path = args.manifest.expanduser().resolve()
     contact_sheet_path = args.contact_sheet.expanduser().resolve() if args.contact_sheet else None
@@ -755,7 +756,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
             contact_sheet_hash or "",
         ]
     )
-    prompt_cache_key = args.prompt_cache_key or f"stage1-{sha256_text(cache_material)[:48]}"
+    prompt_cache_key = args.prompt_cache_key or f"strategy-{sha256_text(cache_material)[:48]}"
     fingerprint_payload = request_fingerprint_payload(
         args=args,
         source_materials=source_materials,
@@ -839,7 +840,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
     output_root = args.output_dir.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or (
-        f"{transcript_path.stem}.stage1.{args.model}.{args.reasoning_effort}."
+        f"{transcript_path.stem}.strategy.{args.model}.{args.reasoning_effort}."
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     )
     run_dir = output_root / run_id
@@ -940,7 +941,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
         )
         print(f"Local response cache hit: {entry_dir}")
         print("No OpenAI API call made.")
-        print(f"Wrote {run_dir / 'stage1-output.json'}")
+        print(f"Wrote {run_dir / 'strategy-output.json'}")
         print(f"Wrote {run_dir / 'summary.md'}")
         return {
             "run_dir": str(run_dir),
@@ -979,7 +980,9 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
         f"estimated cost: ${preflight_cost['estimated_usd']:.6f}"
     )
     print(f"Writing run artifacts to {run_dir}")
-    response = client.responses.create(
+    response = create_response_streaming(
+        client,
+        label="strategy",
         model=args.model,
         input=input_messages,
         reasoning={"effort": args.reasoning_effort},
@@ -1053,7 +1056,7 @@ def run_stage1(args: argparse.Namespace) -> dict[str, Any]:
         f"cached_input={cost['cached_input_tokens']}, output={cost['output_tokens']}"
     )
     print(f"Estimated billed cost from usage: ${cost['estimated_usd']:.6f}")
-    print(f"Wrote {run_dir / 'stage1-output.json'}")
+    print(f"Wrote {run_dir / 'strategy-output.json'}")
     print(f"Wrote {run_dir / 'summary.md'}")
     return {
         "run_dir": str(run_dir),
@@ -1120,44 +1123,44 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_env_defaults(args: argparse.Namespace) -> None:
     if args.output_dir is None:
-        args.output_dir = Path(env_value("STAGE1_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
+        args.output_dir = Path(env_value("STRATEGY_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR)
     if args.cache_dir is None:
         args.cache_dir = Path(
-            env_value("STAGE1_CACHE_DIR")
+            env_value("STRATEGY_CACHE_DIR")
             or env_value("OPENAI_RESPONSE_CACHE_DIR")
             or (args.output_dir / DEFAULT_CACHE_SUBDIR)
         )
     if args.model is None:
-        args.model = env_value("STAGE1_MODEL") or DEFAULT_MODEL
+        args.model = env_value("STRATEGY_MODEL") or DEFAULT_MODEL
     if args.reasoning_effort is None:
-        args.reasoning_effort = env_value("STAGE1_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT
+        args.reasoning_effort = env_value("STRATEGY_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT
     if args.max_output_tokens is None:
-        args.max_output_tokens = env_int("STAGE1_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
+        args.max_output_tokens = env_int("STRATEGY_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)
     if args.image_detail is None:
-        args.image_detail = env_value("STAGE1_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
+        args.image_detail = env_value("STRATEGY_IMAGE_DETAIL") or DEFAULT_IMAGE_DETAIL
     if args.image_token_allowance is None:
         args.image_token_allowance = env_int(
-            "STAGE1_IMAGE_TOKEN_ALLOWANCE",
+            "STRATEGY_IMAGE_TOKEN_ALLOWANCE",
             DEFAULT_IMAGE_TOKEN_ALLOWANCE,
         )
     if args.input_usd_per_million is None:
         args.input_usd_per_million = env_float(
-            "STAGE1_INPUT_USD_PER_MILLION",
+            "STRATEGY_INPUT_USD_PER_MILLION",
             DEFAULT_GPT55_INPUT_USD_PER_MILLION,
         )
     if args.cached_input_usd_per_million is None:
         args.cached_input_usd_per_million = env_float(
-            "STAGE1_CACHED_INPUT_USD_PER_MILLION",
+            "STRATEGY_CACHED_INPUT_USD_PER_MILLION",
             DEFAULT_GPT55_CACHED_INPUT_USD_PER_MILLION,
         )
     if args.output_usd_per_million is None:
         args.output_usd_per_million = env_float(
-            "STAGE1_OUTPUT_USD_PER_MILLION",
+            "STRATEGY_OUTPUT_USD_PER_MILLION",
             DEFAULT_GPT55_OUTPUT_USD_PER_MILLION,
         )
     if args.cache_mode is None:
         args.cache_mode = (
-            env_value("STAGE1_CACHE_MODE")
+            env_value("STRATEGY_CACHE_MODE")
             or env_value("OPENAI_RESPONSE_CACHE_MODE")
             or stage_cache.DEFAULT_CACHE_MODE
         )
@@ -1170,7 +1173,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         load_env_file(args.env_file)
         apply_env_defaults(args)
-        run_stage1(args)
+        run_strategy(args)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
