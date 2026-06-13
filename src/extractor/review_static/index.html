@@ -120,7 +120,7 @@ function renderClip(c,idx){
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
     <div class="row">
       <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
-      <div class="col"><div class="hint">cut preview (9:16, approximate)</div><div class="phone"><video class="pv" muted></video><div class="cap"></div></div></div>
+      <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div><div class="phone"><video class="pv" controls></video><div class="cap"></div></div></div>
     </div>`;
 
   // word toggling
@@ -150,27 +150,50 @@ function updateSegInfo(div,c){
   div.querySelector('.seginfo').textContent=`${segs.length} segment(s), ~${total.toFixed(1)}s`;
 }
 
+// Captions ARE the in-words in transcript-first editing — derive them live from
+// the current selection so newly-included dialogue shows up immediately.
+function captionsFromWords(words){
+  const MAXC=42, MAXW=7, GAP=0.9, TAIL=0.15;
+  const caps=[]; let line=[];
+  const flush=()=>{ if(line.length){ caps.push({source_start:line[0].start,
+    source_end:line[line.length-1].end+TAIL, text:line.map(w=>w.text).join(' ')}); line=[]; } };
+  for(const w of words){
+    if(!w.in) continue;
+    if(line.length){
+      const chars=line.map(x=>x.text).join(' ').length+1+w.text.length;
+      const gap=w.start-line[line.length-1].end;
+      if(chars>MAXC || line.length>=MAXW || gap>GAP) flush();
+    }
+    line.push(w);
+  }
+  flush(); return caps;
+}
+
 function previewCut(div,c){
   if(!CURRENT.source_url){ alert('Source video not found, cannot preview.'); return; }
   const segs=currentSegments(c); if(!segs.length){ alert('No words selected.'); return; }
+  const caps=captionsFromWords(c.words);
   const v=div.querySelector('.pv'); const cap=div.querySelector('.cap');
   if(v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url;
   let i=0;
-  const playSeg=()=>{ if(i>=segs.length){ cap.textContent=''; return; } v.currentTime=segs[i].source_in; v.play(); };
+  const playSeg=()=>{ if(i>=segs.length){ cap.textContent=''; v.pause(); return; } v.currentTime=segs[i].source_in; v.play(); };
   v.ontimeupdate=()=>{
     const s=segs[i]; if(!s) return;
     if(v.currentTime>=s.source_out){ i++; playSeg(); return; }
     const t=v.currentTime;
-    const line=(c.captions||[]).find(x=>x.source_start<=t && t<=x.source_end);
+    const line=caps.find(x=>x.source_start<=t && t<=x.source_end);
     cap.textContent=line?line.text:'';
   };
   i=0; playSeg();
 }
 
 function clipPayload(c){
+  // Omit captions: in transcript-first editing captions are the kept words, so
+  // the backend regenerates them from the transcript for the current segments
+  // (newly-included dialogue gets captioned automatically).
   return {clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
           title_card_seconds:c.title_card_seconds, notes:c.notes||'',
-          segments: c.decision==='drop'?[]:currentSegments(c), captions:c.captions};
+          segments: c.decision==='drop'?[]:currentSegments(c)};
 }
 
 async function renderClipNow(div,c){

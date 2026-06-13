@@ -30,4 +30,13 @@ Mark each: `[ ]` open · `[x]` fixed (note the commit) · `[~]` won't-fix/by-des
 
 ## Findings
 
-(none yet — add as you test)
+[x] Cut preview had no audio (fixed: was `<video muted>`; preview is click-
+    triggered so it can play with sound).
+[x] Cut preview had no pause/play controls (fixed: added native `controls`; also
+    fixed it running past the end of the cut into the rest of the source).
+[x] Adding dialogue (including more words) didn't show as captions (fixed:
+    captions are now derived live from the in-words for the preview, and
+    regenerated from the transcript on save — verified caption count grows with
+    included words, human_edited_captions stays False/verbatim).
+    — all three in the same commit; please re-test in the browser to confirm
+    audio + controls feel right (I can't drive a real browser here).
