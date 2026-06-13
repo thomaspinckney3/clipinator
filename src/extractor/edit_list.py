@@ -787,6 +787,62 @@ def rebuild_clip(
     return clip
 
 
+def apply_edits(
+    plan: dict[str, Any],
+    edits: dict[str, Any],
+    words: list[dict[str, Any]],
+    duration: float | None,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    """Merge an edit-list overlay (TOML- or OTIO-derived) onto a plan.
+
+    Shared by every edit-list serialization: validates decisions and segments,
+    rebuilds kept clips, drops/reworks per decision, keeps clips absent from the
+    overlay unchanged, and records provenance under ``human_edit``. Raises on
+    any invalid edit before returning, so a caller never writes a partial plan.
+    """
+    plan_clips = {str(clip.get("clip_id")): clip for clip in plan.get("clip_ads", []) or []}
+    edited_ids: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    reworked: list[str] = []
+    for edit in edits.get("clips", []) or []:
+        clip_id = str(edit.get("clip_id", ""))
+        if clip_id not in plan_clips:
+            raise RuntimeError(f"Edit list references unknown clip_id {clip_id!r}.")
+        if clip_id in edited_ids:
+            raise RuntimeError(f"Edit list contains clip_id {clip_id!r} twice.")
+        edited_ids.add(clip_id)
+        decision = str(edit.get("decision", "keep")).strip().lower()
+        if decision not in DECISIONS:
+            raise RuntimeError(
+                f"{clip_id}: decision must be one of {', '.join(DECISIONS)}; got {decision!r}."
+            )
+        if decision == "drop":
+            dropped.append(clip_id)
+            continue
+        validate_segments(clip_id, edit.get("segments", []) or [], duration)
+        kept.append(rebuild_clip(plan_clips[clip_id], edit, words))
+        if decision == "rework":
+            reworked.append(clip_id)
+
+    for clip_id, clip in plan_clips.items():
+        if clip_id not in edited_ids:
+            print(f"warning: {clip_id} is not in the edit list; keeping it unchanged.")
+            kept.append(deepcopy(clip))
+
+    revised = deepcopy(plan)
+    revised["clip_ads"] = kept
+    revised["human_edit"] = {
+        "edit_list": source,
+        "applied_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "dropped_clip_ids": dropped,
+        "rework_clip_ids": reworked,
+    }
+    return revised
+
+
 def run_import(args: argparse.Namespace) -> int:
     edit_list_path = args.edit_list.expanduser().resolve()
     toml_text = edit_list_path.read_text(encoding="utf-8")
@@ -861,45 +917,11 @@ def run_import(args: argparse.Namespace) -> int:
             "segment end-of-video bounds are NOT validated for this import."
         )
 
-    plan_clips = {str(clip.get("clip_id")): clip for clip in plan.get("clip_ads", []) or []}
-    edited_ids: set[str] = set()
-    kept: list[dict[str, Any]] = []
-    dropped: list[str] = []
-    reworked: list[str] = []
-    for edit in edits.get("clips", []) or []:
-        clip_id = str(edit.get("clip_id", ""))
-        if clip_id not in plan_clips:
-            raise RuntimeError(f"Edit list references unknown clip_id {clip_id!r}.")
-        if clip_id in edited_ids:
-            raise RuntimeError(f"Edit list contains clip_id {clip_id!r} twice.")
-        edited_ids.add(clip_id)
-        decision = str(edit.get("decision", "keep")).strip().lower()
-        if decision not in DECISIONS:
-            raise RuntimeError(
-                f"{clip_id}: decision must be one of {', '.join(DECISIONS)}; got {decision!r}."
-            )
-        if decision == "drop":
-            dropped.append(clip_id)
-            continue
-        validate_segments(clip_id, edit.get("segments", []) or [], duration)
-        kept.append(rebuild_clip(plan_clips[clip_id], edit, words))
-        if decision == "rework":
-            reworked.append(clip_id)
-
-    for clip_id, clip in plan_clips.items():
-        if clip_id not in edited_ids:
-            print(f"warning: {clip_id} is not in the edit list; keeping it unchanged.")
-            kept.append(deepcopy(clip))
-
-    revised = deepcopy(plan)
-    revised["clip_ads"] = kept
-    revised["human_edit"] = {
-        "edit_list": str(edit_list_path),
-        "edit_list_sha256": sha256_text(toml_text),
-        "applied_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "dropped_clip_ids": dropped,
-        "rework_clip_ids": reworked,
-    }
+    revised = apply_edits(plan, edits, words, duration, source=str(edit_list_path))
+    revised["human_edit"]["edit_list_sha256"] = sha256_text(toml_text)
+    kept = revised["clip_ads"]
+    dropped = revised["human_edit"]["dropped_clip_ids"]
+    reworked = revised["human_edit"]["rework_clip_ids"]
 
     output_path = (
         args.output.expanduser().resolve()

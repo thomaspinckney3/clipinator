@@ -930,6 +930,43 @@ Mechanics worth knowing:
 - Clips missing from the TOML are kept unchanged with a warning; dropping a
   clip is always an explicit `decision = "drop"`.
 
+### OpenTimelineIO / NLE interchange
+
+For editors who work in a non-linear editor, the same review gate is also
+available as OpenTimelineIO. `otio-edl export` writes the run's `review/`
+directory:
+
+```bash
+otio-edl export \
+  --plan-output <run>/openai-runs/<base>-revise/plan-output.json \
+  --render-manifest <run>/renders/excerpt/final/render-manifest.json
+```
+
+- `edit-list.otio` — the canonical interchange. Each excerpt is a video track
+  of source-range clips plus a generated title card, with the clipinator
+  decision/title/captions/notes payload in per-track metadata. Premiere Pro and
+  DaVinci Resolve open `.otio` natively.
+- `edit-list.edl` (CMX 3600) and `edit-list.fcpxml` — one-way cuts views via
+  OTIO's adapters: a single flattened track of source segments, for editors on
+  tools that prefer those formats. They carry cut geometry only — title cards,
+  captions, and metadata are dropped by construction, so they are disposable
+  views, not the edit list.
+
+Import an edited `.otio` back into a plan-format file:
+
+```bash
+otio-edl import <run>/review/final/edit-list.otio
+```
+
+This reads the same edit-list overlay the TOML path uses (`clip_id` as the
+merge key, decision/title/segments/captions) and funnels through the shared
+apply step, so it validates identically and writes `plan-output.human.json`.
+Times are frame-accurate (`RationalTime` at the source rate), so a plan →
+`.otio` → plan round-trip preserves every segment to within one frame. The
+`.otio` is the source of truth; an `.otio` re-exported from an NLE is read
+best-effort (cut geometry by track/clip name; metadata an NLE dropped is
+regenerated from the transcript).
+
 ## OpenAI Critique Stage: Post-Render Review
 
 Run the fourth LLM stage (`openai-critique`) after local rendering. This stage critiques rendered
