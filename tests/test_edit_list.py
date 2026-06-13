@@ -278,6 +278,24 @@ class TestExportImport:
         assert result["clip_ads"] == []
         assert result["human_edit"]["dropped_clip_ids"] == ["EX01"]
 
+    def test_trim_segment_through_toml(self, run_dir):
+        # Edit a segment's in/out in the TOML and confirm the trim reaches the plan.
+        plan_path = run_dir / "openai-runs" / "run-plan" / "plan-output.json"
+        manifest = run_dir / "renders" / "excerpt" / "draft" / "render-manifest.json"
+        run_export(self._args(plan_output=plan_path, render_manifest=manifest,
+                              transcript=None, source_video=None, output_dir=None))
+        toml_path = run_dir / "review" / "draft" / "edit-list.toml"
+        text = toml_path.read_text()
+        # default clip segment is (1.0, 9.0); trim to (2.5, 7.5)
+        text = text.replace("source_in = 1.000", "source_in = 2.500", 1)
+        text = text.replace("source_out = 9.000", "source_out = 7.500", 1)
+        toml_path.write_text(text)
+        out = run_dir / "trimmed.json"
+        run_import(self._args(edit_list=toml_path, plan_output=None, transcript=None, output=out))
+        sr = json.loads(out.read_text())["clip_ads"][0]["source_ranges"]
+        assert sr[0]["start"] == pytest.approx(2.5)
+        assert sr[0]["end"] == pytest.approx(7.5)
+
     def test_unknown_clip_id_rejected(self, run_dir):
         plan_path = run_dir / "openai-runs" / "run-plan" / "plan-output.json"
         manifest = run_dir / "renders" / "excerpt" / "draft" / "render-manifest.json"
