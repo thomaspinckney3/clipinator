@@ -14,3 +14,6 @@ visual-index/
 *.draft.mp4
 *.draft.subtitled.mp4
 *.draft.srt
+tmp/
+cloudflare-captures/*.mp4
+cloudflare-captures/*.mp4.json
