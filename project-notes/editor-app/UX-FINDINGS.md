@@ -40,3 +40,7 @@ Mark each: `[ ]` open · `[x]` fixed (note the commit) · `[~]` won't-fix/by-des
     included words, human_edited_captions stays False/verbatim).
     — all three in the same commit; please re-test in the browser to confirm
     audio + controls feel right (I can't drive a real browser here).
+[x] Cut preview could play the whole source start-to-finish and had no easy
+    "back to clip start" (fixed: replaced native source controls with a
+    cut-confined transport — play/pause, ⏮ start, and a clickable cut progress
+    bar; playback is clamped to the segments so it never leaves the clip).

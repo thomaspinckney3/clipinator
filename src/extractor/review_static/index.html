@@ -26,6 +26,10 @@
   video { width:100%; max-width:300px; background:#000; border-radius:4px; }
   .phone { aspect-ratio:9/16; max-width:220px; background:#000; border-radius:10px; overflow:hidden; position:relative; }
   .phone video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; max-width:none; }
+  .transport { display:flex; align-items:center; gap:.5rem; max-width:220px; margin-top:.4rem; }
+  .transport button { border:1px solid #bbb; background:#fff; border-radius:5px; padding:.2rem .5rem; cursor:pointer; font-size:.8rem; }
+  .pbar { flex:1; height:8px; background:#e4e4e4; border-radius:5px; cursor:pointer; overflow:hidden; }
+  .pfill { height:100%; width:0; background:var(--accent); }
   .phone .cap { position:absolute; left:6%; right:6%; bottom:14%; text-align:center; color:#fff;
     font-weight:700; font-size:.8rem; text-shadow:0 1px 3px #000,0 0 6px #000; line-height:1.2; }
   .transcript { line-height:2; font-size:.95rem; margin-top:.4rem; max-height:14rem; overflow-y:auto;
@@ -122,7 +126,11 @@ function renderClip(c,idx){
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
     <div class="row">
       <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
-      <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div><div class="phone"><video class="pv" controls></video><div class="cap"></div></div><div class="clock pvclock hint">source —:— · cut —:—</div></div>
+      <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div>
+        <div class="phone"><video class="pv" playsinline></video><div class="cap"></div></div>
+        <div class="transport"><button class="tplay" title="play/pause">▶</button><button class="trestart" title="back to clip start">⏮ start</button><div class="pbar"><div class="pfill"></div></div></div>
+        <div class="clock pvclock hint">source —:— · cut —:—</div>
+      </div>
     </div>`;
 
   // word toggling
@@ -136,8 +144,8 @@ function renderClip(c,idx){
   // title/notes
   div.querySelector('.title').oninput=e=>{ c.title=e.target.value; };
   div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
-  // preview the cut from the source, segment by segment, with captions
-  div.querySelector('.preview').onclick=()=>previewCut(div,c);
+  // cut-confined transport (play/pause/restart/scrub within the clip)
+  setupPreview(div,c);
   // render this clip for real (ffmpeg) — gated on availability
   const rb=div.querySelector('.render');
   if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
@@ -173,27 +181,35 @@ function captionsFromWords(words){
   flush(); return caps;
 }
 
-function previewCut(div,c){
-  if(!CURRENT.source_url){ alert('Source video not found, cannot preview.'); return; }
-  const segs=currentSegments(c); if(!segs.length){ alert('No words selected.'); return; }
-  const caps=captionsFromWords(c.words);
-  const v=div.querySelector('.pv'); const cap=div.querySelector('.cap'); const clk=div.querySelector('.pvclock');
-  if(v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url;
-  // cumulative cut time at the start of each segment (excl. title card)
-  const before=[]; let acc=0;
-  for(const s of segs){ before.push(acc); acc+=s.source_out-s.source_in; }
-  let i=0;
-  const playSeg=()=>{ if(i>=segs.length){ cap.textContent=''; v.pause(); return; } v.currentTime=segs[i].source_in; v.play(); };
+// A transport over the CUT timeline (not the source): playback is clamped to
+// the selected segments so it can never run into the rest of the video, with
+// play/pause, restart, and a clickable cut progress bar.
+function setupPreview(div,c){
+  const v=div.querySelector('.pv'), cap=div.querySelector('.cap'), clk=div.querySelector('.pvclock');
+  const playBtn=div.querySelector('.tplay'), pfill=div.querySelector('.pfill'), pbar=div.querySelector('.pbar');
+  let segs=[], before=[], total=0, caps=[], i=0, finished=false;
+  const rebuild=()=>{ segs=currentSegments(c); before=[]; let acc=0; for(const s of segs){before.push(acc);acc+=s.source_out-s.source_in;} total=acc; caps=captionsFromWords(c.words); };
+  const ensureSrc=()=>{ if(CURRENT.source_url && v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url; };
+  const showAt=(t,cut)=>{ const line=caps.find(x=>x.source_start<=t&&t<=x.source_end); cap.textContent=line?line.text:''; clk.textContent=`source ${fmt1(t)} · cut ${fmt1(cut)} / ${fmt1(total)}`; pfill.style.width=(100*cut/Math.max(total,0.01))+'%'; };
+  function seekCut(t){ if(!segs.length) return; t=Math.max(0,Math.min(t,total-0.01)); let idx=0; while(idx<segs.length-1 && t>=before[idx]+(segs[idx].source_out-segs[idx].source_in)) idx++; i=idx; finished=false; v.currentTime=segs[idx].source_in+(t-before[idx]); showAt(v.currentTime,t); }
+  function start(){ if(!CURRENT.source_url){ alert('Source video not found, cannot preview.'); return; } rebuild(); if(!segs.length){ alert('No words selected.'); return; } ensureSrc(); i=0; finished=false; v.currentTime=segs[0].source_in; v.play(); }
+  function toggle(){ if(!segs.length||v.src===''){ start(); return; } if(v.paused){ if(finished) start(); else v.play(); } else v.pause(); }
+  v.onplay=()=>{ playBtn.textContent='⏸'; };
+  v.onpause=()=>{ playBtn.textContent='▶'; };
   v.ontimeupdate=()=>{
-    const s=segs[i]; if(!s) return;
-    if(v.currentTime>=s.source_out){ i++; playSeg(); return; }
-    const t=v.currentTime;
-    const line=caps.find(x=>x.source_start<=t && t<=x.source_end);
-    cap.textContent=line?line.text:'';
-    const cut=before[i]+(t-s.source_in);
-    clk.textContent=`source ${fmt1(t)} · cut ${fmt1(cut)} / ${fmt1(acc)}`;
+    if(!segs.length) return;
+    let s=segs[i]; if(!s){ v.pause(); return; }
+    if(v.currentTime>=s.source_out-0.001){
+      i++;
+      if(i>=segs.length){ finished=true; v.pause(); cap.textContent=''; pfill.style.width='100%'; clk.textContent=`source ${fmt1(s.source_out)} · cut ${fmt1(total)} / ${fmt1(total)}`; return; }
+      v.currentTime=segs[i].source_in; s=segs[i];
+    }
+    showAt(v.currentTime, before[i]+(v.currentTime-s.source_in));
   };
-  i=0; playSeg();
+  playBtn.onclick=toggle;
+  div.querySelector('.trestart').onclick=start;
+  div.querySelector('.preview').onclick=start;
+  pbar.onclick=e=>{ if(!segs.length) rebuild(); const r=pbar.getBoundingClientRect(); seekCut((e.clientX-r.left)/r.width*total); };
 }
 
 function clipPayload(c){
