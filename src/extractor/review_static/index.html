@@ -55,6 +55,11 @@
   .rework-row .rwinstr { flex:1; min-width:18rem; font:inherit; font-size:.85rem; padding:.3rem .5rem; border:1px solid #ccc; border-radius:5px; }
   .rework-row .rwbtn { border:1px solid #3a5bd9; color:#3a5bd9; background:#fff; border-radius:5px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; white-space:nowrap; }
   .rework-row .rwbtn:disabled { opacity:.4; cursor:default; border-color:#bbb; color:#999; }
+  .framing { display:flex; align-items:center; gap:.4rem; margin-top:.4rem; }
+  .framing input[type=range] { flex:1; max-width:130px; }
+  .framing button { border:1px solid #ccc; background:#fff; border-radius:4px; cursor:pointer; padding:0 .45rem; line-height:1.6; }
+  .framing .fr-val { min-width:4.5rem; }
+  .fr-note { font-size:.74rem; color:#9a9a9a; margin-top:.1rem; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
   .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
@@ -110,6 +115,7 @@ async function loadProject(id){
   // editor can expand earlier/later to reach content beyond the clip.
   proj.clips.forEach(c=>{
     c.decision='keep';
+    c.framing=+c.framing_offset||0;
     c.inSet=new Set();
     for(let i=0;i<W.length;i++){
       if((c.segments||[]).some(s=>s.source_in-1e-6<=W[i].start && W[i].start<=s.source_out+1e-6)) c.inSet.add(i);
@@ -216,6 +222,14 @@ function renderClip(c,idx){
         <div class="phone"><video class="pv" playsinline></video><div class="cap"></div></div>
         <div class="transport"><button class="tplay" title="play/pause">▶</button><button class="trestart" title="back to clip start">⏮ start</button><div class="pbar"><div class="pfill"></div></div></div>
         <div class="clock pvclock hint">source —:— · cut —:—</div>
+        <div class="framing">
+          <span class="hint">Framing</span>
+          <button class="fr-left" title="shift crop left">◀</button>
+          <input class="fr-slider" type="range" min="-0.4" max="0.4" step="0.05" value="0">
+          <button class="fr-right" title="shift crop right">▶</button>
+          <span class="hint fr-val">centered</span>
+        </div>
+        <div class="hint fr-note">preview approximate — render to confirm framing</div>
       </div>
     </div>`;
 
@@ -232,6 +246,12 @@ function renderClip(c,idx){
   div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
   // cut-confined transport (play/pause/restart/scrub within the clip)
   setupPreview(div,c);
+  // framing: horizontal crop nudge (biases the renderer's subject-crop center)
+  const fs=div.querySelector('.fr-slider'); fs.value=c.framing;
+  fs.oninput=()=>{ c.framing=+fs.value; applyFraming(div,c); };
+  div.querySelector('.fr-left').onclick=()=>{ c.framing=Math.max(-0.4,+(c.framing-0.05).toFixed(2)); applyFraming(div,c); };
+  div.querySelector('.fr-right').onclick=()=>{ c.framing=Math.min(0.4,+(c.framing+0.05).toFixed(2)); applyFraming(div,c); };
+  applyFraming(div,c);
   // render this clip for real (ffmpeg) — gated on availability
   const rb=div.querySelector('.render');
   if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
@@ -244,6 +264,17 @@ function renderClip(c,idx){
   div.querySelector('.rwinstr').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); reworkClip(div,c); } });
   updateSegInfo(div,c);
   return div;
+}
+
+// Approximate the horizontal reframe in the preview by shifting which part of
+// the cover-cropped video shows. Truth comes from "render this clip".
+function applyFraming(div,c){
+  const pv=div.querySelector('.pv');
+  if(pv) pv.style.objectPosition=(50+c.framing*125).toFixed(0)+'% 50%';
+  const s=div.querySelector('.fr-slider'); if(s && +s.value!==c.framing) s.value=c.framing;
+  const v=div.querySelector('.fr-val');
+  if(v) v.textContent = Math.abs(c.framing)<0.001 ? 'centered'
+        : Math.round(Math.abs(c.framing)*100)+'% '+(c.framing<0?'left':'right');
 }
 
 function updateSegInfo(div,c){
@@ -340,6 +371,7 @@ function clipPayload(c){
   // (newly-included dialogue gets captioned automatically).
   return {clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
           title_card_seconds:c.title_card_seconds, notes:c.notes||'',
+          framing_offset:+c.framing||0,
           segments: c.decision==='drop'?[]:currentSegments(c)};
 }
 

@@ -417,6 +417,7 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
             "title": clip.get("concept_title", ""),
             "title_card_seconds": card,
             "segments": [{"source_in": s["source_in"], "source_out": s["source_out"]} for s in segments],
+            "framing_offset": float(clip.get("framing_offset") or 0.0),
             "preview_url": video_url(preview) if preview and Path(str(preview)).exists() else None,
             "uses_assets": has_assets,
             "critique": compact_critique(clip_critique(reviews, clip_id)),

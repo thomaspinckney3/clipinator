@@ -1,4 +1,24 @@
-from extractor.render_plan import caption_plan_entries, transcript_words_from_data
+from extractor.render_plan import (
+    apply_framing_offset,
+    caption_plan_entries,
+    transcript_words_from_data,
+)
+
+
+class TestApplyFramingOffset:
+    def test_zero_is_noop(self):
+        assert apply_framing_offset(0.5, 0.0) == (0.5, None)
+
+    def test_shifts_and_reports(self):
+        center, reason = apply_framing_offset(0.5, 0.2)
+        assert center == 0.7
+        assert "reframe" in reason
+
+    def test_clamped_to_frame(self):
+        center, reason = apply_framing_offset(0.95, 0.2)
+        assert center == 1.0  # never past the frame edge
+        center, _ = apply_framing_offset(0.05, -0.2)
+        assert center == 0.0
 
 
 class TestCaptionPlanEntries:

@@ -2243,6 +2243,25 @@ def apply_subject_crop_guard(
     return adjusted_scale, adjusted_center, reason
 
 
+def apply_framing_offset(
+    foreground_center_x: float,
+    framing_offset: float,
+) -> tuple[float, str | None]:
+    """Bias the subject-crop center by a human reframe correction.
+
+    ``framing_offset`` comes from the review editor (positive shifts the visible
+    crop toward the right of the wide frame, negative toward the left). It is
+    applied after the automatic subject/motion guards so a human can correct a
+    crop the detectors got wrong; the result stays within [0, 1].
+    """
+    if not framing_offset:
+        return foreground_center_x, None
+    adjusted = max(0.0, min(1.0, foreground_center_x + framing_offset))
+    if abs(adjusted - foreground_center_x) < 0.001:
+        return foreground_center_x, None
+    return adjusted, f"human reframe (offset={framing_offset:+.2f})"
+
+
 def motion_analysis_for_clip(source_video: Path, clip: dict[str, Any]) -> dict[str, Any]:
     windows = visual_analysis_windows_for_clip(clip)
     columns = [0.0] * MOTION_ANALYSIS_WIDTH
@@ -2963,6 +2982,7 @@ def render_segment(
     foreground_contrast: float,
     foreground_saturation: float,
     subject_index: dict[str, Any] | None,
+    framing_offset: float = 0.0,
 ) -> dict[str, Any]:
     duration = timeline_duration(item)
     if duration <= 0:
@@ -3066,6 +3086,10 @@ def render_segment(
                         span_foreground_scale,
                         foreground_center_x,
                     )
+                    foreground_center_x, framing_offset_reason = apply_framing_offset(
+                        foreground_center_x,
+                        framing_offset,
+                    )
                     span["foreground_focus"] = foreground_focus
                     if subject_focus:
                         span["subject_focus"] = {
@@ -3091,6 +3115,7 @@ def render_segment(
                             scale_adjustment_reason,
                             subject_adjustment_reason,
                             projected_adjustment_reason,
+                            framing_offset_reason,
                         )
                         if reason
                     ]
@@ -3591,6 +3616,11 @@ def render_clip(
         or (caption_source_mode in {"auto", "transcript"} and bool(transcript_words))
     )
     use_black_title_card = clip_id in black_title_card_clip_ids
+    try:
+        framing_offset = float(clip.get("framing_offset") or 0.0)
+    except (TypeError, ValueError):
+        framing_offset = 0.0
+    framing_offset = max(-0.4, min(0.4, framing_offset))
     segment_results = [
         render_segment(
             source_video=source_video,
@@ -3613,6 +3643,7 @@ def render_clip(
             foreground_contrast=foreground_contrast,
             foreground_saturation=foreground_saturation,
             subject_index=subject_index,
+            framing_offset=framing_offset,
         )
         for index, item in enumerate(timeline, start=1)
     ]

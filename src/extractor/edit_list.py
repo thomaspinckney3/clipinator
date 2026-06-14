@@ -33,6 +33,11 @@ SEGMENT_MATCH_TOLERANCE = 0.075
 # export and when validating edited segments on import, so every segment the
 # export emits passes import unchanged (no round-trip failure on short cuts).
 MIN_SEGMENT_SECONDS = 0.05
+# Largest horizontal reframe an editor can dial in. The value biases the
+# renderer's subject-crop center (0=centered) by at most this fraction of the
+# wide frame in either direction, so a correction stays within the punched-in
+# crop and never reveals letterbox edges.
+MAX_FRAMING_OFFSET = 0.4
 CAPTION_OVERLAP_SECONDS = 0.2
 CAPTION_MAX_CHARS = 42
 CAPTION_MAX_WORDS = 7
@@ -782,6 +787,20 @@ def rebuild_clip(
     notes = str(edit.get("notes", "")).strip()
     if notes:
         clip["human_review_notes"] = notes
+
+    # Horizontal reframe: a human correction to the renderer's subject-crop
+    # center. Stored only when non-zero so untouched clips keep the renderer's
+    # automatic framing. Clamped to the supported range.
+    try:
+        framing_offset = float(edit.get("framing_offset", clip.get("framing_offset", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        framing_offset = 0.0
+    framing_offset = max(-MAX_FRAMING_OFFSET, min(MAX_FRAMING_OFFSET, framing_offset))
+    if abs(framing_offset) >= 0.001:
+        clip["framing_offset"] = round(framing_offset, 3)
+    else:
+        clip.pop("framing_offset", None)
+
     if dormant:
         print(f"  {clip_id}: {dormant} caption(s) fell outside the kept segments and were dropped.")
     return clip

@@ -125,3 +125,38 @@ reasoning + conversational rework.
 4. Save → write edit list → `apply_edits` → `plan-output.human.json`.
 5. "Render this clip" endpoint → `render-plan` single clip + progress.
 6. (later) inline AI critique suggestions; conversational rework.
+
+## AI integration (built — 2026-06-13)
+
+- **A — critique surfaced inline (no key):** each clip card shows the run's
+  existing critique (verdict, score, one-sentence assessment, issues with
+  severity + suggested fix). Matched by clip_id, prefix-fallback for final
+  clips' `_R2` suffix. Read-only.
+- **B — conversational rework (needs OPENAI_API_KEY):** per-clip instruction box
+  → focused Responses call (numbered sentences of the clip neighborhood + current
+  in/out) returns sentences to keep → applied to the word in-set; cut + captions
+  update; human keeps editing. Gated by an `ai` flag; openai imported lazily;
+  key loaded from .env by a minimal stdlib loader so the core stays dep-free.
+  ~6s round-trip at low reasoning. Verified in-browser (clip 74.8s→47.6s).
+- NOT built: on-demand re-critique of the *edited* cut (was the "full layer"
+  option, deferred).
+
+## Framing override (built — 2026-06-14)
+
+Rationale: word/sentence selection is trivial in the transcript UI, so it's a
+weak use of the AI. The high-value editorial decisions are the ones the text UI
+*can't* express — first among them, **horizontal framing** of the 9:16 punch-in
+when the subject-crop detector mis-centers the speaker.
+
+- **Manual, no key.** A per-clip horizontal **framing nudge** (slider + ◀/▶,
+  range ±0.4) biases the renderer's subject-crop center. Stored as
+  `clip["framing_offset"]` only when non-zero (untouched clips keep automatic
+  framing). Carried browser → `clipPayload` → `/api/save` →
+  `edit_list.rebuild_clip` → human plan; honored in `render_plan` by
+  `apply_framing_offset` after the subject/motion guards.
+- **Preview honesty.** The in-browser cut preview shifts `object-position-x` to
+  approximate the reframe direction, with a "preview approximate — render to
+  confirm framing" cue; the real crop is verified via "render this clip".
+- NOT built yet: **AI auto-center** (a vision pass that sets the offset for
+  off-center subjects) and the **AI cost guardrail** (confirm-before-call +
+  actual-cost readout) that will wrap every billable editor call.

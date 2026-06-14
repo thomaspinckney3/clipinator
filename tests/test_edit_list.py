@@ -167,6 +167,24 @@ class TestRebuildClip:
         body = out["timeline"][-1]
         assert body["source_start"] == 2.0 and body["source_end"] == 6.0
 
+    def test_framing_offset_persisted_and_clamped(self):
+        clip = make_clip(segments=[(1.0, 9.0)])
+        base = {"clip_id": "EX01", "title": "T", "title_card_seconds": 4.5,
+                "segments": [{"source_in": 1.0, "source_out": 9.0}]}
+        out = rebuild_clip(clip, {**base, "framing_offset": 0.2}, self._words())
+        assert out["framing_offset"] == 0.2
+        # clamped to the supported range
+        out = rebuild_clip(clip, {**base, "framing_offset": 5.0}, self._words())
+        assert out["framing_offset"] == 0.4
+
+    def test_framing_offset_zero_not_stored(self):
+        clip = make_clip(segments=[(1.0, 9.0)])
+        clip["framing_offset"] = 0.3  # a prior reframe
+        edit = {"clip_id": "EX01", "title": "T", "title_card_seconds": 4.5,
+                "segments": [{"source_in": 1.0, "source_out": 9.0}], "framing_offset": 0.0}
+        out = rebuild_clip(clip, edit, self._words())
+        assert "framing_offset" not in out  # recentering clears the override
+
     def test_empty_title_rejected(self):
         clip = make_clip()
         edit = {"clip_id": "EX01", "title": "  ", "title_card_seconds": 4.5,
