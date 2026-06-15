@@ -53,8 +53,10 @@
   .iss .fix { color:#555; font-size:.8rem; margin-left:.2rem; }
   .rework-row { display:flex; gap:.5rem; align-items:center; margin-top:.5rem; flex-wrap:wrap; }
   .rework-row .rwinstr { flex:1; min-width:18rem; font:inherit; font-size:.85rem; padding:.3rem .5rem; border:1px solid #ccc; border-radius:5px; }
-  .rework-row .rwbtn { border:1px solid #3a5bd9; color:#3a5bd9; background:#fff; border-radius:5px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; white-space:nowrap; }
-  .rework-row .rwbtn:disabled { opacity:.4; cursor:default; border-color:#bbb; color:#999; }
+  .rework-row .rwbtn, .rework-row .capbtn { border:1px solid #3a5bd9; color:#3a5bd9; background:#fff; border-radius:5px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; white-space:nowrap; }
+  .rework-row .rwbtn:disabled, .rework-row .capbtn:disabled { opacity:.4; cursor:default; border-color:#bbb; color:#999; }
+  .capstatus button { font:inherit; font-size:.78rem; padding:.1rem .5rem; margin-left:.2rem; border-radius:4px; cursor:pointer; border:1px solid #ccc; background:#fff; }
+  .capstatus button.cfm-yes { border-color:#3a5bd9; color:#3a5bd9; }
   .framing { display:flex; align-items:center; gap:.4rem; margin-top:.4rem; }
   .framing input[type=range] { flex:1; max-width:130px; }
   .framing button { border:1px solid #ccc; background:#fff; border-radius:4px; cursor:pointer; padding:0 .45rem; line-height:1.6; }
@@ -179,7 +181,7 @@ function renderWords(div,c){
   t.innerHTML=html||'<span class="hint">no transcript words here</span>';
   t.querySelectorAll('.w').forEach(sp=>{
     sp.onclick=()=>{ const i=+sp.dataset.i; if(c.inSet.has(i)) c.inSet.delete(i); else c.inSet.add(i);
-      sp.className='w '+(c.inSet.has(i)?'in':'out'); updateSegInfo(div,c); };
+      sp.className='w '+(c.inSet.has(i)?'in':'out'); c.captions=null; updateSegInfo(div,c); };
   });
   const atStart=c.win[0]<=0, atEnd=c.win[1]>=CURRENT.tend;
   div.querySelector('.earlier').disabled=atStart;
@@ -216,6 +218,10 @@ function renderClip(c,idx){
       <input class="rwinstr" placeholder="tell the AI how to change this cut — e.g. 'tighten the middle', 'start at the question', 'cut the aside about Wagner'">
       <button class="rwbtn">rework with AI</button>
       <span class="hint rwstatus"></span>
+    </div>
+    <div class="rework-row cap-row">
+      <button class="capbtn" title="Fix ASR errors, stutters, and punctuation — faithfully">fix captions with AI</button>
+      <span class="hint capstatus"></span>
     </div>
     <textarea class="notes" placeholder="Notes for a rework pass (optional)…"></textarea>
     <div class="row">
@@ -264,6 +270,10 @@ function renderClip(c,idx){
     div.querySelector('.rwinstr').disabled=true; }
   rw.onclick=()=>reworkClip(div,c);
   div.querySelector('.rwinstr').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); reworkClip(div,c); } });
+  // AI caption cleanup — same key gate + cost guardrail
+  const cb=div.querySelector('.capbtn');
+  if(!AI){ cb.disabled=true; cb.title='Set OPENAI_API_KEY in .env to enable AI caption cleanup'; }
+  cb.onclick=()=>cleanupCaptions(div,c);
   updateSegInfo(div,c);
   return div;
 }
@@ -305,6 +315,13 @@ function currentCaptions(c){
   flush(); return caps;
 }
 
+// Cleaned (AI) captions when present, else the live transcript-derived ones.
+// Cleaned captions are cleared whenever the word selection changes (see
+// renderWords / applySegments) so they never drift out of sync with the cut.
+function activeCaptions(c){
+  return (c.captions && c.captions.length) ? c.captions : currentCaptions(c);
+}
+
 // A transport over the CUT timeline (not the source): playback is clamped to
 // the selected segments so it can never run into the rest of the video, with
 // play/pause, restart, and a clickable cut progress bar.
@@ -312,7 +329,7 @@ function setupPreview(div,c){
   const v=div.querySelector('.pv'), cap=div.querySelector('.cap'), clk=div.querySelector('.pvclock');
   const playBtn=div.querySelector('.tplay'), pfill=div.querySelector('.pfill'), pbar=div.querySelector('.pbar');
   let segs=[], before=[], total=0, caps=[], i=0, finished=false;
-  const rebuild=()=>{ segs=currentSegments(c); before=[]; let acc=0; for(const s of segs){before.push(acc);acc+=s.source_out-s.source_in;} total=acc; caps=currentCaptions(c); };
+  const rebuild=()=>{ segs=currentSegments(c); before=[]; let acc=0; for(const s of segs){before.push(acc);acc+=s.source_out-s.source_in;} total=acc; caps=activeCaptions(c); };
   const ensureSrc=()=>{ if(CURRENT.source_url && v.src!==location.origin+CURRENT.source_url) v.src=CURRENT.source_url; };
   const showAt=(t,cut)=>{ const line=caps.find(x=>x.source_start<=t&&t<=x.source_end); cap.textContent=line?line.text:''; clk.textContent=`source ${fmt1(t)} · cut ${fmt1(cut)} / ${fmt1(total)}`; pfill.style.width=(100*cut/Math.max(total,0.01))+'%'; };
   function seekCut(t){ if(!segs.length) return; t=Math.max(0,Math.min(t,total-0.01)); let idx=0; while(idx<segs.length-1 && t>=before[idx]+(segs[idx].source_out-segs[idx].source_in)) idx++; i=idx; finished=false; v.currentTime=segs[idx].source_in+(t-before[idx]); showAt(v.currentTime,t); }
@@ -337,6 +354,7 @@ function setupPreview(div,c){
 }
 
 function applySegments(c, segs){
+  c.captions=null;  // selection changed — cleaned captions would drift, revert to auto
   c.inSet=new Set();
   for(let i=0;i<CURRENT.W.length;i++){
     const w=CURRENT.W[i];
@@ -394,14 +412,52 @@ async function doRework(div,c,instr){
   finally{ btn.disabled=false; }
 }
 
+// Caption cleanup cost ≈ input (caption text + overhead) + output (one cleaned
+// line per input, so output ~ input text). Lean high.
+function estimateCaptionUsd(c){
+  const n=inWords(c).length; if(!n) return 0;
+  const inTok=n*1.6+400, outTok=n*1.6+200;
+  return inTok/1e6*5 + outTok/1e6*30;
+}
+
+function cleanupCaptions(div,c){
+  if(!AI) return;
+  const status=div.querySelector('.capstatus');
+  if(!inWords(c).length){ status.textContent='Select some words first so there are captions to clean.'; return; }
+  status.innerHTML=`Live AI call, ~${fmtUsdEst(estimateCaptionUsd(c))} est. — <button class="cfm-yes">Confirm</button> <button class="cfm-no">Cancel</button>`;
+  status.querySelector('.cfm-yes').onclick=()=>doCleanup(div,c);
+  status.querySelector('.cfm-no').onclick=()=>{ status.textContent='Cancelled — no call made.'; };
+}
+
+async function doCleanup(div,c){
+  const status=div.querySelector('.capstatus');
+  const btn=div.querySelector('.capbtn'); btn.disabled=true; status.textContent='Cleaning captions…';
+  try{
+    const res=await fetch('/api/caption-cleanup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, segments:currentSegments(c)})});
+    const d=await res.json();
+    if(d.error){ status.textContent='Error: '+d.error; return; }
+    c.captions=(d.captions||[]).map(x=>({source_start:x.source_start, source_end:x.source_end, text:x.text}));
+    const k=d.cost||{};
+    const costStr = k.estimated_usd!=null
+      ? ` · cost ${fmtUsd(k.estimated_usd)} (${(k.input_tokens||0).toLocaleString()} in / ${(k.output_tokens||0).toLocaleString()} out)`
+      : '';
+    status.innerHTML=`Captions cleaned ✓ — ${d.changed||0} line(s) changed${d.summary?(' · '+esc(d.summary)):''}${costStr} <button class="cfm-no">revert to verbatim</button>`;
+    status.querySelector('.cfm-no').onclick=()=>{ c.captions=null; status.textContent='Reverted to verbatim captions.'; };
+  }catch(e){ status.textContent='Error: '+e; }
+  finally{ btn.disabled=false; }
+}
+
 function clipPayload(c){
-  // Omit captions: in transcript-first editing captions are the kept words, so
-  // the backend regenerates them from the transcript for the current segments
-  // (newly-included dialogue gets captioned automatically).
-  return {clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
-          title_card_seconds:c.title_card_seconds, notes:c.notes||'',
-          framing_offset:+c.framing||0,
-          segments: c.decision==='drop'?[]:currentSegments(c)};
+  // Captions are normally regenerated server-side from the kept words. We only
+  // send them when AI cleanup has produced human-edited caption text, which the
+  // backend then locks in (human_edited_captions) so it actually renders.
+  const p={clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
+           title_card_seconds:c.title_card_seconds, notes:c.notes||'',
+           framing_offset:+c.framing||0,
+           segments: c.decision==='drop'?[]:currentSegments(c)};
+  if(c.captions && c.captions.length && c.decision!=='drop') p.captions=c.captions;
+  return p;
 }
 
 async function renderClipNow(div,c){

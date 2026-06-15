@@ -157,6 +157,32 @@ when the subject-crop detector mis-centers the speaker.
 - **Preview honesty.** The in-browser cut preview shifts `object-position-x` to
   approximate the reframe direction, with a "preview approximate — render to
   confirm framing" cue; the real crop is verified via "render this clip".
-- NOT built yet: **AI auto-center** (a vision pass that sets the offset for
-  off-center subjects) and the **AI cost guardrail** (confirm-before-call +
-  actual-cost readout) that will wrap every billable editor call.
+## AI cost guardrail (built — 2026-06-14)
+
+Every billable editor call now confirms before spending and reports the real
+charge (mirrors the pipeline's `--approve-api-cost`). Clicking an AI action
+shows an inline confirm with a conservative pre-call estimate (never
+`window.confirm` — it blocks the Chrome extension); on confirm the result lands
+and the status shows the actual cost from the response usage
+(`response_cost` → `actual_cost`, priced from `REVIEW_REWORK_*_USD_PER_MILLION`
+in `.env`, default gpt-5.5 5.00/0.50/30.00). Verified live: rework reported
+`$0.0474 (6,404 in / 513 out)`.
+
+## Faithful caption cleanup (built — 2026-06-15)
+
+The captions are verbatim ASR, so they carry mis-transcriptions, false-start
+stutters, and bad punctuation — tedious to fix by hand and not otherwise
+editable in the UI. "fix captions with AI" sends the current cut's caption lines
+(built server-side with the same `chunk_captions` the save path uses) to a
+constrained model pass that fixes ONLY errors/stutters/punctuation and stays
+faithful (no paraphrase, reorder, or content change), one cleaned line per
+input, timing preserved. Cost-guarded like rework; shows lines-changed + a
+one-sentence summary + cost, with a "revert to verbatim" link. Cleaned text is
+sent in `clipPayload.captions` only when present, so `rebuild_clip` locks it in
+as `human_edited_captions` and it actually renders (the F1 path). Changing the
+word selection clears cleaned captions (they'd drift). Verified live: a
+"It, it, it recognizes…" stutter → "It recognizes…", all other lines untouched,
+`$0.0051`, persisted with `human_edited_captions: true`.
+
+- NOT built yet: **AI auto-center framing** (a vision pass that sets the
+  Phase-1 framing offset for off-center subjects).

@@ -15,11 +15,13 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from extractor.edit_list import (
     apply_edits,
+    chunk_captions,
     clip_segments,
     export_captions,
     read_json,
     render_manifest_clip,
     title_card_seconds,
+    words_in_range,
     write_json,
 )
 from extractor.render_plan import transcript_words_from_data
@@ -181,6 +183,76 @@ def rework_clip(
         if i in kept:
             new_in.update(w["gi"] for w in s)
     return new_in, str(out.get("note", "")).strip(), response_cost(resp)
+
+
+CAPTION_CLEANUP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["captions", "summary"],
+    "properties": {
+        "captions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["i", "text"],
+                "properties": {"i": {"type": "integer"}, "text": {"type": "string"}},
+            },
+        },
+        "summary": {"type": "string"},
+    },
+}
+
+
+def cleanup_captions(
+    chunks: list[dict[str, Any]], instruction: str = ""
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    """Faithfully clean auto-generated (ASR) caption lines.
+
+    `chunks` are source-anchored verbatim caption lines ({source_start,
+    source_end, text}). The model fixes transcription errors, stutters, and
+    punctuation WITHOUT paraphrasing, returning one cleaned line per index.
+    Timing is preserved (only the text changes). Returns cleaned chunks, a
+    one-sentence summary of the fixes, and the call's actual cost.
+    """
+    from openai import OpenAI
+    from extractor.openai_responses import create_response_streaming
+
+    lines = [f"[{i}] {c['text']}" for i, c in enumerate(chunks)]
+    developer = (
+        "You are cleaning up auto-generated (speech-to-text) captions for a short "
+        "video clip. The text is verbatim and may contain transcription errors, "
+        "false-start stutters (e.g. 'p- people', 'i-it'), missing or wrong "
+        "punctuation, and bad capitalization. Fix ONLY those: correct obvious "
+        "mis-transcriptions, remove stutters and false starts, and add natural "
+        "punctuation and capitalization. Stay FAITHFUL to what was said — do NOT "
+        "paraphrase, translate, summarize, reorder, or add or drop content words. "
+        "Keep each line's wording and length close to the original (it must still "
+        "match the spoken audio under it). Return exactly one cleaned line per "
+        "input index in `captions`, plus a one-sentence `summary` of the kinds of "
+        "fixes you made."
+    )
+    user = (f"Editor note: {instruction}\n\n" if instruction else "") + "Captions:\n" + "\n".join(lines)
+    client = OpenAI(timeout=float(os.environ.get("OPENAI_CLIENT_TIMEOUT_SECONDS", "600")))
+    resp = create_response_streaming(
+        client, label="caption-cleanup",
+        model=os.environ.get("REVIEW_CAPTION_MODEL") or os.environ.get("REVIEW_REWORK_MODEL") or "gpt-5.5",
+        input=[{"role": "developer", "content": developer},
+               {"role": "user", "content": user}],
+        reasoning={"effort": os.environ.get("REVIEW_CAPTION_EFFORT") or "low"},
+        max_output_tokens=int(os.environ.get("REVIEW_CAPTION_MAX_OUTPUT_TOKENS") or 6000),
+        store=False,
+        text={"format": {"type": "json_schema", "name": "caption_cleanup",
+                         "schema": CAPTION_CLEANUP_SCHEMA, "strict": True}},
+    )
+    out = json.loads(resp.output_text)
+    cleaned = {int(x["i"]): str(x.get("text", "")).strip() for x in out.get("captions", [])}
+    result = [
+        {"source_start": c["source_start"], "source_end": c["source_end"],
+         "text": cleaned.get(i) or c["text"]}
+        for i, c in enumerate(chunks)
+    ]
+    return result, str(out.get("summary", "")).strip(), response_cost(resp)
 
 
 def start_render_job(*, plan_path: Path, source: Path, transcript: Path | None,
@@ -526,6 +598,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._api_render()
             elif parsed.path == "/api/rework":
                 self._api_rework()
+            elif parsed.path == "/api/caption-cleanup":
+                self._api_caption_cleanup()
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
         except (BrokenPipeError, ConnectionResetError):
@@ -676,6 +750,44 @@ class ReviewHandler(BaseHTTPRequestHandler):
             "segments": [{"source_in": round(s["source_in"], 3), "source_out": round(s["source_out"], 3)}
                          for s in new_segs],
             "note": note,
+            "cost": cost,
+        })
+
+    def _api_caption_cleanup(self) -> None:
+        if not openai_available():
+            raise RuntimeError("Caption cleanup needs the openai package and OPENAI_API_KEY in .env.")
+        from urllib.parse import unquote
+        body = self._read_json_body()
+        segs = body.get("segments", []) or []
+        if not segs:
+            raise RuntimeError("Select some words first so there are captions to clean up.")
+        manifest_path = Path(unquote(str(body.get("project_id", ""))))
+        if not manifest_path.exists():
+            raise RuntimeError("That project could not be found.")
+        manifest = read_json(manifest_path)
+        transcript_path = manifest.get("transcript")
+        if not (transcript_path and Path(str(transcript_path)).exists()):
+            raise RuntimeError("The transcript for this project is missing.")
+        words = transcript_words_from_data(read_json(Path(str(transcript_path))))
+
+        # Build verbatim caption lines from the current cut, exactly as the save
+        # path seeds them, so cleaned text lines up with what would render.
+        segment_words: list[dict[str, Any]] = []
+        for s in segs:
+            segment_words.extend(words_in_range(words, float(s["source_in"]), float(s["source_out"])))
+        chunks = chunk_captions(segment_words)
+        if not chunks:
+            raise RuntimeError("No captions to clean up on the current cut.")
+        cleaned, summary, cost = cleanup_captions(chunks, str(body.get("instruction", "")).strip())
+        changed = sum(1 for a, b in zip(chunks, cleaned) if a["text"] != b["text"])
+        self._json({
+            "captions": [
+                {"source_start": round(c["source_start"], 3), "source_end": round(c["source_end"], 3),
+                 "text": c["text"], "was": chunks[i]["text"]}
+                for i, c in enumerate(cleaned)
+            ],
+            "changed": changed,
+            "summary": summary,
             "cost": cost,
         })
 

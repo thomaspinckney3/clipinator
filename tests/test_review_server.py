@@ -213,6 +213,17 @@ class TestReworkCost:
         assert rs.rework_pricing().output_usd_per_million == 60.0
 
 
+class TestCaptionCleanupSchema:
+    def test_strict_schema_required_covers_every_property(self):
+        # strict json_schema requires every property listed in `required`
+        s = rs.CAPTION_CLEANUP_SCHEMA
+        assert set(s["required"]) == set(s["properties"])
+        assert s["additionalProperties"] is False
+        item = s["properties"]["captions"]["items"]
+        assert set(item["required"]) == set(item["properties"])
+        assert item["additionalProperties"] is False
+
+
 class TestVideoUrl:
     def test_none(self):
         assert rs.video_url(None) is None
