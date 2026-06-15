@@ -33,8 +33,9 @@
   .pfill { height:100%; width:0; background:var(--accent); }
   .phone .cap { position:absolute; left:6%; right:6%; bottom:14%; text-align:center; color:#fff;
     font-weight:700; font-size:.8rem; text-shadow:0 1px 3px #000,0 0 6px #000; line-height:1.2; }
-  .transcript { line-height:2; font-size:.95rem; margin-top:.4rem; max-height:14rem; overflow-y:auto;
-    border:1px solid #eee; border-radius:6px; padding:.5rem .7rem; background:#fcfcfc; }
+  .transcript { line-height:2; font-size:.95rem; margin-top:.4rem; max-height:22rem; overflow-y:auto;
+    overscroll-behavior:contain; scroll-behavior:smooth;
+    border:1px solid #ddd; border-radius:6px; padding:.5rem .7rem; background:#fcfcfc; }
   .w { cursor:pointer; padding:0 1px; border-radius:3px; }
   .w.in { background:var(--in); } .w.in:hover { background:var(--in-h); }
   .w.out { color:#bbb; text-decoration:line-through; } .w.out:hover { color:#666; }
@@ -244,8 +245,11 @@ function renderClip(c,idx){
 
   // transcript window + expand controls
   renderWords(div,c);
-  div.querySelector('.earlier').onclick=()=>{ c.win[0]=Math.max(0,c.win[0]-30); renderWords(div,c); };
-  div.querySelector('.later').onclick=()=>{ c.win[1]=Math.min(CURRENT.tend,c.win[1]+30); renderWords(div,c); };
+  // Expanding the window re-renders the transcript (resetting its scroll), so
+  // scroll to the side that grew — otherwise the new words land off-screen and
+  // the button looks like it did nothing.
+  div.querySelector('.earlier').onclick=()=>{ c.win[0]=Math.max(0,c.win[0]-30); renderWords(div,c); div.querySelector('.transcript').scrollTop=0; };
+  div.querySelector('.later').onclick=()=>{ c.win[1]=Math.min(CURRENT.tend,c.win[1]+30); renderWords(div,c); const t=div.querySelector('.transcript'); t.scrollTop=t.scrollHeight; };
   // keep/drop + rework
   const keep=div.querySelector('.keep'), rework=div.querySelector('.rework');
   keep.onchange=()=>{ c.decision=keep.checked?(rework.checked?'rework':'keep'):'drop'; div.classList.toggle('dropped',!keep.checked); if(!keep.checked) rework.checked=false; };
