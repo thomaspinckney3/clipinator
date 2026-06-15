@@ -60,6 +60,8 @@
   .framing button { border:1px solid #ccc; background:#fff; border-radius:4px; cursor:pointer; padding:0 .45rem; line-height:1.6; }
   .framing .fr-val { min-width:4.5rem; }
   .fr-note { font-size:.74rem; color:#9a9a9a; margin-top:.1rem; }
+  .rwstatus button { font:inherit; font-size:.78rem; padding:.1rem .5rem; margin-left:.2rem; border-radius:4px; cursor:pointer; border:1px solid #ccc; background:#fff; }
+  .rwstatus button.cfm-yes { border-color:#3a5bd9; color:#3a5bd9; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
   .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
@@ -342,17 +344,40 @@ function applySegments(c, segs){
   }
 }
 
-async function reworkClip(div,c){
+// Rough pre-call estimate, mirroring the server's neighborhood (words within
+// ±45s of the current segments) so the confirm shows a realistic ballpark. The
+// real charge is reported from the response after the call.
+function estimateReworkUsd(c){
+  const segs=currentSegments(c); if(!segs.length) return 0;
+  const lo=Math.min(...segs.map(s=>s.source_in))-45, hi=Math.max(...segs.map(s=>s.source_out))+45;
+  let n=0; for(const w of CURRENT.W){ if(w.end>=lo && w.start<=hi) n++; }
+  // ~1.8 tok/word covers the numbered-sentence scaffolding (indices+timestamps);
+  // lean slightly high so the estimate is a ceiling, not a floor.
+  return (n*1.8+600)/1e6*5 + 600/1e6*30;
+}
+const fmtUsdEst=x=> x<0.01 ? '<$0.01' : '$'+x.toFixed(2);
+const fmtUsd=x=> '$'+(+x).toFixed(4);
+
+// Confirm before spending: AI rework is a live billable call, so gate it behind
+// an inline confirmation (never window.confirm — that blocks the extension).
+function reworkClip(div,c){
   if(!AI) return;
   const instr=div.querySelector('.rwinstr').value.trim();
   const status=div.querySelector('.rwstatus');
   if(!instr){ status.textContent='Type an instruction first.'; return; }
   const segs=currentSegments(c);
   if(!segs.length){ status.textContent='Select some words first so the AI has a starting cut.'; return; }
+  status.innerHTML=`Live AI call, ~${fmtUsdEst(estimateReworkUsd(c))} est. — <button class="cfm-yes">Confirm</button> <button class="cfm-no">Cancel</button>`;
+  status.querySelector('.cfm-yes').onclick=()=>doRework(div,c,instr);
+  status.querySelector('.cfm-no').onclick=()=>{ status.textContent='Cancelled — no call made.'; };
+}
+
+async function doRework(div,c,instr){
+  const status=div.querySelector('.rwstatus');
   const btn=div.querySelector('.rwbtn'); btn.disabled=true; status.textContent='Asking the AI…';
   try{
     const res=await fetch('/api/rework',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, instruction:instr, segments:segs})});
+      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, instruction:instr, segments:currentSegments(c)})});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; return; }
     if(!d.segments||!d.segments.length){ status.textContent='AI returned an empty cut — left unchanged.'; return; }
@@ -360,7 +385,11 @@ async function reworkClip(div,c){
     c.win=[Math.max(0,Math.min(...d.segments.map(s=>s.source_in))-4),
            Math.min(CURRENT.tend, Math.max(...d.segments.map(s=>s.source_out))+4)];
     renderWords(div,c); updateSegInfo(div,c);
-    status.textContent='AI updated the cut ✓ — review and tweak'+(d.note?(' · '+d.note):'');
+    const k=d.cost||{};
+    const costStr = k.estimated_usd!=null
+      ? ` · cost ${fmtUsd(k.estimated_usd)} (${(k.input_tokens||0).toLocaleString()} in / ${(k.output_tokens||0).toLocaleString()} out)`
+      : '';
+    status.textContent='AI updated the cut ✓ — review and tweak'+(d.note?(' · '+d.note):'')+costStr;
   }catch(e){ status.textContent='Error: '+e; }
   finally{ btn.disabled=false; }
 }

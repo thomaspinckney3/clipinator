@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from extractor import review_server as rs
 
 from conftest import make_plan, make_clip, make_transcript
@@ -190,6 +192,25 @@ class TestBuildSentences:
         words = [{"gi": 0, "text": "no", "start": 0, "end": 1},
                  {"gi": 1, "text": "period", "start": 1, "end": 2}]
         assert len(rs.build_sentences(words)) == 1
+
+
+class TestReworkCost:
+    class _Resp:
+        def model_dump(self, mode="json"):
+            return {"usage": {"input_tokens": 1000, "output_tokens": 200,
+                              "input_tokens_details": {"cached_tokens": 100}}}
+
+    def test_response_cost_from_usage(self):
+        cost = rs.response_cost(self._Resp())
+        assert cost["input_tokens"] == 1000
+        assert cost["cached_input_tokens"] == 100
+        assert cost["output_tokens"] == 200
+        # default gpt-5.5 pricing: 900 full in @5 + 100 cached @0.5 + 200 out @30
+        assert cost["estimated_usd"] == pytest.approx((900*5 + 100*0.5 + 200*30) / 1e6)
+
+    def test_pricing_env_override(self, monkeypatch):
+        monkeypatch.setenv("REVIEW_REWORK_OUTPUT_USD_PER_MILLION", "60.00")
+        assert rs.rework_pricing().output_usd_per_million == 60.0
 
 
 class TestVideoUrl:

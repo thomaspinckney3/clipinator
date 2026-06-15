@@ -100,13 +100,44 @@ def build_sentences(neigh: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return sents
 
 
-def rework_clip(neigh: list[dict[str, Any]], in_idx: set[int], instruction: str) -> tuple[set[int], str]:
+def rework_pricing():
+    """Pricing for the editor's AI calls, read from .env (gpt-5.5 convention).
+
+    Mirrors the per-stage *_USD_PER_MILLION vars; defaults to the project's
+    standard gpt-5.5 numbers so a fresh checkout still reports a cost.
+    """
+    from extractor.openai_strategy import Pricing
+
+    def num(key: str, default: float) -> float:
+        try:
+            return float(os.environ.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+
+    return Pricing(
+        input_usd_per_million=num("REVIEW_REWORK_INPUT_USD_PER_MILLION", 5.00),
+        cached_input_usd_per_million=num("REVIEW_REWORK_CACHED_INPUT_USD_PER_MILLION", 0.50),
+        output_usd_per_million=num("REVIEW_REWORK_OUTPUT_USD_PER_MILLION", 30.00),
+    )
+
+
+def response_cost(resp) -> dict[str, Any]:
+    """Actual token usage + USD for a finished Responses call."""
+    from extractor.openai_strategy import actual_cost, usage_dict
+
+    response_dict = resp.model_dump(mode="json") if hasattr(resp, "model_dump") else {}
+    return actual_cost(usage_dict(response_dict), rework_pricing())
+
+
+def rework_clip(
+    neigh: list[dict[str, Any]], in_idx: set[int], instruction: str
+) -> tuple[set[int], str, dict[str, Any]]:
     """Ask the model to re-select sentences per the editor's instruction.
 
     `neigh` is the clip neighborhood (words with global index `gi`, text, start,
     end); `in_idx` is the currently-included global indices. Returns the new set
-    of included global indices plus a short note. Lazy-imports openai so the core
-    server has no third-party dependency.
+    of included global indices, a short note, and the call's actual cost. Lazy-
+    imports openai so the core server has no third-party dependency.
     """
     from openai import OpenAI
     from extractor.openai_responses import create_response_streaming
@@ -149,7 +180,7 @@ def rework_clip(neigh: list[dict[str, Any]], in_idx: set[int], instruction: str)
     for i, s in enumerate(sents):
         if i in kept:
             new_in.update(w["gi"] for w in s)
-    return new_in, str(out.get("note", "")).strip()
+    return new_in, str(out.get("note", "")).strip(), response_cost(resp)
 
 
 def start_render_job(*, plan_path: Path, source: Path, transcript: Path | None,
@@ -625,7 +656,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         ]
         in_idx = {n["gi"] for n in neigh
                   if any(s["source_in"] - 1e-6 <= n["start"] <= s["source_out"] + 1e-6 for s in segs)}
-        new_in, note = rework_clip(neigh, in_idx, instruction)
+        new_in, note, cost = rework_clip(neigh, in_idx, instruction)
 
         new_segs: list[dict[str, float]] = []
         run = None
@@ -645,6 +676,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             "segments": [{"source_in": round(s["source_in"], 3), "source_out": round(s["source_out"], 3)}
                          for s in new_segs],
             "note": note,
+            "cost": cost,
         })
 
     def _api_render_status(self, job_id: str) -> None:
