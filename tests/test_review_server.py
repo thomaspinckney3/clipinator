@@ -162,23 +162,6 @@ class TestRunRoot:
         assert rs.run_root_of(mp) == tmp_path / "MyRun"
 
 
-class TestCritique:
-    def test_compact_and_match(self, tmp_path):
-        review = {"clip_id": "EX01", "verdict": "major_revision", "score_0_to_100": 66,
-                  "one_sentence_assessment": "x",
-                  "issues": [{"category": "mid_sentence", "severity": "high",
-                              "why_it_matters": "starts mid-sentence", "suggested_fix": "extend"}]}
-        reviews = {"EX01": review}
-        # exact match
-        c = rs.compact_critique(rs.clip_critique(reviews, "EX01"))
-        assert c["verdict"] == "major_revision" and c["score"] == 66
-        assert c["issues"][0]["why"] == "starts mid-sentence"
-        # prefix match (final clip carries a revise suffix)
-        assert rs.clip_critique(reviews, "EX01_R2") is review
-        assert rs.clip_critique(reviews, "ZZ") is None
-        assert rs.compact_critique(None) is None
-
-
 class TestBuildSentences:
     def test_splits_on_terminal_punctuation(self):
         words = [{"gi": i, "text": t, "start": i, "end": i + 0.5} for i, t in

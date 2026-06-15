@@ -445,59 +445,8 @@ def clip_words(words: list[dict[str, Any]], segments: list[dict[str, Any]], pad:
     return out
 
 
-def load_critique(run_root: Path) -> dict[str, dict[str, Any]]:
-    """Map clip_id -> critique review from the run's critique-output.json, if any.
-
-    Surfaces the AI's existing per-clip review (verdict + issues) so the editor
-    can see what the model flagged. No API call.
-    """
-    reviews: dict[str, dict[str, Any]] = {}
-    runs = run_root / "openai-runs"
-    if not runs.is_dir():
-        return reviews
-    for cand in sorted(runs.glob("*critique*/critique-output.json")):
-        try:
-            data = read_json(cand)
-        except (OSError, json.JSONDecodeError):
-            continue
-        for r in data.get("clip_reviews", []) or []:
-            cid = str(r.get("clip_id") or "")
-            if cid:
-                reviews.setdefault(cid, r)
-        break  # first critique run is enough
-    return reviews
-
-
-def clip_critique(reviews: dict[str, dict[str, Any]], clip_id: str) -> dict[str, Any] | None:
-    """Match a clip to its review by exact id, else by prefix (final clips carry
-    a revise suffix like '_R2' over the draft critique's clip_id)."""
-    if clip_id in reviews:
-        return reviews[clip_id]
-    for cid, r in reviews.items():
-        if clip_id.startswith(cid) or cid.startswith(clip_id):
-            return r
-    return None
-
-
-def compact_critique(review: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not review:
-        return None
-    return {
-        "verdict": review.get("verdict"),
-        "score": review.get("score_0_to_100"),
-        "assessment": review.get("one_sentence_assessment"),
-        "issues": [
-            {"category": i.get("category"), "severity": i.get("severity"),
-             "why": i.get("why_it_matters") or i.get("evidence"),
-             "fix": i.get("suggested_fix")}
-            for i in (review.get("issues") or [])
-        ],
-    }
-
-
 def project_detail(manifest_path: Path) -> dict[str, Any]:
     manifest = read_json(manifest_path)
-    reviews = load_critique(run_root_of(manifest_path))
     source = manifest.get("source_video")
     plan_path = manifest.get("stage3_output")  # legacy key retained in manifests
     transcript_path = manifest.get("transcript")
@@ -525,7 +474,6 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
             "framing_offset": float(clip.get("framing_offset") or 0.0),
             "preview_url": video_url(preview) if preview and Path(str(preview)).exists() else None,
             "uses_assets": has_assets,
-            "critique": compact_critique(clip_critique(reviews, clip_id)),
         })
     return {
         "id": project_id(manifest_path),

@@ -128,10 +128,10 @@ reasoning + conversational rework.
 
 ## AI integration (built — 2026-06-13)
 
-- **A — critique surfaced inline (no key):** each clip card shows the run's
-  existing critique (verdict, score, one-sentence assessment, issues with
-  severity + suggested fix). Matched by clip_id, prefix-fallback for final
-  clips' `_R2` suffix. Read-only.
+- **A — critique surfaced inline (no key): REMOVED 2026-06-15** at the editor's
+  request. The inline AI-review block (verdict/score/assessment/issues) and its
+  backend plumbing (`load_critique`/`clip_critique`/`compact_critique`) were
+  taken out; the clip card no longer shows the run's critique.
 - **B — conversational rework (needs OPENAI_API_KEY):** per-clip instruction box
   → focused Responses call (numbered sentences of the clip neighborhood + current
   in/out) returns sentences to keep → applied to the word in-set; cut + captions
