@@ -26,8 +26,9 @@
   video { width:100%; max-width:300px; background:#000; border-radius:4px; }
   .phone { aspect-ratio:9/16; max-width:220px; background:#000; border-radius:10px; overflow:hidden; position:relative; }
   .phone video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; max-width:none; }
-  .transport { display:flex; align-items:center; gap:.5rem; max-width:220px; margin-top:.4rem; }
-  .transport button { border:1px solid #bbb; background:#fff; border-radius:5px; padding:.2rem .5rem; cursor:pointer; font-size:.8rem; }
+  .transport { display:flex; align-items:center; gap:.35rem; max-width:288px; margin-top:.4rem; }
+  .transport button { border:1px solid #bbb; background:#fff; border-radius:5px; padding:.2rem .4rem; cursor:pointer; font-size:.8rem; white-space:nowrap; }
+  .transport .trestart { padding:.2rem .35rem; }
   .pbar { flex:1; height:8px; background:#e4e4e4; border-radius:5px; cursor:pointer; overflow:hidden; }
   .pfill { height:100%; width:0; background:var(--accent); }
   .phone .cap { position:absolute; left:6%; right:6%; bottom:14%; text-align:center; color:#fff;
@@ -227,8 +228,8 @@ function renderClip(c,idx){
     <div class="row">
       <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
       <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div>
-        <div class="phone"><video class="pv" playsinline></video><div class="cap"></div></div>
-        <div class="transport"><button class="tplay" title="play/pause">▶</button><button class="trestart" title="back to clip start">⏮ start</button><div class="pbar"><div class="pfill"></div></div></div>
+        <div class="phone"><video class="pv" playsinline preload="metadata"></video><div class="cap"></div></div>
+        <div class="transport"><button class="tplay" title="play/pause">▶</button><button class="trestart" title="back to clip start">⏮ start</button><button class="tstepb" title="back one frame">◀ǀ</button><button class="tstepf" title="forward one frame">ǀ▶</button><div class="pbar"><div class="pfill"></div></div></div>
         <div class="clock pvclock hint">source —:— · cut —:—</div>
         <div class="framing">
           <span class="hint">Framing</span>
@@ -237,7 +238,7 @@ function renderClip(c,idx){
           <button class="fr-right" title="shift crop right">▶</button>
           <span class="hint fr-val">centered</span>
         </div>
-        <div class="hint fr-note">preview approximate — render to confirm framing</div>
+        <div class="hint fr-note">tip: pause or step (◀ǀ ǀ▶) to a frame, then adjust · preview approximate — render to confirm</div>
       </div>
     </div>`;
 
@@ -256,9 +257,10 @@ function renderClip(c,idx){
   setupPreview(div,c);
   // framing: horizontal crop nudge (biases the renderer's subject-crop center)
   const fs=div.querySelector('.fr-slider'); fs.value=c.framing;
-  fs.oninput=()=>{ c.framing=+fs.value; applyFraming(div,c); };
-  div.querySelector('.fr-left').onclick=()=>{ c.framing=Math.max(-0.4,+(c.framing-0.05).toFixed(2)); applyFraming(div,c); };
-  div.querySelector('.fr-right').onclick=()=>{ c.framing=Math.min(0.4,+(c.framing+0.05).toFixed(2)); applyFraming(div,c); };
+  const nudge=v=>{ c._pausePreview&&c._pausePreview(); c.framing=v; applyFraming(div,c); };
+  fs.oninput=()=>nudge(+fs.value);
+  div.querySelector('.fr-left').onclick=()=>nudge(Math.max(-0.4,+(c.framing-0.05).toFixed(2)));
+  div.querySelector('.fr-right').onclick=()=>nudge(Math.min(0.4,+(c.framing+0.05).toFixed(2)));
   applyFraming(div,c);
   // render this clip for real (ffmpeg) — gated on availability
   const rb=div.querySelector('.render');
@@ -347,10 +349,20 @@ function setupPreview(div,c){
     }
     showAt(v.currentTime, before[i]+(v.currentTime-s.source_in));
   };
+  // Land on a still without playing: ensure the source is loaded + the cut is
+  // built, then pause so framing can be judged frame-by-frame.
+  const curCut=()=>{ const s=segs[i]; return s ? before[i]+(v.currentTime-s.source_in) : 0; };
+  const armStill=()=>{ ensureSrc(); if(!segs.length) rebuild(); v.pause(); };
+  const STEP=1/24;  // ~one frame
+  function step(delta){ armStill(); if(!segs.length) return; const cut = finished ? total : curCut(); finished=false; seekCut(cut+delta); }
   playBtn.onclick=toggle;
   div.querySelector('.trestart').onclick=start;
   div.querySelector('.preview').onclick=start;
-  pbar.onclick=e=>{ if(!segs.length) rebuild(); const r=pbar.getBoundingClientRect(); seekCut((e.clientX-r.left)/r.width*total); };
+  div.querySelector('.tstepb').onclick=()=>step(-STEP);
+  div.querySelector('.tstepf').onclick=()=>step(STEP);
+  pbar.onclick=e=>{ armStill(); const r=pbar.getBoundingClientRect(); seekCut((e.clientX-r.left)/r.width*total); };
+  // let the framing controls freeze the preview on the current frame
+  c._pausePreview=()=>{ if(!v.paused) v.pause(); };
 }
 
 function applySegments(c, segs){
