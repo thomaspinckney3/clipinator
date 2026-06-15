@@ -21,6 +21,7 @@ from extractor.edit_list import (
     read_json,
     render_manifest_clip,
     title_card_seconds,
+    title_card_text,
     words_in_range,
     write_json,
 )
@@ -518,6 +519,7 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
         clips.append({
             "clip_id": clip_id,
             "title": clip.get("concept_title", ""),
+            "title_card_text": title_card_text(clip),
             "title_card_seconds": card,
             "segments": [{"source_in": s["source_in"], "source_out": s["source_out"]} for s in segments],
             "framing_offset": float(clip.get("framing_offset") or 0.0),

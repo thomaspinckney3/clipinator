@@ -66,6 +66,8 @@
   .fr-note { font-size:.74rem; color:#9a9a9a; margin-top:.1rem; }
   .rwstatus button { font:inherit; font-size:.78rem; padding:.1rem .5rem; margin-left:.2rem; border-radius:4px; cursor:pointer; border:1px solid #ccc; background:#fff; }
   .rwstatus button.cfm-yes { border-color:#3a5bd9; color:#3a5bd9; }
+  .cardrow { display:flex; align-items:center; gap:.5rem; margin-top:.3rem; flex-wrap:wrap; }
+  .cardrow .cardtext { flex:1; min-width:14rem; font:inherit; font-size:.9rem; padding:.25rem .45rem; border:1px solid #ccc; border-radius:5px; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
   .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
@@ -122,6 +124,7 @@ async function loadProject(id){
   proj.clips.forEach(c=>{
     c.decision='keep';
     c.framing=+c.framing_offset||0;
+    c.cardText=c.title_card_text||'';
     c.inSet=new Set();
     for(let i=0;i<W.length;i++){
       if((c.segments||[]).some(s=>s.source_in-1e-6<=W[i].start && W[i].start<=s.source_out+1e-6)) c.inSet.add(i);
@@ -195,10 +198,13 @@ function renderClip(c,idx){
   const div=document.createElement('div'); div.className='clip'; div.dataset.idx=idx;
   div.innerHTML=`
     <div class="cliphead">
-      <input class="title" value="${esc(c.title||c.clip_id)}">
+      <input class="title" value="${esc(c.title||c.clip_id)}" title="headline title (clip name)">
       ${c.uses_assets?'<span class="badge">uses B-roll — render to confirm</span>':''}
     </div>
-    <div class="hint">${c.clip_id} · title card ${c.title_card_seconds.toFixed(1)}s</div>
+    <div class="cardrow"><label class="hint">title card text</label>
+      <input class="cardtext" value="${esc(c.cardText||'')}" placeholder="(uses the title)" title="text shown on the opening title card">
+      <span class="hint">· card ${c.title_card_seconds.toFixed(1)}s · ${c.clip_id}</span>
+    </div>
     ${critiqueHtml(c.critique)}
     <div class="ctrls">
       <label><input type="checkbox" class="keep" checked> keep</label>
@@ -256,6 +262,7 @@ function renderClip(c,idx){
   rework.onchange=()=>{ if(rework.checked && keep.checked) c.decision='rework'; };
   // title/notes
   div.querySelector('.title').oninput=e=>{ c.title=e.target.value; };
+  div.querySelector('.cardtext').oninput=e=>{ c.cardText=e.target.value; };
   div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
   // cut-confined transport (play/pause/restart/scrub within the clip)
   setupPreview(div,c);
@@ -469,6 +476,7 @@ function clipPayload(c){
   // send them when AI cleanup has produced human-edited caption text, which the
   // backend then locks in (human_edited_captions) so it actually renders.
   const p={clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
+           title_card_text:(c.cardText||'').trim(),
            title_card_seconds:c.title_card_seconds, notes:c.notes||'',
            framing_offset:+c.framing||0,
            segments: c.decision==='drop'?[]:currentSegments(c)};

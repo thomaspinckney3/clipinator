@@ -118,6 +118,19 @@ def title_card_seconds(clip: dict[str, Any]) -> float:
         return 0.0
 
 
+def title_card_text(clip: dict[str, Any]) -> str:
+    """The on-screen opening title-card text (defaults to the concept title)."""
+    for item in sorted_timeline(clip):
+        if is_title_card_item(item):
+            text = str(item.get("caption_or_overlay", "")).strip()
+            if text:
+                return text
+            break
+    hook = clip.get("opening_hook") or {}
+    text = str(hook.get("text", "")).strip()
+    return text or str(clip.get("concept_title", "")).strip()
+
+
 def render_offset_to_source(offset: float, card: float, segments: list[dict[str, Any]]) -> float | None:
     cursor = card
     for segment in segments:
@@ -656,6 +669,9 @@ def rebuild_clip(
     title = str(edit.get("title", clip.get("concept_title", ""))).strip()
     if not title:
         raise RuntimeError(f"{clip_id}: title must not be empty.")
+    # On-screen title-card text can differ from the headline title; default to
+    # the title so untouched clips render exactly as before.
+    card_text = str(edit.get("title_card_text", "")).strip() or title
     card = float(edit.get("title_card_seconds", title_card_seconds(clip)))
     if card < 0:
         raise RuntimeError(f"{clip_id}: title_card_seconds must be >= 0.")
@@ -691,7 +707,7 @@ def rebuild_clip(
                 "screen_time_end": round(card, 3),
                 "source_start": 0,
                 "source_end": 0,
-                "caption_or_overlay": title,
+                "caption_or_overlay": card_text,
             }
         )
         timeline.append(card_item)
@@ -761,7 +777,7 @@ def rebuild_clip(
     clip["concept_title"] = title
     clip["target_duration_seconds"] = total
     hook = dict(clip.get("opening_hook") or {})
-    hook["text"] = title
+    hook["text"] = card_text
     hook["duration_seconds"] = round(card, 3)
     clip["opening_hook"] = hook
     clip["timeline"] = timeline

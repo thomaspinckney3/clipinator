@@ -167,6 +167,25 @@ class TestRebuildClip:
         body = out["timeline"][-1]
         assert body["source_start"] == 2.0 and body["source_end"] == 6.0
 
+    def test_title_card_text_defaults_to_title(self):
+        clip = make_clip(segments=[(1.0, 9.0)])
+        edit = {"clip_id": "EX01", "title": "Headline", "title_card_seconds": 4.5,
+                "segments": [{"source_in": 1.0, "source_out": 9.0}]}
+        out = rebuild_clip(clip, edit, self._words())
+        card = next(i for i in out["timeline"] if i.get("source_start") == 0 and i.get("source_end") == 0)
+        assert card["caption_or_overlay"] == "Headline"
+        assert out["concept_title"] == "Headline"
+
+    def test_title_card_text_can_differ_from_title(self):
+        clip = make_clip(segments=[(1.0, 9.0)])
+        edit = {"clip_id": "EX01", "title": "Headline", "title_card_text": "On the card",
+                "title_card_seconds": 4.5, "segments": [{"source_in": 1.0, "source_out": 9.0}]}
+        out = rebuild_clip(clip, edit, self._words())
+        card = next(i for i in out["timeline"] if i.get("source_start") == 0 and i.get("source_end") == 0)
+        assert card["caption_or_overlay"] == "On the card"
+        assert out["opening_hook"]["text"] == "On the card"
+        assert out["concept_title"] == "Headline"  # headline title unaffected
+
     def test_framing_offset_persisted_and_clamped(self):
         clip = make_clip(segments=[(1.0, 9.0)])
         base = {"clip_id": "EX01", "title": "T", "title_card_seconds": 4.5,
