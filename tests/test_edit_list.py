@@ -7,6 +7,7 @@ import pytest
 from extractor import edit_list
 from extractor.edit_list import (
     MIN_SEGMENT_SECONDS,
+    apply_edits,
     build_caption_plan,
     chunk_captions,
     clip_segments,
@@ -218,6 +219,25 @@ class TestRebuildClip:
                 "segments": [{"source_in": 1.0, "source_out": 9.0}]}
         out = rebuild_clip(clip, edit, self._words())
         assert out["timeline"][-1]["edit_action"] == "SPECIAL B-ROLL CUE"
+
+
+# --- apply_edits with a partial overlay (per-clip save) ----------------------
+
+class TestApplyEditsSubset:
+    """Per-clip save sends one clip; the others must survive untouched."""
+
+    def test_partial_overlay_keeps_other_clips(self):
+        words = transcript_words_from_data(make_transcript(12.0))
+        plan = make_plan([make_clip("EX01", segments=[(1.0, 9.0)]),
+                          make_clip("EX02", segments=[(1.0, 9.0)])])
+        orig2 = plan["clip_ads"][1]["concept_title"]
+        edits = {"clips": [{"clip_id": "EX01", "title": "Only A", "title_card_seconds": 4.5,
+                            "segments": [{"source_in": 2.0, "source_out": 6.0}]}]}
+        out = apply_edits(plan, edits, words, 12.0, source="x")
+        ids = {c["clip_id"]: c for c in out["clip_ads"]}
+        assert set(ids) == {"EX01", "EX02"}
+        assert ids["EX01"]["concept_title"] == "Only A"
+        assert ids["EX02"]["concept_title"] == orig2  # untouched
 
 
 # --- path resolution / relink (F6) -------------------------------------------

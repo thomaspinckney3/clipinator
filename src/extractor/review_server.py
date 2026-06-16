@@ -492,6 +492,7 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
             "segments": [{"source_in": s["source_in"], "source_out": s["source_out"]} for s in segments],
             "framing_offset": float(clip.get("framing_offset") or 0.0),
             "preview_url": video_url(preview) if preview and Path(str(preview)).exists() else None,
+            "output_path": str(preview) if preview else None,
             "uses_assets": has_assets,
         })
     return {
@@ -620,7 +621,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
         plan_path = manifest.get("stage3_output")
         if not (plan_path and Path(str(plan_path)).exists()):
             raise RuntimeError("The plan for this project is missing.")
-        plan = read_json(Path(str(plan_path)))
         source = manifest.get("source_video")
         transcript_path = manifest.get("transcript")
         words = (
@@ -629,11 +629,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
         )
         duration = probe_duration(Path(str(source))) if source and Path(str(source)).exists() else None
 
+        out_dir = run_root_of(manifest_path) / "review" / manifest_path.parent.name
+        out_path = out_dir / "plan-output.human.json"
+        # Merge onto a prior human plan when one exists so a single-clip save
+        # keeps edits already saved for the other clips (apply_edits leaves
+        # clips absent from the overlay untouched); otherwise start from the
+        # original plan.
+        base_path = out_path if out_path.exists() else Path(str(plan_path))
+        plan = read_json(base_path)
         revised = apply_edits(plan, {"clips": body.get("clips", [])}, words, duration,
                               source="clipinator-review-editor")
-        out_dir = run_root_of(manifest_path) / "review" / manifest_path.parent.name
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "plan-output.human.json"
         write_json(out_path, revised)
         return {
             "revised": revised, "out_path": out_path, "out_dir": out_dir,

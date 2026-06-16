@@ -58,15 +58,15 @@
   .fr-note { font-size:.74rem; color:#9a9a9a; margin-top:.1rem; }
   .rwstatus button { font:inherit; font-size:.78rem; padding:.1rem .5rem; margin-left:.2rem; border-radius:4px; cursor:pointer; border:1px solid #ccc; background:#fff; }
   .rwstatus button.cfm-yes { border-color:#3a5bd9; color:#3a5bd9; }
+  .filepath { font-size:.72rem; color:#999; word-break:break-all; margin-top:.15rem; font-family:ui-monospace,Menlo,monospace; }
   .cardrow { display:flex; align-items:center; gap:.5rem; margin-top:.3rem; flex-wrap:wrap; }
   .cardrow .cardtext { flex:1; min-width:14rem; font:inherit; font-size:.9rem; padding:.25rem .45rem; border:1px solid #ccc; border-radius:5px; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
-  .savebar { position:fixed; bottom:0; left:17rem; right:0; background:#fff; border-top:1px solid #ddd;
-    padding:.6rem 1.4rem; display:flex; gap:1rem; align-items:center; }
-  button.save { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:.5rem 1.1rem; font-size:.9rem; cursor:pointer; }
+  .saverow { display:flex; gap:.7rem; align-items:center; margin-top:.8rem; padding-top:.7rem; border-top:1px solid #eee; }
+  button.saveclip { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:.45rem 1.1rem; font-size:.88rem; cursor:pointer; }
+  button.saveclip:disabled { opacity:.5; cursor:default; }
   button.preview { border:1px solid #bbb; background:#fff; border-radius:6px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; }
-  .status { font-size:.85rem; color:#444; }
   .empty { color:#777; padding:2rem; }
 </style>
 </head>
@@ -75,10 +75,6 @@
 <div class="layout">
   <div class="sidebar" id="sidebar"><div class="empty">Loading…</div></div>
   <main id="main"><div class="empty">Select a project on the left.</div></main>
-</div>
-<div class="savebar" id="savebar" style="display:none">
-  <button class="save" id="saveBtn">Save edits</button>
-  <span class="status" id="status"></span>
 </div>
 <script>
 let CURRENT = null;            // current project detail
@@ -141,8 +137,6 @@ async function loadProject(id){
   });
   main.innerHTML = `<h2>${proj.label}</h2><p class="hint">${proj.content_mode} · ${proj.clips.length} clips · ${proj.transcript_word_count} transcript words${proj.source_found?'':' · <b>source video not found</b>'}</p>`;
   proj.clips.forEach((c,i)=>main.appendChild(renderClip(c,i)));
-  document.getElementById('savebar').style.display='flex';
-  document.getElementById('status').textContent='';
 }
 
 const esc=s=>String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
@@ -188,6 +182,7 @@ function renderClip(c,idx){
       <input class="title" value="${esc(c.title||c.clip_id)}" title="headline title (clip name)">
       ${c.uses_assets?'<span class="badge">uses B-roll — render to confirm</span>':''}
     </div>
+    <div class="hint filepath" title="rendered clip file">${esc(c.output_path||'(not rendered yet)')}</div>
     <div class="cardrow"><label class="hint">title card text</label>
       <input class="cardtext" value="${esc(c.cardText||'')}" placeholder="(uses the title)" title="text shown on the opening title card">
       <span class="hint">· card ${c.title_card_seconds.toFixed(1)}s · ${c.clip_id}</span>
@@ -231,7 +226,8 @@ function renderClip(c,idx){
         </div>
         <div class="hint fr-note">tip: pause or step (◀ǀ ǀ▶) to a frame, then adjust · preview approximate — render to confirm</div>
       </div>
-    </div>`;
+    </div>
+    <div class="saverow"><button class="saveclip">Save this clip</button><span class="hint savestatus"></span></div>`;
 
   // transcript window + expand controls
   renderWords(div,c);
@@ -244,6 +240,7 @@ function renderClip(c,idx){
   div.querySelector('.title').oninput=e=>{ c.title=e.target.value; };
   div.querySelector('.cardtext').oninput=e=>{ c.cardText=e.target.value; };
   div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
+  div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
   // cut-confined transport (play/pause/restart/scrub within the clip)
   setupPreview(div,c);
   // framing: horizontal crop nudge (biases the renderer's subject-crop center)
@@ -470,7 +467,7 @@ async function renderClipNow(div,c){
   status.textContent='Saving + rendering… (about a minute)';
   try{
     const res=await fetch('/api/render',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, clips:CURRENT.clips.map(clipPayload)})});
+      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, clips:[clipPayload(c)]})});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; btn.disabled=false; return; }
     const poll=async()=>{
@@ -491,18 +488,21 @@ async function renderClipNow(div,c){
   }catch(e){ status.textContent='Error: '+e; btn.disabled=false; }
 }
 
-async function save(){
+// Per-clip save: send only this clip's edits. The server merges them onto the
+// existing human plan, so other clips' saved edits are preserved.
+async function saveClip(div,c){
   if(!CURRENT) return;
-  const status=document.getElementById('status'); status.textContent='Saving…';
+  const status=div.querySelector('.savestatus');
+  const btn=div.querySelector('.saveclip'); btn.disabled=true; status.textContent='Saving…';
   try{
     const res=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:CURRENT.id, clips:CURRENT.clips.map(clipPayload)})});
+      body:JSON.stringify({project_id:CURRENT.id, clips:[clipPayload(c)]})});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; return; }
-    status.textContent=`Saved ✓  ${d.kept} kept, ${d.dropped.length} dropped → ${d.output}`;
+    status.textContent='Saved ✓';
   }catch(e){ status.textContent='Error: '+e; }
+  finally{ btn.disabled=false; }
 }
-document.getElementById('saveBtn').onclick=save;
 loadProjects();
 </script>
 </body>
