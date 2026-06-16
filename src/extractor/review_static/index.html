@@ -6,9 +6,12 @@
 <style>
   :root { --in:#dff3dd; --in-h:#bfe6ba; --accent:#3a5bd9; }
   body { font-family:-apple-system,system-ui,sans-serif; margin:0; color:#1a1a1a; background:#f4f4f6; }
-  header { background:#1a1a2e; color:#fff; padding:.7rem 1.2rem; display:flex; align-items:baseline; gap:1rem; }
+  header { background:#1a1a2e; color:#fff; padding:.7rem 1.2rem; display:flex; align-items:center; gap:1rem; }
   header h1 { font-size:1.05rem; margin:0; }
-  header .lib { font-size:.78rem; opacity:.7; }
+  header .lib { font-size:.78rem; opacity:.7; margin-left:auto; }
+  header .tabs { display:flex; gap:.3rem; }
+  header .tab { background:transparent; color:#c9c9d6; border:1px solid #3a3a52; border-radius:6px; padding:.3rem .9rem; cursor:pointer; font-size:.85rem; }
+  header .tab.active { background:#fafafa; color:#1a1a2e; border-color:#fafafa; font-weight:600; }
   .layout { display:flex; height:calc(100vh - 52px); }
   .sidebar { width:17rem; overflow-y:auto; background:#fff; border-right:1px solid #ddd; }
   .proj { padding:.65rem 1rem; border-bottom:1px solid #eee; cursor:pointer; font-size:.88rem; }
@@ -70,7 +73,12 @@
 </style>
 </head>
 <body>
-<header><h1>Clipinator Review Editor</h1><div class="lib" id="lib"></div></header>
+<header><h1>Clipinator Review Editor</h1>
+  <div class="tabs">
+    <button class="tab active" data-mode="review">Review clips</button>
+    <button class="tab" data-mode="pick">Pick clips</button>
+  </div>
+  <div class="lib" id="lib"></div></header>
 <div class="layout">
   <div class="sidebar" id="sidebar"><div class="empty">Loading…</div></div>
   <main id="main"><div class="empty">Select a project on the left.</div></main>
@@ -79,6 +87,18 @@
 let CURRENT = null;            // current project detail
 let FFMPEG = false;            // whether ffmpeg is available for in-app render
 let AI = false;                // whether OPENAI key is available for AI rework
+let MODE = 'review';           // 'review' (adjust AI clips) or 'pick' (author from source)
+let ACTIVE_PID = null;         // selected project id (source + transcript)
+
+// Open the selected source in the active mode. Review = adjust the AI clips;
+// Pick = author a new clip from the full transcript.
+function openProject(id){ ACTIVE_PID = id; (MODE === 'pick' ? loadPickProject : loadProject)(id); }
+function setMode(m){
+  MODE = m;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.mode===m));
+  if(ACTIVE_PID) openProject(ACTIVE_PID);
+  else document.getElementById('main').innerHTML='<div class="empty">Select a source on the left.</div>';
+}
 const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
 const fmt1 = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}.${Math.floor((s%1)*10)}`;
 
@@ -107,7 +127,7 @@ function renderProjectList(){
     const el=document.createElement('div');
     el.className='proj'+(p.source_found?'':' missing')+(p.preferred?'':' altvar');
     el.innerHTML=`<div>${p.label}</div><div class="meta">${p.clip_count} clip(s)${p.source_found?'':' · source missing'}</div>`;
-    el.onclick=()=>{document.querySelectorAll('.proj').forEach(e=>e.classList.remove('active'));el.classList.add('active');loadProject(p.id);};
+    el.onclick=()=>{document.querySelectorAll('.proj').forEach(e=>e.classList.remove('active'));el.classList.add('active');openProject(p.id);};
     sb.appendChild(el);
   }
 }
@@ -136,6 +156,34 @@ async function loadProject(id){
   });
   main.innerHTML = `<h2>${proj.label}</h2><p class="hint">${proj.content_mode} · ${proj.clips.length} clips · ${proj.transcript_word_count} transcript words${proj.source_found?'':' · <b>source video not found</b>'}</p>`;
   proj.clips.forEach((c,i)=>main.appendChild(renderClip(c,i)));
+}
+
+// Pick mode: author a brand-new clip from the full source transcript. One blank
+// card with nothing selected; the user highlights words to build the clip, then
+// previews / exports metadata / renders it (synthesized server-side).
+async function loadPickProject(id){
+  const main=document.getElementById('main'); main.innerHTML='<div class="empty">Loading…</div>';
+  const proj = await (await fetch('/api/project?id='+encodeURIComponent(id))).json();
+  if(proj.error){ main.innerHTML=`<div class="empty">${proj.error}</div>`; return; }
+  CURRENT = proj;
+  const W = proj.transcript_words || []; CURRENT.W = W;
+  CURRENT.tend = W.length ? W[W.length-1].end : 0;
+  main.innerHTML = `<h2>${proj.label} — pick a clip</h2><p class="hint">Highlight words in the full transcript to build a new clip, then preview, export metadata, or render it.${proj.source_found?'':' · <b>source video not found</b>'}</p>`;
+  main.appendChild(renderClip(newPickClip(), 0));
+}
+
+function newPickClip(){
+  return {clip_id:'pick', _pick:true, title:'', title_card_text:'', cardText:'',
+          title_card_seconds:4.5, segments:[], framing_offset:0, framing:0, decision:'keep',
+          preview_url:null, output_path:null, uses_assets:false,
+          inSet:new Set(), win:[0, CURRENT.tend]};
+}
+
+function clearPick(div,c){
+  c.inSet=new Set(); c.win=[0, CURRENT.tend]; c.framing=0; c.captions=null; c.title=''; c.cardText='';
+  div.querySelector('.title').value=''; div.querySelector('.cardtext').value='';
+  renderWords(div,c); applyFraming(div,c); updateSegInfo(div,c);
+  div.querySelector('.savestatus').textContent=''; div.querySelector('.renderstatus').textContent='';
 }
 
 const esc=s=>String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
@@ -178,7 +226,7 @@ function renderClip(c,idx){
   const div=document.createElement('div'); div.className='clip'; div.dataset.idx=idx;
   div.innerHTML=`
     <div class="cliphead">
-      <input class="title" value="${esc(c.title||c.clip_id)}" title="headline title (clip name)">
+      <input class="title" value="${esc(c.title || (c._pick?'':c.clip_id))}" placeholder="${c._pick?'Title (optional)':''}" title="headline title (clip name)">
       ${c.uses_assets?'<span class="badge">uses B-roll — render to confirm</span>':''}
     </div>
     <div class="hint filepath" title="rendered clip file">${esc(c.output_path||'(not rendered yet)')}</div>
@@ -223,6 +271,7 @@ function renderClip(c,idx){
     <div class="controls">
       <button class="render" title="Render this clip with ffmpeg (true final look)">render this clip</button>
       <button class="saveclip" title="Write this clip's edit decisions to the plan (no video)">export metadata</button>
+      ${c._pick?'<button class="clearpick" title="Start a new pick">clear</button>':''}
       <span class="hint seginfo"></span>
       <span class="hint renderstatus"></span>
       <span class="hint savestatus"></span>
@@ -240,6 +289,7 @@ function renderClip(c,idx){
   div.querySelector('.cardtext').oninput=e=>{ c.cardText=e.target.value; };
   div.querySelector('.notes').oninput=e=>{ c.notes=e.target.value; };
   div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
+  if(c._pick) div.querySelector('.clearpick').onclick=()=>clearPick(div,c);
   // cut-confined transport (play/pause/restart/scrub within the clip)
   setupPreview(div,c);
   // framing: horizontal crop nudge (biases the renderer's subject-crop center)
@@ -450,7 +500,8 @@ function clipPayload(c){
   // Captions are normally regenerated server-side from the kept words. We only
   // send them when AI cleanup has produced human-edited caption text, which the
   // backend then locks in (human_edited_captions) so it actually renders.
-  const p={clip_id:c.clip_id, decision:c.decision||'keep', title:c.title||c.clip_id,
+  const p={clip_id:c.clip_id, decision:c.decision||'keep',
+           title:c.title || (c._pick ? '' : c.clip_id),
            title_card_text:(c.cardText||'').trim(),
            title_card_seconds:c.title_card_seconds, notes:c.notes||'',
            framing_offset:+c.framing||0,
@@ -464,8 +515,11 @@ async function renderClipNow(div,c){
   const btn=div.querySelector('.render'); btn.disabled=true;
   status.textContent='Saving + rendering… (about a minute)';
   try{
-    const res=await fetch('/api/render',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:CURRENT.id, clip_id:c.clip_id, clips:[clipPayload(c)]})});
+    if(c._pick && !currentSegments(c).length){ status.textContent='Highlight some words first.'; btn.disabled=false; return; }
+    const url=c._pick?'/api/pick-render':'/api/render';
+    const body=c._pick?{project_id:CURRENT.id, clip:clipPayload(c)}
+                      :{project_id:CURRENT.id, clip_id:c.clip_id, clips:[clipPayload(c)]};
+    const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; btn.disabled=false; return; }
     const poll=async()=>{
@@ -493,14 +547,18 @@ async function saveClip(div,c){
   const status=div.querySelector('.savestatus');
   const btn=div.querySelector('.saveclip'); btn.disabled=true; status.textContent='Exporting…';
   try{
-    const res=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:CURRENT.id, clips:[clipPayload(c)]})});
+    if(c._pick && !currentSegments(c).length){ status.textContent='Highlight some words first.'; return; }
+    const url=c._pick?'/api/pick-save':'/api/save';
+    const body=c._pick?{project_id:CURRENT.id, clip:clipPayload(c)}
+                      :{project_id:CURRENT.id, clips:[clipPayload(c)]};
+    const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; return; }
-    status.textContent='Exported ✓';
+    status.textContent='Exported ✓'+(d.clip_id?(' ('+d.clip_id+')'):'');
   }catch(e){ status.textContent='Error: '+e; }
   finally{ btn.disabled=false; }
 }
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>setMode(t.dataset.mode));
 loadProjects();
 </script>
 </body>

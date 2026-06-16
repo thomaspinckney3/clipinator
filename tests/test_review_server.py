@@ -211,6 +211,30 @@ class TestReworkCost:
         assert rs.rework_pricing().output_usd_per_million == 60.0
 
 
+class TestBuildPickPlan:
+    def test_synthesizes_one_clip_from_segments(self, tmp_path):
+        manifest = build_run_root(tmp_path / "Proj")
+        edit = {"segments": [{"source_in": 1.0, "source_out": 3.0}],
+                "title": "My pick", "title_card_seconds": 2.0}
+        plan, clip_id, source, transcript = rs.build_pick_plan(manifest, edit)
+        assert clip_id == "pick_1-3"
+        assert len(plan["clip_ads"]) == 1
+        assert plan["clip_ads"][0]["clip_id"] == "pick_1-3"
+        assert plan["clip_ads"][0]["concept_title"] == "My pick"
+        assert source and transcript
+
+    def test_empty_segments_rejected(self, tmp_path):
+        manifest = build_run_root(tmp_path / "Proj")
+        with pytest.raises(RuntimeError, match="Highlight"):
+            rs.build_pick_plan(manifest, {"segments": []})
+
+    def test_blank_title_falls_back_to_clip_id(self, tmp_path):
+        manifest = build_run_root(tmp_path / "Proj")
+        plan, _, _, _ = rs.build_pick_plan(
+            manifest, {"segments": [{"source_in": 1.0, "source_out": 3.0}], "title": ""})
+        assert plan["clip_ads"][0]["concept_title"] == "pick_1-3"
+
+
 class TestCaptionCleanupSchema:
     def test_strict_schema_required_covers_every_property(self):
         # strict json_schema requires every property listed in `required`

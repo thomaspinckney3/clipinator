@@ -19,6 +19,7 @@ from extractor.edit_list import (
     clip_segments,
     export_captions,
     read_json,
+    rebuild_clip,
     render_manifest_clip,
     title_card_seconds,
     title_card_text,
@@ -518,6 +519,52 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def build_pick_plan(
+    manifest_path: Path, clip_edit: dict[str, Any]
+) -> tuple[dict[str, Any], str, str | None, str | None]:
+    """Synthesize a one-clip plan for a clip authored from scratch ("Pick clips").
+
+    The picked clip isn't in the AI plan, so we build it from the user's segments
+    using the same rebuild_clip the review path uses (seeded from the project's
+    first clip so the schema is complete), and wrap it in a copy of the plan so
+    the normal export/render path can consume it. Returns (plan, clip_id, source,
+    transcript).
+    """
+    manifest = read_json(manifest_path)
+    plan_path = manifest.get("stage3_output")
+    if not (plan_path and Path(str(plan_path)).exists()):
+        raise RuntimeError("The plan for this project is missing.")
+    plan = read_json(Path(str(plan_path)))
+    transcript_path = manifest.get("transcript")
+    words = (
+        transcript_words_from_data(read_json(Path(str(transcript_path))))
+        if transcript_path and Path(str(transcript_path)).exists() else []
+    )
+    segs = clip_edit.get("segments") or []
+    if not segs:
+        raise RuntimeError("Highlight some words first to build a clip.")
+    first = min(float(s["source_in"]) for s in segs)
+    last = max(float(s["source_out"]) for s in segs)
+    clip_id = f"pick_{int(first)}-{int(last)}"
+    base = plan.get("clip_ads") or []
+    template = json.loads(json.dumps(base[0])) if base else {}
+    skeleton = {
+        **template,
+        "clip_id": clip_id,
+        "concept_title": str(clip_edit.get("title") or clip_id),
+        "timeline": [],
+        "caption_plan": [],
+        "source_ranges": [],
+    }
+    skeleton.pop("media_request_ids", None)
+    edit = {**clip_edit, "clip_id": clip_id, "decision": "keep",
+            "title": str(clip_edit.get("title") or clip_id)}
+    clip = rebuild_clip(skeleton, edit, words)
+    plan["clip_ads"] = [clip]
+    plan.pop("deferred_candidates", None)
+    return plan, clip_id, manifest.get("source_video"), transcript_path
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     server_version = "ClipinatorReview/0.1"
 
@@ -575,6 +622,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._api_rework()
             elif parsed.path == "/api/caption-cleanup":
                 self._api_caption_cleanup()
+            elif parsed.path == "/api/pick-save":
+                self._api_pick_save()
+            elif parsed.path == "/api/pick-render":
+                self._api_pick_render()
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
         except (BrokenPipeError, ConnectionResetError):
@@ -770,6 +821,47 @@ class ReviewHandler(BaseHTTPRequestHandler):
             "summary": summary,
             "cost": cost,
         })
+
+    def _pick_manifest_path(self, body: dict[str, Any]) -> Path:
+        from urllib.parse import unquote
+        manifest_path = Path(unquote(str(body.get("project_id", ""))))
+        if not manifest_path.exists():
+            raise RuntimeError("That project could not be found.")
+        return manifest_path
+
+    def _pick_out_dir(self, manifest_path: Path) -> Path:
+        return run_root_of(manifest_path) / "review" / manifest_path.parent.name / "picks"
+
+    def _api_pick_save(self) -> None:
+        body = self._read_json_body()
+        manifest_path = self._pick_manifest_path(body)
+        plan, clip_id, _source, _transcript = build_pick_plan(manifest_path, body.get("clip") or {})
+        out_dir = self._pick_out_dir(manifest_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{clip_id}.plan.json"
+        write_json(out_path, plan)
+        self._json({"ok": True, "output": str(out_path), "clip_id": clip_id})
+
+    def _api_pick_render(self) -> None:
+        if not ffmpeg_available():
+            raise RuntimeError("ffmpeg is not installed; install it to render clips here.")
+        body = self._read_json_body()
+        manifest_path = self._pick_manifest_path(body)
+        plan, clip_id, source, transcript = build_pick_plan(manifest_path, body.get("clip") or {})
+        if not (source and Path(str(source)).exists()):
+            raise RuntimeError("The source video for this project was not found.")
+        out_dir = self._pick_out_dir(manifest_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = out_dir / f"{clip_id}.plan.json"
+        write_json(plan_path, plan)
+        job_id = start_render_job(
+            plan_path=plan_path,
+            source=Path(str(source)),
+            transcript=Path(str(transcript)) if transcript else None,
+            out_dir=out_dir,
+            clip_id=clip_id,
+        )
+        self._json({"job_id": job_id})
 
     def _api_render_status(self, job_id: str) -> None:
         job = RENDER_JOBS.get(job_id)

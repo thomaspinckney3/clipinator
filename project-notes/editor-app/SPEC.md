@@ -186,3 +186,27 @@ word selection clears cleaned captions (they'd drift). Verified live: a
 
 - NOT built yet: **AI auto-center framing** (a vision pass that sets the
   Phase-1 framing offset for off-center subjects).
+
+## Pick clips — author from the source (built — 2026-06-16)
+
+A second top-level mode, the inverse of review: instead of adjusting AI-proposed
+clips, the editor authors a clip from scratch off the raw source. Two header
+tabs — **Review clips** | **Pick clips** — share the same project list (each
+project bundles a source video + full transcript).
+
+- **Pick clips:** select a source → one blank card shows the **entire
+  transcript with nothing selected**; highlight words (contiguous runs become
+  segments, same as review) → the cut preview, framing nudge, title / title-card
+  text, caption cleanup, **export metadata**, and **render this clip** all work
+  on the picked selection. **One clip at a time** (a "clear" button starts the
+  next).
+- **Backend:** a picked clip isn't in the AI plan, so `build_pick_plan`
+  synthesizes a one-clip plan from the segments via the same `rebuild_clip`
+  (seeded from the project's first clip for schema completeness), wrapped in a
+  copy of the plan. `/api/pick-save` writes it to `review/<variant>/picks/
+  <clip_id>.plan.json`; `/api/pick-render` writes it and runs the normal
+  `start_render_job` (with `--auto-foreground-scale`). `clip_id` is
+  `pick_<start>-<end>` from the selection; blank title falls back to that id.
+- Verified live: full 2078-word transcript shown blank → highlighted a run →
+  exported (`pick_109-114.plan.json`) and rendered a real 720×1280 9:16 clip;
+  switching back to Review shows the AI clips unchanged.
