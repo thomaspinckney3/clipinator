@@ -64,6 +64,21 @@ class TestDiscovery:
         labels = sorted(p["label"] for p in projects)
         assert labels == ["Proj — draft", "Proj — final"]
 
+    def test_only_most_refined_variant_preferred(self, tmp_path):
+        root = tmp_path / "lib" / "Proj"
+        build_run_root(root, variant="draft")
+        build_run_root(root, variant="final")
+        projects, _ = rs.discover_projects(root)
+        pref = {p["variant"]: p["preferred"] for p in projects}
+        assert pref == {"draft": False, "final": True}
+
+    def test_lone_variant_is_preferred(self, tmp_path):
+        # a draft-only run still shows: its only variant is preferred
+        root = tmp_path / "lib" / "DraftOnly"
+        build_run_root(root, variant="draft")
+        projects, _ = rs.discover_projects(root)
+        assert projects[0]["preferred"] is True
+
     def test_missing_dir_is_empty(self, tmp_path):
         projects, allowed = rs.discover_projects(tmp_path / "nope")
         assert projects == [] and allowed == set()

@@ -42,6 +42,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "review_static"
 SCAN_MAX_DEPTH = 7
 SCAN_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "Library", ".Trash", "review"}
 SCAN_MAX_PROJECTS = 500
+# How refined each render variant is. The most-refined variant per run is the
+# one an editor usually wants (the final/revised cut), so it is flagged
+# "preferred" and shown by default; earlier variants hide behind a toggle.
+VARIANT_RANK = {"final": 3, "revise": 3, "draft": 1}
+
+
+def variant_rank(variant: str) -> int:
+    return VARIANT_RANK.get(variant.lower(), 2)
 
 # Background single-clip render jobs and the previews they produce. Previews are
 # served via /video even though they live under review/ (which discovery skips).
@@ -371,12 +379,16 @@ def discover_projects(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
             continue
         source = manifest.get("source_video")
         source_path = Path(str(source)) if source else None
+        variant = manifest_path.parent.name
         projects.append({
             "id": project_id(manifest_path),
             "label": project_label(manifest_path, manifest),
             "manifest_path": str(manifest_path),
             "clip_count": len(manifest.get("clips", []) or []),
             "source_found": bool(source_path and source_path.exists()),
+            "variant": variant,
+            "run_root": str(run_root_of(manifest_path)),
+            "preferred": True,  # refined below once all variants of a run are known
         })
         if source_path and source_path.exists():
             allowed.add(str(source_path.resolve()))
@@ -385,6 +397,13 @@ def discover_projects(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
                 p = clip.get(key)
                 if p and Path(str(p)).exists():
                     allowed.add(str(Path(str(p)).resolve()))
+    # Within each run, only the most-refined variant is "preferred" (shown by
+    # default); the rest hide behind the editor's "show all variants" toggle.
+    best_rank: dict[str, int] = {}
+    for p in projects:
+        best_rank[p["run_root"]] = max(best_rank.get(p["run_root"], -1), variant_rank(p["variant"]))
+    for p in projects:
+        p["preferred"] = variant_rank(p["variant"]) == best_rank[p["run_root"]]
     projects.sort(key=lambda p: p["label"].lower())
     return projects, allowed
 
