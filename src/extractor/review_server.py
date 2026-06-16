@@ -280,9 +280,14 @@ def start_render_job(*, plan_path: Path, source: Path, transcript: Path | None,
         import extractor
         src_root = str(Path(extractor.__file__).resolve().parents[1])
         env = {**os.environ, "PYTHONPATH": src_root}
+        # --auto-foreground-scale matches how the pipeline renders finals (a
+        # per-clip vertical punch-in) so the preview render looks right AND the
+        # editor's framing offset has a crop to act on (without a punch-in the
+        # frame is full-width and the offset is a no-op).
         cmd = [sys.executable, "-m", "extractor.render_plan",
                "--source-video", str(source), "--plan-output", str(plan_path),
-               "--output-dir", str(out_dir), "--output-label", "", "--clip-id", clip_id]
+               "--output-dir", str(out_dir), "--output-label", "", "--clip-id", clip_id,
+               "--auto-foreground-scale"]
         if transcript is not None:
             cmd += ["--transcript", str(transcript)]
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
