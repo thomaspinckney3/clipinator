@@ -40,8 +40,7 @@
   .w { cursor:pointer; padding:0 1px; border-radius:3px; }
   .w.in { background:var(--in); } .w.in:hover { background:var(--in-h); }
   .w.out { color:#bbb; text-decoration:line-through; } .w.out:hover { color:#666; }
-  .ctrls { display:flex; gap:.6rem; align-items:center; margin-top:.5rem; font-size:.85rem; flex-wrap:wrap; }
-  .ctrls label { display:flex; gap:.3rem; align-items:center; }
+  .controls { display:flex; gap:.7rem; align-items:center; margin-top:.8rem; padding-top:.7rem; border-top:1px solid #eee; flex-wrap:wrap; font-size:.85rem; }
   .expand { display:flex; gap:.5rem; align-items:center; margin-top:.5rem; font-size:.82rem; flex-wrap:wrap; }
   .expand button { border:1px solid #bbb; background:#fff; border-radius:5px; padding:.15rem .5rem; cursor:pointer; font-size:.78rem; }
   .expand button:disabled { opacity:.4; cursor:default; }
@@ -63,10 +62,10 @@
   .cardrow .cardtext { flex:1; min-width:14rem; font:inherit; font-size:.9rem; padding:.25rem .45rem; border:1px solid #ccc; border-radius:5px; }
   textarea.notes { width:100%; min-height:2.5rem; margin-top:.4rem; font:inherit; font-size:.85rem; }
   .hint { color:#777; font-size:.82rem; }
-  .saverow { display:flex; gap:.7rem; align-items:center; margin-top:.8rem; padding-top:.7rem; border-top:1px solid #eee; }
   button.saveclip { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:.45rem 1.1rem; font-size:.88rem; cursor:pointer; }
   button.saveclip:disabled { opacity:.5; cursor:default; }
-  button.preview { border:1px solid #bbb; background:#fff; border-radius:6px; padding:.3rem .7rem; cursor:pointer; font-size:.82rem; }
+  .controls button.render { border:1px solid #bbb; background:#fff; border-radius:6px; padding:.45rem 1rem; cursor:pointer; font-size:.85rem; }
+  .controls button.render:disabled { opacity:.5; cursor:default; }
   .empty { color:#777; padding:2rem; }
 </style>
 </head>
@@ -187,12 +186,6 @@ function renderClip(c,idx){
       <input class="cardtext" value="${esc(c.cardText||'')}" placeholder="(uses the title)" title="text shown on the opening title card">
       <span class="hint">· card ${c.title_card_seconds.toFixed(1)}s · ${c.clip_id}</span>
     </div>
-    <div class="ctrls">
-      <button class="preview">▶ preview cut</button>
-      <button class="render" title="Render this clip with ffmpeg">render this clip</button>
-      <span class="hint seginfo"></span>
-      <span class="hint renderstatus"></span>
-    </div>
     <div class="expand">
       <button class="earlier" title="reveal earlier transcript">⟵ 30s earlier</button>
       <button class="later" title="reveal later transcript">30s later ⟶</button>
@@ -227,7 +220,13 @@ function renderClip(c,idx){
         <div class="hint fr-note">tip: pause or step (◀ǀ ǀ▶) to a frame, then adjust · preview approximate — render to confirm</div>
       </div>
     </div>
-    <div class="saverow"><button class="saveclip">Save this clip</button><span class="hint savestatus"></span></div>`;
+    <div class="controls">
+      <button class="render" title="Render this clip with ffmpeg (true final look)">render this clip</button>
+      <button class="saveclip" title="Write this clip's edit decisions to the plan (no video)">export metadata</button>
+      <span class="hint seginfo"></span>
+      <span class="hint renderstatus"></span>
+      <span class="hint savestatus"></span>
+    </div>`;
 
   // transcript window + expand controls
   renderWords(div,c);
@@ -345,7 +344,6 @@ function setupPreview(div,c){
   function step(delta){ armStill(); if(!segs.length) return; const cut = finished ? total : curCut(); finished=false; seekCut(cut+delta); }
   playBtn.onclick=toggle;
   div.querySelector('.trestart').onclick=start;
-  div.querySelector('.preview').onclick=start;
   div.querySelector('.tstepb').onclick=()=>step(-STEP);
   div.querySelector('.tstepf').onclick=()=>step(STEP);
   pbar.onclick=e=>{ armStill(); const r=pbar.getBoundingClientRect(); seekCut((e.clientX-r.left)/r.width*total); };
@@ -493,13 +491,13 @@ async function renderClipNow(div,c){
 async function saveClip(div,c){
   if(!CURRENT) return;
   const status=div.querySelector('.savestatus');
-  const btn=div.querySelector('.saveclip'); btn.disabled=true; status.textContent='Saving…';
+  const btn=div.querySelector('.saveclip'); btn.disabled=true; status.textContent='Exporting…';
   try{
     const res=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({project_id:CURRENT.id, clips:[clipPayload(c)]})});
     const d=await res.json();
     if(d.error){ status.textContent='Error: '+d.error; return; }
-    status.textContent='Saved ✓';
+    status.textContent='Exported ✓';
   }catch(e){ status.textContent='Error: '+e; }
   finally{ btn.disabled=false; }
 }
