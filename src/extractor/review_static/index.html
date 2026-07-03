@@ -94,6 +94,10 @@
   /* karaoke word highlight synced to the source video playhead */
   .sb-tx .w.spoken { background:#ffd34d; color:#1a1a1a; text-decoration:none; box-shadow:0 0 0 2px #ffd34d; }
   .sb-bottom { margin-top:1.3rem; }
+  .sumbtn { border:1px solid #3a5bd9; color:#3a5bd9; background:#fff; border-radius:5px; padding:.1rem .55rem; cursor:pointer; font-size:.76rem; margin-left:.3rem; }
+  .sumbtn:disabled { opacity:.4; cursor:default; border-color:#bbb; color:#999; }
+  .sumstatus button { font:inherit; font-size:.76rem; padding:.1rem .5rem; margin-left:.2rem; border-radius:4px; cursor:pointer; border:1px solid #ccc; background:#fff; }
+  .sumstatus button.cfm-yes { border-color:#3a5bd9; color:#3a5bd9; }
 </style>
 </head>
 <body>
@@ -621,6 +625,7 @@ async function loadStoryboardProject(id){
   if(proj.error){ main.innerHTML=`<div class="empty">${proj.error}</div>`; return; }
   CURRENT=proj;
   const W=proj.transcript_words||[]; CURRENT.W=W; CURRENT.U=proj.transcript_units||[];
+  CURRENT.aiSummaries=!!proj.ai_summaries;
   CURRENT.tend=W.length?W[W.length-1].end:0;
   proj.clips.forEach(c=>{
     c.decision='keep'; c.framing=+c.framing_offset||0; c.cardText=c.title_card_text||'';
@@ -677,7 +682,8 @@ function renderStoryboard(c,idx){
       </div>
     </div>
     <div class="sb-tl-wrap">
-      <div class="hint">source timeline — each block is a content unit; click to include/exclude it in this clip · <span class="seginfo"></span></div>
+      <div class="hint">source timeline — each block is a content unit; click to include/exclude it in this clip · <span class="seginfo"></span>
+        <button class="sumbtn">✨ AI labels</button><span class="hint sumstatus"></span></div>
       <div class="sb-timeline"></div>
     </div>
     <div class="row sb-bottom">
@@ -716,6 +722,11 @@ function renderStoryboard(c,idx){
   rb.onclick=()=>renderClipNow(div,c);
   div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
   div.querySelector('.cardtext').oninput=e=>{ c.cardText=e.target.value; };
+  // AI topic labels for the timeline (batched + cached server-side)
+  const sumb=div.querySelector('.sumbtn');
+  if(!AI){ sumb.disabled=true; sumb.title='Set OPENAI_API_KEY in .env to enable AI labels'; }
+  if(CURRENT.aiSummaries) sumb.textContent='✨ AI labels ✓';
+  sumb.onclick=()=>confirmUnitSummaries(div,c);
   // source video playhead drives the timeline "now" marker and karaoke word
   // highlight. A rAF loop tracks the playhead more smoothly than timeupdate
   // (which fires ~4x/s, too coarse for fast speech); it stops on pause or when
@@ -769,6 +780,40 @@ function renderTimeline(div,c){
   });
   const firstSel=tl.querySelector('.sb-unit.sel');
   if(firstSel) firstSel.scrollIntoView({inline:'center',block:'nearest'});
+}
+
+// AI topic labels: one batched, cached server call replaces the heuristic
+// timeline labels. Gated behind an inline cost confirm like the other AI calls.
+function confirmUnitSummaries(div,c){
+  if(!AI) return;
+  const st=div.querySelector('.sumstatus');
+  const n=(CURRENT.U||[]).length;
+  if(!n){ st.textContent='No content units to label.'; return; }
+  // coarse ceiling: full segment text in, a few tokens per label out
+  const est=n*(150*5 + 10*30)/1e6;
+  st.innerHTML=`Label ${n} units with AI (cached after) ~${fmtUsdEst(est)} — <button class="cfm-yes">Confirm</button> <button class="cfm-no">Cancel</button>`;
+  st.querySelector('.cfm-yes').onclick=()=>doUnitSummaries(div,c);
+  st.querySelector('.cfm-no').onclick=()=>{ st.textContent='Cancelled — no call made.'; };
+}
+
+async function doUnitSummaries(div,c){
+  const st=div.querySelector('.sumstatus'), btn=div.querySelector('.sumbtn');
+  btn.disabled=true; st.textContent='Labeling units…';
+  try{
+    const res=await fetch('/api/unit-summaries',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project_id:CURRENT.id})});
+    const d=await res.json();
+    if(d.error){ st.textContent='Error: '+d.error; return; }
+    const s=d.summaries||[];
+    if(s.length!==(CURRENT.U||[]).length){ st.textContent='Label count mismatch — left unchanged.'; return; }
+    CURRENT.U.forEach((u,i)=>{ u.summary=s[i]; });
+    CURRENT.aiSummaries=true;
+    renderTimeline(div,c);          // repaint blocks with new labels
+    btn.textContent='✨ AI labels ✓';
+    if(d.cached){ st.textContent='Loaded cached AI labels ✓'; }
+    else { const k=d.cost||{}; st.textContent='AI labels ✓'+(k.estimated_usd!=null?(' · cost '+fmtUsd(k.estimated_usd)):''); }
+  }catch(e){ st.textContent='Error: '+e; }
+  finally{ btn.disabled=false; }
 }
 
 function toggleUnit(div,c,ui,el){

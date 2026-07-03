@@ -529,22 +529,101 @@ def transcript_units_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if e > s:
             units.append({"start": round(s, 3), "end": round(e, 3),
-                          "summary": _pithy_summary(text)})
+                          "summary": _pithy_summary(text), "text": text})
     if units:
         return units
     # Fallback for word-only transcripts: break on >0.7s pauses or every ~10 words.
     group: list[dict[str, Any]] = []
     def flush() -> None:
         if group:
+            text = " ".join(w["text"] for w in group)
             units.append({"start": round(group[0]["start"], 3),
                           "end": round(group[-1]["end"], 3),
-                          "summary": _pithy_summary(" ".join(w["text"] for w in group))})
+                          "summary": _pithy_summary(text), "text": text})
     for w in transcript_words_from_data(data):
         if group and (w["start"] - group[-1]["end"] > 0.7 or len(group) >= 10):
             flush(); group = []
         group.append(w)
     flush()
     return units
+
+
+# AI-generated topic labels for the timeline. Heuristic labels (_pithy_summary)
+# are word-salad on conversational speech, so an LLM distills each unit into a
+# real 2-4 word topic. The result is cached to disk keyed by the transcript, so
+# it is a one-time cost per source; reopening a project reuses it for free.
+UNIT_SUMMARY_DIR = CONFIG_DIR / "unit-summaries"
+UNIT_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False, "required": ["labels"],
+    "properties": {"labels": {"type": "array", "items": {"type": "string"}}},
+}
+
+
+def unit_summary_key(transcript_path: str, units: list[dict[str, Any]]) -> str:
+    import hashlib
+    sig = f"{transcript_path}|{len(units)}|" + ";".join(
+        f"{u['start']:.2f}-{u['end']:.2f}" for u in units[:4000])
+    return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:24]
+
+
+def load_unit_summaries(key: str) -> list[str] | None:
+    p = UNIT_SUMMARY_DIR / f"{key}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    labels = data.get("summaries")
+    return labels if isinstance(labels, list) else None
+
+
+def save_unit_summaries(key: str, summaries: list[str]) -> None:
+    UNIT_SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_SUMMARY_DIR / f"{key}.json").write_text(
+        json.dumps({"summaries": summaries}, ensure_ascii=False), encoding="utf-8")
+
+
+def generate_unit_summaries(
+    unit_texts: list[str], batch: int = 80
+) -> tuple[list[str], dict[str, Any]]:
+    """Label each unit's text with a concise topic, batched into few LLM calls.
+    Returns (labels aligned to unit_texts, summed cost)."""
+    from openai import OpenAI
+    from extractor.openai_responses import create_response_streaming
+
+    client = OpenAI(timeout=float(os.environ.get("OPENAI_CLIENT_TIMEOUT_SECONDS", "600")))
+    developer = (
+        "You label transcript segments for a video-editing timeline. For each numbered "
+        "segment, write a concise 2-4 word topic label — a noun phrase capturing the gist, "
+        "not a verbatim quote or a full sentence. Reply with labels in the same order, one "
+        "per segment, exactly as many labels as segments."
+    )
+    labels: list[str] = []
+    cost: dict[str, Any] = {"estimated_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+    for start in range(0, len(unit_texts), batch):
+        chunk = unit_texts[start:start + batch]
+        numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(chunk))
+        resp = create_response_streaming(
+            client, label="unit-summaries",
+            model=os.environ.get("REVIEW_SUMMARY_MODEL") or os.environ.get("REVIEW_REWORK_MODEL") or "gpt-5.5",
+            input=[{"role": "developer", "content": developer},
+                   {"role": "user", "content": f"Segments:\n{numbered}\n\nReturn exactly {len(chunk)} labels."}],
+            reasoning={"effort": os.environ.get("REVIEW_SUMMARY_EFFORT") or "low"},
+            max_output_tokens=40 * len(chunk) + 500,
+            store=False,
+            text={"format": {"type": "json_schema", "name": "unit_labels",
+                             "schema": UNIT_SUMMARY_SCHEMA, "strict": True}},
+        )
+        out = json.loads(resp.output_text)
+        got = [str(x).strip() for x in (out.get("labels") or [])]
+        got = (got + [""] * len(chunk))[:len(chunk)]  # align length defensively
+        labels.extend(got)
+        c = response_cost(resp)
+        cost["estimated_usd"] += float(c.get("estimated_usd") or 0.0)
+        cost["input_tokens"] += int(c.get("input_tokens") or 0)
+        cost["output_tokens"] += int(c.get("output_tokens") or 0)
+    return labels, cost
 
 
 def project_detail(manifest_path: Path) -> dict[str, Any]:
@@ -554,10 +633,17 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
     transcript_path = manifest.get("transcript")
     words: list[dict[str, Any]] = []
     units: list[dict[str, Any]] = []
+    ai_summaries = False
     if transcript_path and Path(str(transcript_path)).exists():
         tdata = read_json(Path(str(transcript_path)))
         words = transcript_words_from_data(tdata)
         units = transcript_units_from_data(tdata)
+        cached = load_unit_summaries(unit_summary_key(str(transcript_path), units))
+        if cached and len(cached) == len(units):
+            for u, s in zip(units, cached):
+                if s:
+                    u["summary"] = s
+            ai_summaries = True
     plan = read_json(Path(str(plan_path))) if plan_path and Path(str(plan_path)).exists() else {}
 
     clips: list[dict[str, Any]] = []
@@ -595,8 +681,12 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
              "end": round(float(w["end"]), 3)}
             for w in words
         ],
-        # logical content units for the storyboard timeline (segment summaries)
-        "transcript_units": units,
+        # logical content units for the storyboard timeline (segment summaries).
+        # Strip the full unit text — the client only needs span + label.
+        "transcript_units": [
+            {"start": u["start"], "end": u["end"], "summary": u["summary"]} for u in units
+        ],
+        "ai_summaries": ai_summaries,
         "clips": clips,
     }
 
@@ -709,6 +799,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._api_render()
             elif parsed.path == "/api/rework":
                 self._api_rework()
+            elif parsed.path == "/api/unit-summaries":
+                self._api_unit_summaries()
             elif parsed.path == "/api/caption-cleanup":
                 self._api_caption_cleanup()
             elif parsed.path == "/api/pick-save":
@@ -873,6 +965,34 @@ class ReviewHandler(BaseHTTPRequestHandler):
             "note": note,
             "cost": cost,
         })
+
+    def _api_unit_summaries(self) -> None:
+        """Generate (or return cached) AI topic labels for a project's content units."""
+        from urllib.parse import unquote
+        body = self._read_json_body()
+        manifest_path = Path(unquote(str(body.get("project_id", ""))))
+        if not manifest_path.exists():
+            raise RuntimeError("That project could not be found.")
+        manifest = read_json(manifest_path)
+        transcript_path = manifest.get("transcript")
+        if not (transcript_path and Path(str(transcript_path)).exists()):
+            raise RuntimeError("The transcript for this project is missing.")
+        units = transcript_units_from_data(read_json(Path(str(transcript_path))))
+        if not units:
+            raise RuntimeError("This transcript has no content units.")
+        key = unit_summary_key(str(transcript_path), units)
+        cached = load_unit_summaries(key)
+        if cached and len(cached) == len(units):
+            self._json({"summaries": cached, "cached": True})
+            return
+        if not openai_available():
+            raise RuntimeError("AI summaries need the openai package and OPENAI_API_KEY in .env.")
+        labels, cost = generate_unit_summaries([u.get("text", "") for u in units])
+        # keep the heuristic label where the model returned nothing
+        summaries = [labels[i] if i < len(labels) and labels[i] else units[i]["summary"]
+                     for i in range(len(units))]
+        save_unit_summaries(key, summaries)
+        self._json({"summaries": summaries, "cached": False, "cost": cost})
 
     def _api_caption_cleanup(self) -> None:
         if not openai_available():
