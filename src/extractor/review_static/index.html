@@ -660,6 +660,11 @@ function renderStoryboardShell(){
 function renderStoryboard(c,idx){
   const div=document.createElement('div'); div.className='sb clip'; div.dataset.idx=idx;
   div.innerHTML=`
+    <div class="cardrow">
+      <label class="hint">title card</label>
+      <input class="cardtext" value="${esc(c.cardText||'')}" placeholder="${esc(c.title||'(uses the title)')}" title="text shown on the opening title card">
+      <span class="hint">· card ${c.title_card_seconds.toFixed(1)}s · ${esc(c.clip_id)}</span>
+    </div>
     <div class="sb-top">
       <div class="sb-tx-panel">
         <div class="hint">transcript — click a word for fine control</div>
@@ -710,6 +715,7 @@ function renderStoryboard(c,idx){
   if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
   rb.onclick=()=>renderClipNow(div,c);
   div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
+  div.querySelector('.cardtext').oninput=e=>{ c.cardText=e.target.value; };
   // source video playhead drives the timeline "now" marker and karaoke word
   // highlight. A rAF loop tracks the playhead more smoothly than timeupdate
   // (which fires ~4x/s, too coarse for fast speech); it stops on pause or when
