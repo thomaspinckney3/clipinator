@@ -470,14 +470,63 @@ def clip_words(words: list[dict[str, Any]], segments: list[dict[str, Any]], pad:
     return out
 
 
+def _several_word_summary(text: str, max_words: int = 6) -> str:
+    """A short label for a content unit: the first few words, elided if longer."""
+    words = str(text).split()
+    if not words:
+        return ""
+    summary = " ".join(words[:max_words])
+    if len(words) > max_words:
+        summary += "…"
+    return summary
+
+
+def transcript_units_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Logical content units for the storyboard timeline. Prefer the transcript's
+    own segments (real semantic-ish units from the ASR stage); if a transcript has
+    only words, group them on pauses. Each unit carries its source-time span plus a
+    several-word summary the timeline shows as its label."""
+    units: list[dict[str, Any]] = []
+    for seg in data.get("segments") or []:
+        start, end = seg.get("start"), seg.get("end")
+        text = str(seg.get("text", "")).strip()
+        if start is None or end is None or not text:
+            continue
+        try:
+            s, e = float(start), float(end)
+        except (TypeError, ValueError):
+            continue
+        if e > s:
+            units.append({"start": round(s, 3), "end": round(e, 3),
+                          "summary": _several_word_summary(text)})
+    if units:
+        return units
+    # Fallback for word-only transcripts: break on >0.7s pauses or every ~10 words.
+    group: list[dict[str, Any]] = []
+    def flush() -> None:
+        if group:
+            units.append({"start": round(group[0]["start"], 3),
+                          "end": round(group[-1]["end"], 3),
+                          "summary": _several_word_summary(" ".join(w["text"] for w in group))})
+    for w in transcript_words_from_data(data):
+        if group and (w["start"] - group[-1]["end"] > 0.7 or len(group) >= 10):
+            flush(); group = []
+        group.append(w)
+    flush()
+    return units
+
+
 def project_detail(manifest_path: Path) -> dict[str, Any]:
     manifest = read_json(manifest_path)
     source = manifest.get("source_video")
     plan_path = manifest.get("stage3_output")  # legacy key retained in manifests
     transcript_path = manifest.get("transcript")
     words: list[dict[str, Any]] = []
+    units: list[dict[str, Any]] = []
     if transcript_path and Path(str(transcript_path)).exists():
-        words = transcript_words_from_data(read_json(Path(str(transcript_path))))
+        tdata = read_json(Path(str(transcript_path)))
+        words = transcript_words_from_data(tdata)
+        units = transcript_units_from_data(tdata)
     plan = read_json(Path(str(plan_path))) if plan_path and Path(str(plan_path)).exists() else {}
 
     clips: list[dict[str, Any]] = []
@@ -515,6 +564,8 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
              "end": round(float(w["end"]), 3)}
             for w in words
         ],
+        # logical content units for the storyboard timeline (segment summaries)
+        "transcript_units": units,
         "clips": clips,
     }
 

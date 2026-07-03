@@ -70,6 +70,28 @@
   .controls button.render { border:1px solid #bbb; background:#fff; border-radius:6px; padding:.45rem 1rem; cursor:pointer; font-size:.85rem; }
   .controls button.render:disabled { opacity:.5; cursor:default; }
   .empty { color:#777; padding:2rem; }
+  /* --- Storyboard prototype --- */
+  .sb-clips { display:flex; gap:.4rem; flex-wrap:wrap; margin:.2rem 0 1rem; }
+  .sb-pill { border:1px solid #bbb; background:#fff; border-radius:999px; padding:.25rem .8rem; cursor:pointer; font-size:.82rem; }
+  .sb-pill.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .sb-top { display:flex; gap:1.2rem; align-items:stretch; flex-wrap:wrap; }
+  .sb-tx-panel, .sb-src-panel { flex:1; min-width:20rem; }
+  .sb-tx { max-height:20rem; margin-top:.3rem; }
+  .sb-src-panel video { width:100%; max-width:100%; aspect-ratio:16/9; }
+  .sb-srcclock { margin-top:.25rem; font-family:ui-monospace,Menlo,monospace; }
+  .sb-tl-wrap { margin-top:1.1rem; }
+  .sb-timeline { display:flex; gap:5px; overflow-x:auto; padding:.55rem 0; align-items:stretch;
+    border-top:1px solid #e4e4e4; border-bottom:1px solid #e4e4e4; }
+  .sb-unit { flex:0 0 auto; min-width:70px; max-width:260px; box-sizing:border-box; border:1px solid #ccc;
+    border-radius:6px; background:#fafafa; padding:.35rem .5rem; cursor:pointer; font-size:.74rem;
+    line-height:1.25; color:#555; user-select:none; transition:background .08s; }
+  .sb-unit:hover { border-color:#999; background:#eef2ff; }
+  .sb-unit.sel { background:var(--in); border-color:#7fbf78; color:#1a1a1a; }
+  .sb-unit.sel:hover { background:var(--in-h); }
+  .sb-unit.now { box-shadow:0 0 0 2px var(--accent); }
+  .sb-unit .ut { display:block; font-size:.66rem; color:#9a9a9a; margin-bottom:.15rem; font-family:ui-monospace,Menlo,monospace; }
+  .sb-unit.sel .ut { color:#4a7a44; }
+  .sb-bottom { margin-top:1.3rem; }
 </style>
 </head>
 <body>
@@ -77,6 +99,7 @@
   <div class="tabs">
     <button class="tab active" data-mode="review">Review clips</button>
     <button class="tab" data-mode="pick">Pick clips</button>
+    <button class="tab" data-mode="storyboard">Storyboard</button>
   </div>
   <div class="lib" id="lib"></div></header>
 <div class="layout">
@@ -92,7 +115,12 @@ let ACTIVE_PID = null;         // selected project id (source + transcript)
 
 // Open the selected source in the active mode. Review = adjust the AI clips;
 // Pick = author a new clip from the full transcript.
-function openProject(id){ ACTIVE_PID = id; (MODE === 'pick' ? loadPickProject : loadProject)(id); }
+function openProject(id){
+  ACTIVE_PID = id;
+  if(MODE === 'pick') loadPickProject(id);
+  else if(MODE === 'storyboard') loadStoryboardProject(id);
+  else loadProject(id);
+}
 function setMode(m){
   MODE = m;
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.mode===m));
@@ -331,9 +359,11 @@ function applyFraming(div,c){
 function updateSegInfo(div,c){
   const segs=currentSegments(c);
   const total=segs.reduce((a,s)=>a+(s.source_out-s.source_in),0)+c.title_card_seconds;
-  div.querySelector('.seginfo').textContent=`${segs.length} segment(s), ~${total.toFixed(1)}s`;
+  const info=div.querySelector('.seginfo');
+  if(info) info.textContent=`${segs.length} segment(s), ~${total.toFixed(1)}s`;
   const cuts=segs.map(s=>`${fmt(s.source_in)}–${fmt(s.source_out)}`).join('  ');
-  div.querySelector('.segtimes').textContent = cuts ? 'source cuts: '+cuts : '';
+  const st=div.querySelector('.segtimes');
+  if(st) st.textContent = cuts ? 'source cuts: '+cuts : '';
 }
 
 // Captions ARE the in-words in transcript-first editing — derive them live from
@@ -558,6 +588,197 @@ async function saveClip(div,c){
   }catch(e){ status.textContent='Error: '+e; }
   finally{ btn.disabled=false; }
 }
+// ------------------------------------------------------------------ Storyboard
+// A prototype UX: transcript beside the source video, a source timeline of
+// logical content units (each a several-word summary) that you click to
+// include/exclude in the current clip, and the render + cut preview below.
+// No free-form AI entry — selection is direct manipulation on units/words.
+
+// Map each transcript word to the content unit whose time span contains it.
+function computeUnitWords(){
+  const U=CURRENT.U||[], W=CURRENT.W||[];
+  const uw=U.map(()=>[]);
+  let u=0;
+  for(let i=0;i<W.length;i++){
+    const t=W[i].start;
+    while(u<U.length-1 && t>U[u].end+1e-6) u++;
+    if(U.length && t>=U[u].start-1e-6 && t<=U[u].end+1e-6) uw[u].push(i);
+  }
+  CURRENT.unitWords=uw;
+}
+// A unit counts as selected when a majority of its words are in the cut.
+function unitSelected(c,u){
+  const idxs=CURRENT.unitWords[u]||[]; if(!idxs.length) return false;
+  let n=0; for(const i of idxs) if(c.inSet.has(i)) n++;
+  return n*2>=idxs.length;
+}
+
+async function loadStoryboardProject(id){
+  const main=document.getElementById('main'); main.innerHTML='<div class="empty">Loading…</div>';
+  const proj=await (await fetch('/api/project?id='+encodeURIComponent(id))).json();
+  if(proj.error){ main.innerHTML=`<div class="empty">${proj.error}</div>`; return; }
+  CURRENT=proj;
+  const W=proj.transcript_words||[]; CURRENT.W=W; CURRENT.U=proj.transcript_units||[];
+  CURRENT.tend=W.length?W[W.length-1].end:0;
+  proj.clips.forEach(c=>{
+    c.decision='keep'; c.framing=+c.framing_offset||0; c.cardText=c.title_card_text||'';
+    c.inSet=new Set();
+    for(let i=0;i<W.length;i++){
+      if((c.segments||[]).some(s=>s.source_in-1e-6<=W[i].start && W[i].start<=s.source_out+1e-6)) c.inSet.add(i);
+    }
+  });
+  computeUnitWords();
+  if(!proj.clips.length){
+    main.innerHTML='<div class="empty">This project has no clips to storyboard. Use “Pick clips” to author one from scratch.</div>';
+    return;
+  }
+  if(CURRENT.sbIdx==null || CURRENT.sbIdx>=proj.clips.length) CURRENT.sbIdx=0;
+  renderStoryboardShell();
+}
+
+function renderStoryboardShell(){
+  const proj=CURRENT, main=document.getElementById('main');
+  main.innerHTML=`<h2>${esc(proj.label)} — storyboard</h2>
+    <p class="hint">${proj.content_mode} · ${proj.clips.length} clip(s) · ${(proj.U||[]).length} content units${proj.source_found?'':' · <b>source video not found</b>'}</p>
+    <div class="sb-clips"></div><div id="sbbody"></div>`;
+  const pills=main.querySelector('.sb-clips');
+  if(proj.clips.length>1){
+    proj.clips.forEach((c,i)=>{
+      const b=document.createElement('button');
+      b.className='sb-pill'+(i===proj.sbIdx?' active':'');
+      b.textContent=c.title||c.clip_id;
+      b.onclick=()=>{ proj.sbIdx=i; renderStoryboardShell(); };
+      pills.appendChild(b);
+    });
+  }
+  const body=document.getElementById('sbbody');
+  body.appendChild(renderStoryboard(proj.clips[proj.sbIdx], proj.sbIdx));
+}
+
+function renderStoryboard(c,idx){
+  const div=document.createElement('div'); div.className='sb clip'; div.dataset.idx=idx;
+  div.innerHTML=`
+    <div class="sb-top">
+      <div class="sb-tx-panel">
+        <div class="hint">transcript — click a word for fine control</div>
+        <div class="transcript sb-tx"></div>
+      </div>
+      <div class="sb-src-panel">
+        <div class="hint">source video</div>
+        ${CURRENT.source_url?`<video class="sb-src" controls preload="metadata" src="${CURRENT.source_url}"></video>`:'<div class="hint">source video not found</div>'}
+        <div class="hint sb-srcclock">source —:—</div>
+      </div>
+    </div>
+    <div class="sb-tl-wrap">
+      <div class="hint">source timeline — each block is a content unit; click to include/exclude it in this clip · <span class="seginfo"></span></div>
+      <div class="sb-timeline"></div>
+    </div>
+    <div class="row sb-bottom">
+      <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
+      <div class="col"><div class="hint">cut preview (9:16, approximate · with audio)</div>
+        <div class="phone"><video class="pv" playsinline preload="metadata"></video><div class="cap"></div></div>
+        <div class="transport"><button class="tplay" title="play/pause">▶</button><button class="trestart" title="back to clip start">⏮ start</button><button class="tstepb" title="back one frame">◀ǀ</button><button class="tstepf" title="forward one frame">ǀ▶</button><div class="pbar"><div class="pfill"></div></div></div>
+        <div class="clock pvclock hint">source —:— · cut —:—</div>
+        <div class="framing">
+          <span class="hint">Framing</span>
+          <button class="fr-left" title="shift crop left">◀</button>
+          <input class="fr-slider" type="range" min="-0.4" max="0.4" step="0.05" value="0">
+          <button class="fr-right" title="shift crop right">▶</button>
+          <span class="hint fr-val">centered</span>
+        </div>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="render" title="Render this clip with ffmpeg (true final look)">render this clip</button>
+      <button class="saveclip" title="Write this clip's edit decisions to the plan (no video)">export metadata</button>
+      <span class="hint renderstatus"></span>
+      <span class="hint savestatus"></span>
+    </div>`;
+  renderStoryboardWords(div,c);
+  renderTimeline(div,c);
+  setupPreview(div,c);
+  // framing nudge (same model as review mode)
+  const fs=div.querySelector('.fr-slider'); fs.value=c.framing;
+  const nudge=v=>{ c._pausePreview&&c._pausePreview(); c.framing=v; applyFraming(div,c); };
+  fs.oninput=()=>nudge(+fs.value);
+  div.querySelector('.fr-left').onclick=()=>nudge(Math.max(-0.4,+(c.framing-0.05).toFixed(2)));
+  div.querySelector('.fr-right').onclick=()=>nudge(Math.min(0.4,+(c.framing+0.05).toFixed(2)));
+  applyFraming(div,c);
+  const rb=div.querySelector('.render');
+  if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
+  rb.onclick=()=>renderClipNow(div,c);
+  div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
+  // source video playhead highlights the current unit on the timeline
+  const sv=div.querySelector('.sb-src');
+  if(sv) sv.ontimeupdate=()=>highlightNowUnit(div,sv.currentTime);
+  updateSegInfo(div,c);
+  return div;
+}
+
+function renderStoryboardWords(div,c){
+  const W=CURRENT.W, t=div.querySelector('.sb-tx');
+  let html='';
+  for(let i=0;i<W.length;i++){
+    html+=`<span class="w ${c.inSet.has(i)?'in':'out'}" data-i="${i}" title="source ${fmt1(W[i].start)}">${esc(W[i].text)}</span> `;
+  }
+  t.innerHTML=html||'<span class="hint">no transcript</span>';
+  t.querySelectorAll('.w').forEach(sp=>{
+    sp.onclick=()=>{ const i=+sp.dataset.i;
+      if(c.inSet.has(i)) c.inSet.delete(i); else c.inSet.add(i);
+      sp.className='w '+(c.inSet.has(i)?'in':'out'); c.captions=null;
+      syncUnitsFromWords(div,c); updateSegInfo(div,c); };
+  });
+}
+
+// After word-level edits, re-evaluate which units read as selected.
+function syncUnitsFromWords(div,c){
+  div.querySelectorAll('.sb-unit').forEach(el=>{
+    el.classList.toggle('sel', unitSelected(c,+el.dataset.u));
+  });
+}
+
+function renderTimeline(div,c){
+  const tl=div.querySelector('.sb-timeline'), U=CURRENT.U||[];
+  tl.innerHTML='';
+  if(!U.length){ tl.innerHTML='<div class="hint">no content units in this transcript</div>'; return; }
+  U.forEach((u,ui)=>{
+    const el=document.createElement('div');
+    el.className='sb-unit'+(unitSelected(c,ui)?' sel':'');
+    el.dataset.u=ui;
+    el.style.width=Math.max(70,Math.min(260,(u.end-u.start)*12))+'px';
+    el.innerHTML=`<span class="ut">${fmt(u.start)}</span>${esc(u.summary)||'…'}`;
+    el.onclick=()=>toggleUnit(div,c,ui,el);
+    tl.appendChild(el);
+  });
+  const firstSel=tl.querySelector('.sb-unit.sel');
+  if(firstSel) firstSel.scrollIntoView({inline:'center',block:'nearest'});
+}
+
+function toggleUnit(div,c,ui,el){
+  const idxs=CURRENT.unitWords[ui]||[]; const sel=unitSelected(c,ui);
+  const t=div.querySelector('.sb-tx');
+  for(const i of idxs){
+    if(sel) c.inSet.delete(i); else c.inSet.add(i);
+    const sp=t.querySelector('.w[data-i="'+i+'"]');
+    if(sp) sp.className='w '+(c.inSet.has(i)?'in':'out');
+  }
+  el.classList.toggle('sel', !sel);
+  c.captions=null; updateSegInfo(div,c);
+  const sv=div.querySelector('.sb-src');
+  if(sv && CURRENT.U[ui]){ try{ sv.currentTime=CURRENT.U[ui].start; }catch(e){} }
+}
+
+// Mark the unit currently under the source-video playhead.
+function highlightNowUnit(div,t){
+  const U=CURRENT.U||[]; let lo=0,hi=U.length-1,found=-1;
+  while(lo<=hi){ const m=(lo+hi)>>1;
+    if(t<U[m].start) hi=m-1; else if(t>U[m].end) lo=m+1; else { found=m; break; } }
+  const tl=div.querySelector('.sb-timeline');
+  const prev=tl.querySelector('.sb-unit.now'); if(prev) prev.classList.remove('now');
+  if(found>=0){ const el=tl.querySelector('.sb-unit[data-u="'+found+'"]'); if(el) el.classList.add('now'); }
+  const clk=div.querySelector('.sb-srcclock'); if(clk) clk.textContent='source '+fmt1(t);
+}
+
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>setMode(t.dataset.mode));
 loadProjects();
 </script>
