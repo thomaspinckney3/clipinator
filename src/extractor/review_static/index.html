@@ -91,6 +91,8 @@
   .sb-unit.now { box-shadow:0 0 0 2px var(--accent); }
   .sb-unit .ut { display:block; font-size:.66rem; color:#9a9a9a; margin-bottom:.15rem; font-family:ui-monospace,Menlo,monospace; }
   .sb-unit.sel .ut { color:#4a7a44; }
+  /* karaoke word highlight synced to the source video playhead */
+  .sb-tx .w.spoken { background:#ffd34d; color:#1a1a1a; text-decoration:none; box-shadow:0 0 0 2px #ffd34d; }
   .sb-bottom { margin-top:1.3rem; }
 </style>
 </head>
@@ -708,9 +710,18 @@ function renderStoryboard(c,idx){
   if(!FFMPEG){ rb.disabled=true; rb.title='Install ffmpeg to render finals here'; }
   rb.onclick=()=>renderClipNow(div,c);
   div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
-  // source video playhead highlights the current unit on the timeline
+  // source video playhead drives the timeline "now" marker and karaoke word
+  // highlight. A rAF loop tracks the playhead more smoothly than timeupdate
+  // (which fires ~4x/s, too coarse for fast speech); it stops on pause or when
+  // this storyboard is replaced (element detached).
   const sv=div.querySelector('.sb-src');
-  if(sv) sv.ontimeupdate=()=>highlightNowUnit(div,sv.currentTime);
+  if(sv){
+    const sync=()=>{ highlightNowUnit(div,sv.currentTime); highlightSpokenWord(div,sv.currentTime); };
+    let raf=null;
+    const tick=()=>{ if(!document.contains(sv) || sv.paused){ raf=null; return; } sync(); raf=requestAnimationFrame(tick); };
+    sv.onplay=()=>{ if(!raf) raf=requestAnimationFrame(tick); };
+    sv.onpause=sync; sv.onseeked=sync; sv.ontimeupdate=()=>{ if(!raf) sync(); };
+  }
   updateSegInfo(div,c);
   return div;
 }
@@ -766,6 +777,24 @@ function toggleUnit(div,c,ui,el){
   c.captions=null; updateSegInfo(div,c);
   const sv=div.querySelector('.sb-src');
   if(sv && CURRENT.U[ui]){ try{ sv.currentTime=CURRENT.U[ui].start; }catch(e){} }
+}
+
+// Karaoke highlight: mark the word currently being spoken (rightmost word whose
+// start is at/before the playhead) and keep it scrolled into view. Clears during
+// long silences so a highlight never gets stuck between words.
+function highlightSpokenWord(div,t){
+  const W=CURRENT.W||[], tx=div.querySelector('.sb-tx'); if(!tx) return;
+  let lo=0, hi=W.length-1, idx=-1;
+  while(lo<=hi){ const m=(lo+hi)>>1; if(W[m].start<=t){ idx=m; lo=m+1; } else hi=m-1; }
+  const prev=tx.querySelector('.w.spoken');
+  if(idx<0 || t > W[idx].end + 1.0){ if(prev) prev.classList.remove('spoken'); return; }
+  const el=tx.querySelector('.w[data-i="'+idx+'"]');
+  if(!el || el===prev) return;
+  if(prev) prev.classList.remove('spoken');
+  el.classList.add('spoken');
+  // keep the word visible by nudging only the transcript panel (never the page)
+  const cr=tx.getBoundingClientRect(), er=el.getBoundingClientRect();
+  if(er.top<cr.top || er.bottom>cr.bottom) tx.scrollTop += (er.top-cr.top) - cr.height/2 + er.height/2;
 }
 
 // Mark the unit currently under the source-video playhead.
