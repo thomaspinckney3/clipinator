@@ -82,9 +82,9 @@
   .sb-tl-wrap { margin-top:1.1rem; }
   .sb-timeline { display:flex; gap:5px; overflow-x:auto; padding:.55rem 0; align-items:stretch;
     border-top:1px solid #e4e4e4; border-bottom:1px solid #e4e4e4; }
-  .sb-unit { flex:0 0 auto; min-width:70px; max-width:260px; box-sizing:border-box; border:1px solid #ccc;
+  .sb-unit { flex:0 0 auto; min-width:82px; max-width:150px; box-sizing:border-box; border:1px solid #ccc;
     border-radius:6px; background:#fafafa; padding:.35rem .5rem; cursor:pointer; font-size:.74rem;
-    line-height:1.25; color:#555; user-select:none; transition:background .08s; }
+    line-height:1.25; color:#555; user-select:none; transition:background .08s; overflow-wrap:break-word; }
   .sb-unit:hover { border-color:#999; background:#eef2ff; }
   .sb-unit.sel { background:var(--in); border-color:#7fbf78; color:#1a1a1a; }
   .sb-unit.sel:hover { background:var(--in-h); }
@@ -762,7 +762,7 @@ function renderTimeline(div,c){
     const el=document.createElement('div');
     el.className='sb-unit'+(unitSelected(c,ui)?' sel':'');
     el.dataset.u=ui;
-    el.style.width=Math.max(70,Math.min(260,(u.end-u.start)*12))+'px';
+    el.style.width=Math.max(84,Math.min(150,(u.end-u.start)*10))+'px';
     el.innerHTML=`<span class="ut">${fmt(u.start)}</span>${esc(u.summary)||'…'}`;
     el.onclick=()=>toggleUnit(div,c,ui,el);
     tl.appendChild(el);
