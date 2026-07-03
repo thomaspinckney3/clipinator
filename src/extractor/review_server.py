@@ -4,6 +4,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import socket
 import threading
 import webbrowser
@@ -470,15 +471,45 @@ def clip_words(words: list[dict[str, Any]], segments: list[dict[str, Any]], pad:
     return out
 
 
-def _several_word_summary(text: str, max_words: int = 6) -> str:
-    """A short label for a content unit: the first few words, elided if longer."""
-    words = str(text).split()
-    if not words:
-        return ""
-    summary = " ".join(words[:max_words])
-    if len(words) > max_words:
-        summary += "…"
-    return summary
+# Function words + verbal disfluencies dropped when distilling a unit's gist, so
+# the timeline shows content ("studied best schools") not verbatim lead-ins
+# ("Uh, studied at the best…") that truncate. Compared against each token's base
+# (the part before an apostrophe), so contractions ("we're"->"we", "didn't"->"did")
+# are caught too.
+_SUMMARY_SKIP = frozenset("""
+a an the and or but so if then than that this these those of to in on at for with from by as
+is are was were be been being am do does did doing have has had having will would can could
+should may might must i you he she it we they me him her us them my your his its our their
+not no nor too very just about into over under again here there
+what when where who whom whose why how which while because although though since until whether
+all any some many much few more most other another each every no none thing things stuff one
+get got getting go going make makes made making also even still yet now well
+didn doesn don wasn weren isn aren wouldn couldn shouldn hasn haven hadn won mustn needn mightn ain
+uh um er ah eh hmm mm mhm yeah yep okay ok alright right like actually basically literally
+really kind sort mean know gonna wanna gotta youknow
+""".split())
+
+
+def _pithy_summary(text: str, max_words: int = 3) -> str:
+    """A short label for a content unit: drop disfluencies and stopwords and keep
+    the first few content-bearing words (original casing/order), with no truncation
+    ellipsis so it fits the timeline block. Falls back to the first raw words when a
+    unit is nothing but filler."""
+    # Unicode-aware so "René" survives; keep an internal apostrophe ("We're").
+    tokens = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", str(text))
+    picked: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        base = re.split(r"['’]", tok.lower())[0]  # "we're" -> "we", "couldn't" -> "couldn"
+        if not base or base in _SUMMARY_SKIP or base in seen:
+            continue
+        seen.add(base)
+        picked.append(tok)
+        if len(picked) >= max_words:
+            break
+    if not picked:
+        picked = tokens[:max_words]
+    return " ".join(picked)
 
 
 def transcript_units_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -498,7 +529,7 @@ def transcript_units_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if e > s:
             units.append({"start": round(s, 3), "end": round(e, 3),
-                          "summary": _several_word_summary(text)})
+                          "summary": _pithy_summary(text)})
     if units:
         return units
     # Fallback for word-only transcripts: break on >0.7s pauses or every ~10 words.
@@ -507,7 +538,7 @@ def transcript_units_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
         if group:
             units.append({"start": round(group[0]["start"], 3),
                           "end": round(group[-1]["end"], 3),
-                          "summary": _several_word_summary(" ".join(w["text"] for w in group))})
+                          "summary": _pithy_summary(" ".join(w["text"] for w in group))})
     for w in transcript_words_from_data(data):
         if group and (w["start"] - group[-1]["end"] > 0.7 or len(group) >= 10):
             flush(); group = []
