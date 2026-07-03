@@ -567,6 +567,12 @@ def build_pick_plan(
 
 class ReviewHandler(BaseHTTPRequestHandler):
     server_version = "ClipinatorReview/0.1"
+    # HTTP/1.1 so Chrome will stream byte-ranged <video> media. Recent Chrome
+    # refuses to play range-served video over HTTP/1.0, which reads to the user
+    # as "the render won't play" even though curl/fetch get the bytes fine.
+    # Every response below sends a Content-Length (or closes the connection),
+    # which keep-alive requires.
+    protocol_version = "HTTP/1.1"
 
     # injected by make_server
     allowed_media: set[str] = set()
@@ -607,8 +613,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
         except (BrokenPipeError, ConnectionResetError):
-            pass  # client closed the connection (common while scrubbing video)
+            self.close_connection = True  # client aborted (common while scrubbing video)
         except Exception as exc:  # never leak a traceback to the browser
+            self.close_connection = True  # response may be half-sent; don't reuse the socket
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Something went wrong: {exc}")
 
     def do_POST(self) -> None:
@@ -629,10 +636,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             else:
                 self._error(HTTPStatus.NOT_FOUND, "Not found.")
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            self.close_connection = True
         except RuntimeError as exc:  # validation / known errors -> plain message
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:
+            self.close_connection = True  # response may be half-sent; don't reuse the socket
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not save: {exc}")
 
     def _read_json_body(self) -> dict[str, Any]:
@@ -924,6 +932,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if start > end:
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             status = 206
