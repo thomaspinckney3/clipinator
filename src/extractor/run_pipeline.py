@@ -176,6 +176,14 @@ class PipelinePaths:
         return self.subject_index_dir / self.revise_run_id / "manifest.json"
 
     @property
+    def outline_run_id(self) -> str:
+        return f"{self.run_id_base}-outline"
+
+    @property
+    def outline_output(self) -> Path:
+        return self.openai_runs_dir / self.outline_run_id / "outline-output.json"
+
+    @property
     def strategy_run_id(self) -> str:
         return f"{self.run_id_base}-strategy"
 
@@ -514,6 +522,7 @@ def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
             "final": str(paths.final_subject_index_manifest),
         },
         "stage_outputs": {
+            "outline": str(paths.outline_output),
             "strategy": str(paths.strategy_output),
             "moments": str(paths.moments_output),
             "plan": str(paths.plan_output),
@@ -759,6 +768,24 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
             force=args.force,
         )
         stage_transcript = transcript_for_api_stages(paths)
+
+        # Content outline: label every source unit (title + one-line gist) so a
+        # human editor can see the building blocks without reading the transcript
+        # or watching the video. Runs early; the storyboard review UX reads it.
+        outline = [
+            *python_module("extractor.openai_outline"),
+            "--env-file",
+            str(args.env_file),
+            "--transcript",
+            str(stage_transcript),
+            "--output-dir",
+            str(paths.openai_runs_dir),
+            "--run-id",
+            paths.outline_run_id,
+            *response_cache_args(paths),
+        ]
+        run_api_step(state, "outline", outline, outline, paths.outline_output)
+
         plan_count = plan_clip_count(paths)
         plan_count_args = (
             [

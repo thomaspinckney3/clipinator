@@ -28,6 +28,7 @@ from extractor.edit_list import (
     write_json,
 )
 from extractor.render_plan import transcript_words_from_data
+from extractor.transcript_units import transcript_units_from_data
 
 # Local review server for the clipinator edit editor. Stdlib only (no third-
 # party deps — see project-notes/editor-app/SPEC.md), so it runs under any
@@ -471,83 +472,6 @@ def clip_words(words: list[dict[str, Any]], segments: list[dict[str, Any]], pad:
     return out
 
 
-# Function words + verbal disfluencies dropped when distilling a unit's gist, so
-# the timeline shows content ("studied best schools") not verbatim lead-ins
-# ("Uh, studied at the best…") that truncate. Compared against each token's base
-# (the part before an apostrophe), so contractions ("we're"->"we", "didn't"->"did")
-# are caught too.
-_SUMMARY_SKIP = frozenset("""
-a an the and or but so if then than that this these those of to in on at for with from by as
-is are was were be been being am do does did doing have has had having will would can could
-should may might must i you he she it we they me him her us them my your his its our their
-not no nor too very just about into over under again here there
-what when where who whom whose why how which while because although though since until whether
-all any some many much few more most other another each every no none thing things stuff one
-get got getting go going make makes made making also even still yet now well
-didn doesn don wasn weren isn aren wouldn couldn shouldn hasn haven hadn won mustn needn mightn ain
-uh um er ah eh hmm mm mhm yeah yep okay ok alright right like actually basically literally
-really kind sort mean know gonna wanna gotta youknow
-""".split())
-
-
-def _pithy_summary(text: str, max_words: int = 3) -> str:
-    """A short label for a content unit: drop disfluencies and stopwords and keep
-    the first few content-bearing words (original casing/order), with no truncation
-    ellipsis so it fits the timeline block. Falls back to the first raw words when a
-    unit is nothing but filler."""
-    # Unicode-aware so "René" survives; keep an internal apostrophe ("We're").
-    tokens = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", str(text))
-    picked: list[str] = []
-    seen: set[str] = set()
-    for tok in tokens:
-        base = re.split(r"['’]", tok.lower())[0]  # "we're" -> "we", "couldn't" -> "couldn"
-        if not base or base in _SUMMARY_SKIP or base in seen:
-            continue
-        seen.add(base)
-        picked.append(tok)
-        if len(picked) >= max_words:
-            break
-    if not picked:
-        picked = tokens[:max_words]
-    return " ".join(picked)
-
-
-def transcript_units_from_data(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Logical content units for the storyboard timeline. Prefer the transcript's
-    own segments (real semantic-ish units from the ASR stage); if a transcript has
-    only words, group them on pauses. Each unit carries its source-time span plus a
-    several-word summary the timeline shows as its label."""
-    units: list[dict[str, Any]] = []
-    for seg in data.get("segments") or []:
-        start, end = seg.get("start"), seg.get("end")
-        text = str(seg.get("text", "")).strip()
-        if start is None or end is None or not text:
-            continue
-        try:
-            s, e = float(start), float(end)
-        except (TypeError, ValueError):
-            continue
-        if e > s:
-            units.append({"start": round(s, 3), "end": round(e, 3),
-                          "summary": _pithy_summary(text), "text": text})
-    if units:
-        return units
-    # Fallback for word-only transcripts: break on >0.7s pauses or every ~10 words.
-    group: list[dict[str, Any]] = []
-    def flush() -> None:
-        if group:
-            text = " ".join(w["text"] for w in group)
-            units.append({"start": round(group[0]["start"], 3),
-                          "end": round(group[-1]["end"], 3),
-                          "summary": _pithy_summary(text), "text": text})
-    for w in transcript_words_from_data(data):
-        if group and (w["start"] - group[-1]["end"] > 0.7 or len(group) >= 10):
-            flush(); group = []
-        group.append(w)
-    flush()
-    return units
-
-
 # AI-generated topic labels for the timeline. Heuristic labels (_pithy_summary)
 # are word-salad on conversational speech, so an LLM distills each unit into a
 # real 2-4 word topic. The result is cached to disk keyed by the transcript, so
@@ -626,6 +550,24 @@ def generate_unit_summaries(
     return labels, cost
 
 
+def find_outline_units(run_root: Path, expected_count: int) -> list[dict[str, Any]] | None:
+    """The pipeline outline artifact (openai_outline stage) for this run, if any.
+    Matched by unit count since both derive units from the same transcript, so the
+    outline's title/gist line up with the storyboard timeline positionally."""
+    base = run_root / "openai-runs"
+    if not base.is_dir():
+        return None
+    for p in sorted(base.glob("*-outline/outline-output.json")):
+        try:
+            data = read_json(p)
+        except (OSError, json.JSONDecodeError):
+            continue
+        units = data.get("units")
+        if isinstance(units, list) and len(units) == expected_count:
+            return units
+    return None
+
+
 def project_detail(manifest_path: Path) -> dict[str, Any]:
     manifest = read_json(manifest_path)
     source = manifest.get("source_video")
@@ -634,16 +576,29 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
     words: list[dict[str, Any]] = []
     units: list[dict[str, Any]] = []
     ai_summaries = False
+    outline_source: str | None = None
     if transcript_path and Path(str(transcript_path)).exists():
         tdata = read_json(Path(str(transcript_path)))
         words = transcript_words_from_data(tdata)
         units = transcript_units_from_data(tdata)
-        cached = load_unit_summaries(unit_summary_key(str(transcript_path), units))
-        if cached and len(cached) == len(units):
-            for u, s in zip(units, cached):
-                if s:
-                    u["summary"] = s
+        # Prefer the pipeline outline stage (title + one-line gist per unit);
+        # fall back to the editor's on-demand title-only cache.
+        outline_units = find_outline_units(run_root_of(manifest_path), len(units))
+        if outline_units:
+            for u, o in zip(units, outline_units):
+                if o.get("title"):
+                    u["summary"] = o["title"]
+                u["gist"] = str(o.get("summary") or "")
             ai_summaries = True
+            outline_source = "pipeline"
+        else:
+            cached = load_unit_summaries(unit_summary_key(str(transcript_path), units))
+            if cached and len(cached) == len(units):
+                for u, s in zip(units, cached):
+                    if s:
+                        u["summary"] = s
+                ai_summaries = True
+                outline_source = "cache"
     plan = read_json(Path(str(plan_path))) if plan_path and Path(str(plan_path)).exists() else {}
 
     clips: list[dict[str, Any]] = []
@@ -682,11 +637,14 @@ def project_detail(manifest_path: Path) -> dict[str, Any]:
             for w in words
         ],
         # logical content units for the storyboard timeline (segment summaries).
-        # Strip the full unit text — the client only needs span + label.
+        # Strip the full unit text — the client only needs span + label + gist.
         "transcript_units": [
-            {"start": u["start"], "end": u["end"], "summary": u["summary"]} for u in units
+            {"start": u["start"], "end": u["end"], "summary": u["summary"],
+             **({"gist": u["gist"]} if u.get("gist") else {})}
+            for u in units
         ],
         "ai_summaries": ai_summaries,
+        "outline_source": outline_source,
         "clips": clips,
     }
 
