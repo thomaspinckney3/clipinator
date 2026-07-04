@@ -311,7 +311,7 @@ resumes from that directory unless `--force` or a distinct `--run-id` is used.
 It runs:
 
 ```text
-video -> provider transcript -> local evidence -> strategy -> moments
+video -> provider transcript -> local evidence -> outline -> strategy -> moments
 -> dense visual index from moments candidates -> plan
 -> local subject index -> draft render -> critique -> revise
 -> local subject index -> final render
@@ -357,6 +357,7 @@ clipped to the usable video duration.
   openai-runs/
     _response-cache/              # local response cache shared by all stages
     _critique-assets/<base>-critique/   # contact sheets, transition strips, waveforms
+    <base>-outline/   outline-output.json  outline.md   # source content map for editors
     <base>-strategy/  strategy-output.json
     <base>-moments/   moments-output.json
     <base>-plan/      plan-output.json
@@ -390,6 +391,7 @@ Each `openai-runs/<base>-<stage>/` directory also records the exact request:
 |---|---|---|---|
 | transcribe | `transcribe-video` | video | normalized transcript JSON + SRT |
 | preprocess | `preprocess-video` | video + transcript | evidence manifest, contact sheet, frames |
+| outline | `openai-outline` | transcript | `outline-output.json` + `outline.md` (source content map) |
 | strategy | `openai-strategy` | transcript, evidence manifest, contact sheet | `strategy-output.json` |
 | moments | `openai-moments` | the above + strategy output | `moments-output.json` |
 | visual-index | `visual-index` (local) | video + moments output | dense frame index + candidate sheets |
@@ -535,6 +537,34 @@ the local response-cache source hash.
 
 Set `CLIPINATOR_PROMPT_DIR` to point at an alternate prompt directory with the
 same filenames.
+
+## OpenAI Outline Stage: Source Content Map
+
+The outline stage labels every logical content unit of the source (the same
+transcript segments the storyboard review UX uses) with a short title and a
+one-sentence gist, so a human editor can see what building blocks the source
+offers without reading the transcript or scrubbing the video. It runs early in
+the pipeline, right after transcription.
+
+```bash
+PYTHONPATH=src python -m extractor.openai_outline \
+  --transcript /Volumes/t9/extract/transcripts/example.elevenlabs-scribe_v2.json \
+  --approve-api-cost 5.00
+```
+
+It labels units in batched calls and caches the result to disk keyed by the
+transcript, so a repeat run is free. Outputs under `OUTLINE_OUTPUT_DIR`:
+
+```text
+outline-output.json   # units: [{index, start, end, title, summary}]
+outline.md            # a scannable outline an editor can read top-to-bottom
+request-manifest.json  raw-response.json  usage-and-cost.json
+```
+
+The review editor's Storyboard tab reads `outline-output.json` and shows each
+unit's title on the timeline, with the one-line gist on hover. Per-stage env
+config lives under the `OUTLINE_*` family (model, effort, pricing), falling back
+to `STRATEGY_*`.
 
 ## OpenAI Strategy Stage: Video Brief And Ad Angles
 

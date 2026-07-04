@@ -98,6 +98,8 @@
   .sumbtn:disabled { opacity:.4; cursor:default; border-color:#bbb; color:#999; }
   .sumstatus button { font:inherit; font-size:.76rem; padding:.1rem .5rem; margin-left:.2rem; border-radius:4px; cursor:pointer; border:1px solid #ccc; background:#fff; }
   .sumstatus button.cfm-yes { border-color:#3a5bd9; color:#3a5bd9; }
+  .sb-unit-detail { margin-top:.4rem; min-height:1.2rem; font-size:.82rem; color:#444; }
+  .sb-unit-detail b { color:#1a1a1a; }
 </style>
 </head>
 <body>
@@ -626,6 +628,7 @@ async function loadStoryboardProject(id){
   CURRENT=proj;
   const W=proj.transcript_words||[]; CURRENT.W=W; CURRENT.U=proj.transcript_units||[];
   CURRENT.aiSummaries=!!proj.ai_summaries;
+  CURRENT.outlineSource=proj.outline_source||null;
   CURRENT.tend=W.length?W[W.length-1].end:0;
   proj.clips.forEach(c=>{
     c.decision='keep'; c.framing=+c.framing_offset||0; c.cardText=c.title_card_text||'';
@@ -685,6 +688,7 @@ function renderStoryboard(c,idx){
       <div class="hint">source timeline — each block is a content unit; click to include/exclude it in this clip · <span class="seginfo"></span>
         <button class="sumbtn">✨ AI labels</button><span class="hint sumstatus"></span></div>
       <div class="sb-timeline"></div>
+      <div class="sb-unit-detail hint">hover a unit to read what happens in it</div>
     </div>
     <div class="row sb-bottom">
       <div class="col"><div class="hint">current render</div>${c.preview_url?`<video src="${c.preview_url}" controls preload="metadata"></video>`:'<div class="hint">not rendered yet</div>'}</div>
@@ -722,11 +726,17 @@ function renderStoryboard(c,idx){
   rb.onclick=()=>renderClipNow(div,c);
   div.querySelector('.saveclip').onclick=()=>saveClip(div,c);
   div.querySelector('.cardtext').oninput=e=>{ c.cardText=e.target.value; };
-  // AI topic labels for the timeline (batched + cached server-side)
+  // AI labels: the pipeline "outline" stage is the primary source (title + gist).
+  // The on-demand button is a fallback for projects that weren't run through it.
   const sumb=div.querySelector('.sumbtn');
-  if(!AI){ sumb.disabled=true; sumb.title='Set OPENAI_API_KEY in .env to enable AI labels'; }
-  if(CURRENT.aiSummaries) sumb.textContent='✨ AI labels ✓';
-  sumb.onclick=()=>confirmUnitSummaries(div,c);
+  if(CURRENT.outlineSource==='pipeline'){
+    sumb.style.display='none';
+    div.querySelector('.sumstatus').textContent='labels from pipeline outline stage';
+  } else {
+    if(!AI){ sumb.disabled=true; sumb.title='Set OPENAI_API_KEY in .env to enable AI labels'; }
+    if(CURRENT.aiSummaries) sumb.textContent='✨ AI labels ✓';
+    sumb.onclick=()=>confirmUnitSummaries(div,c);
+  }
   // source video playhead drives the timeline "now" marker and karaoke word
   // highlight. A rAF loop tracks the playhead more smoothly than timeupdate
   // (which fires ~4x/s, too coarse for fast speech); it stops on pause or when
@@ -767,6 +777,8 @@ function syncUnitsFromWords(div,c){
 
 function renderTimeline(div,c){
   const tl=div.querySelector('.sb-timeline'), U=CURRENT.U||[];
+  const detail=div.querySelector('.sb-unit-detail');
+  const showDetail=u=>{ if(detail) detail.innerHTML=`<b>${esc(u.summary)||'—'}</b>${u.gist?(' — '+esc(u.gist)):''}`; };
   tl.innerHTML='';
   if(!U.length){ tl.innerHTML='<div class="hint">no content units in this transcript</div>'; return; }
   U.forEach((u,ui)=>{
@@ -775,6 +787,8 @@ function renderTimeline(div,c){
     el.dataset.u=ui;
     el.style.width=Math.max(84,Math.min(150,(u.end-u.start)*10))+'px';
     el.innerHTML=`<span class="ut">${fmt(u.start)}</span>${esc(u.summary)||'…'}`;
+    if(u.gist) el.title=u.gist;                 // native tooltip with the one-liner
+    el.onmouseenter=()=>showDetail(u);          // and a persistent detail line
     el.onclick=()=>toggleUnit(div,c,ui,el);
     tl.appendChild(el);
   });
