@@ -127,15 +127,32 @@ def build_clips(project_dir: Path, render_manifest: Path, plan: dict[str, Any],
 def write_project_json(project_dir: Path, project_slug: str, *, content_mode: str,
                        original_master: str, promoted_from: str, archived: list[str],
                        clips: list[dict[str, Any]], created_at: str | None = None) -> None:
-    (project_dir / "project.json").write_text(json.dumps({
-        "schema_version": 1,
-        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
-        "content_mode": content_mode,
+    """Record this run's finished clips under project.json, partitioned by content
+    mode. A run updates ONLY its own mode's slot (`modes.<mode>`) and preserves the
+    others — so any mix/order of independent ad and excerpt runs leaves the project
+    reflecting the latest run of each mode, with neither clobbering the other."""
+    path = project_dir / "project.json"
+    now = created_at or datetime.now(timezone.utc).isoformat()
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, ValueError):
+            existing = {}
+    modes = existing.get("modes") if isinstance(existing.get("modes"), dict) else {}
+    modes[content_mode] = {
+        "clips_dir": deliverables_dirname(content_mode),
+        "generated_at": now,
+        "provenance": {"promoted_from": promoted_from, "archived": archived},
+        "clips": clips,
+    }
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "created_at": existing.get("created_at") or now,
+        "updated_at": now,
         "source": {"slug": project_slug, "master": "media/source.mp4",
                    "original_master": original_master},
-        "provenance": {"promoted_from": promoted_from, "archived": archived},
-        "clips_dir": deliverables_dirname(content_mode),
-        "clips": clips,
+        "modes": modes,
     }, indent=2))
 
 

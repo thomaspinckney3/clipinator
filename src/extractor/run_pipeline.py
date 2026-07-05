@@ -495,12 +495,15 @@ def visual_index_rebuild_decision(
 
 
 def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
-    payload: dict[str, Any] = {
-        "schema_version": 1,
+    # Partitioned by content mode under "runs": a run rewrites only its own mode's
+    # entry and preserves the others, so independent ad/excerpt runs in any order
+    # never clobber each other's state or cost history. The file stays named
+    # pipeline-manifest.json (run-root detection keys off its existence).
+    run_payload: dict[str, Any] = {
+        "content_mode": paths.content_mode,
         "created_at": datetime.now(UTC).isoformat(),
         "video": str(paths.video),
         "run_root": str(paths.run_root),
-        "content_mode": paths.content_mode,
         "transcript": str(paths.transcript_json),
         "available_transcript": (
             str(paths.available_transcript_json)
@@ -543,8 +546,24 @@ def write_pipeline_manifest(paths: PipelinePaths, state: PipelineState) -> None:
         "total_actual_or_reserved_usd": state.spent_or_reserved_usd,
     }
     paths.run_root.mkdir(parents=True, exist_ok=True)
-    (paths.run_root / "pipeline-manifest.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    manifest_path = paths.run_root / "pipeline-manifest.json"
+    existing: dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = {}
+    runs = existing.get("runs") if isinstance(existing.get("runs"), dict) else {}
+    runs[paths.content_mode] = run_payload
+    manifest = {
+        "schema_version": 2,
+        "created_at": existing.get("created_at") or run_payload["created_at"],
+        "updated_at": datetime.now(UTC).isoformat(),
+        "run_root": str(paths.run_root),
+        "runs": runs,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 
@@ -555,7 +574,13 @@ def load_pipeline_state(paths: PipelinePaths, approved_cap_usd: float | None) ->
     if not manifest_path.exists():
         return state
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for item in manifest.get("costs", []) or []:
+    runs = manifest.get("runs")
+    if isinstance(runs, dict):
+        run = runs.get(paths.content_mode) or {}
+    else:
+        # legacy flat manifest: only adopt its costs if it recorded this same mode.
+        run = manifest if manifest.get("content_mode") == paths.content_mode else {}
+    for item in run.get("costs", []) or []:
         state.cost_records.append(
             CostRecord(
                 stage=str(item.get("stage", "")),

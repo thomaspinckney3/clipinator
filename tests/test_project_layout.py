@@ -101,13 +101,32 @@ class TestGenerateLayout:
         assert pj["source"]["slug"] == "ergo-demo"
         assert pj["source"]["master"] == "media/source.mp4"
         assert pj["source"]["original_master"] == "orig.mp4"
-        assert pj["content_mode"] == "excerpt"
-        assert pj["clips_dir"] == "excerpts"
-        assert len(pj["clips"]) == 1
+        assert pj["modes"]["excerpt"]["clips_dir"] == "excerpts"
+        assert len(pj["modes"]["excerpt"]["clips"]) == 1
 
     def test_no_render_manifest_still_writes_project_json(self, tmp_path):
         proj = tmp_path / "p"; proj.mkdir()
         pl.generate_layout(proj, None, make_plan(), "p", content_mode="ad",
                            original_master="o.mp4", promoted_from="p")
         assert (proj / "project.json").exists()
-        assert json.loads((proj / "project.json").read_text())["clips"] == []
+        assert json.loads((proj / "project.json").read_text())["modes"]["ad"]["clips"] == []
+
+    def test_modes_coexist_regardless_of_run_order(self, tmp_path):
+        # Run excerpt, then ad, into the same project: each updates only its own
+        # mode slot, so the project reflects the latest of BOTH — neither clobbers
+        # the other. This is what makes independent single-mode runs safe.
+        proj = tmp_path / "proj"; proj.mkdir()
+        ex_plan = make_plan([make_clip("EX01")])
+        pl.generate_layout(proj, _fake_render(proj, ["EX01"]), ex_plan, "proj",
+                           content_mode="excerpt", original_master="o.mp4", promoted_from="proj")
+        # a later ad run must not erase the excerpt slot
+        (proj / "_renders").rename(proj / "_renders-ex")  # move the excerpt render aside
+        ad_plan = make_plan([make_clip("AD01"), make_clip("AD02")])
+        pl.generate_layout(proj, _fake_render(proj, ["AD01", "AD02"]), ad_plan, "proj",
+                           content_mode="ad", original_master="o.mp4", promoted_from="proj")
+        pj = json.loads((proj / "project.json").read_text())
+        assert set(pj["modes"]) == {"excerpt", "ad"}
+        assert len(pj["modes"]["excerpt"]["clips"]) == 1
+        assert len(pj["modes"]["ad"]["clips"]) == 2
+        assert pj["modes"]["excerpt"]["clips_dir"] == "excerpts"
+        assert pj["modes"]["ad"]["clips_dir"] == "ads"
