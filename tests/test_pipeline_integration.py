@@ -133,3 +133,35 @@ class TestSubjectIndexNoAPI:
         manifest = json.loads((out / "run-plan" / "manifest.json").read_text())
         assert manifest["api_calls"] is False
         assert manifest["entries"] if "entries" in manifest else manifest.get("entry_count", 1)
+
+
+def _paths(run_root: Path, mode: str):
+    from extractor.run_pipeline import PipelinePaths
+    return PipelinePaths(
+        video=run_root / "media" / "source.mp4", run_root=run_root, stem="source",
+        run_id_base=("s" if mode == "ad" else "s-excerpt"), content_mode=mode,
+        transcribe_provider="elevenlabs", transcribe_model="scribe_v2", render_variant=None)
+
+
+def test_pipeline_manifest_partitions_state_by_mode(tmp_path):
+    # Independent ad/excerpt runs must not clobber each other's state or leak costs
+    # across caps. An excerpt run started after an ad run sees a clean slate, and
+    # both runs' cost history is preserved and readable per mode.
+    from extractor.run_pipeline import PipelineState, write_pipeline_manifest, load_pipeline_state
+    root = tmp_path / "proj"; root.mkdir()
+
+    ad = PipelineState(approved_cap_usd=10.0)
+    ad.record("strategy", estimate_usd=2.0, actual_usd=2.0, cache_hit=False)
+    write_pipeline_manifest(_paths(root, "ad"), ad)
+
+    # excerpt run must NOT inherit the ad run's $2 against its own cap
+    ex = load_pipeline_state(_paths(root, "excerpt"), approved_cap_usd=10.0)
+    assert ex.spent_or_reserved_usd == 0.0
+    ex.record("strategy", estimate_usd=3.0, actual_usd=3.0, cache_hit=False)
+    write_pipeline_manifest(_paths(root, "excerpt"), ex)
+
+    manifest = json.loads((root / "pipeline-manifest.json").read_text())
+    assert set(manifest["runs"]) == {"ad", "excerpt"}
+    # each mode loads only its own costs; the ad run was not erased by the excerpt run
+    assert load_pipeline_state(_paths(root, "ad"), 10.0).spent_or_reserved_usd == 2.0
+    assert load_pipeline_state(_paths(root, "excerpt"), 10.0).spent_or_reserved_usd == 3.0
