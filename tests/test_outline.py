@@ -42,12 +42,26 @@ def test_pithy_summary_skips_contractions_and_ellipsis():
 
 
 def test_outline_cache_key_is_stable_and_model_sensitive():
-    units = [{"start": 0.0, "end": 4.5}, {"start": 5.0, "end": 9.0}]
-    a = openai_outline.outline_cache_key("/x/t.json", units, "gpt-5.5", "low")
-    b = openai_outline.outline_cache_key("/x/t.json", units, "gpt-5.5", "low")
-    c = openai_outline.outline_cache_key("/x/t.json", units, "gpt-6", "low")
+    units = [
+        {"start": 0.0, "end": 4.5, "text": "hello"},
+        {"start": 5.0, "end": 9.0, "text": "world"},
+    ]
+    a = openai_outline.outline_cache_key(units, "gpt-5.5", "low")
+    b = openai_outline.outline_cache_key(units, "gpt-5.5", "low")
+    c = openai_outline.outline_cache_key(units, "gpt-6", "low")
     assert a == b
     assert a != c
+
+
+def test_outline_cache_key_is_location_independent_but_content_sensitive():
+    # Same content -> same key regardless of where the transcript lived (the key no
+    # longer takes a path at all), so a relocated project reuses its outline cache.
+    units = [{"start": 0.0, "end": 4.5, "text": "the moon is bright"}]
+    key = openai_outline.outline_cache_key(units, "gpt-5.5", "low")
+    # ...but changing the spoken words (same timings) must change the key: the old
+    # timings-only key collided here.
+    reworded = [{"start": 0.0, "end": 4.5, "text": "the sun is bright"}]
+    assert openai_outline.outline_cache_key(reworded, "gpt-5.5", "low") != key
 
 
 def test_outline_output_payload_shape(tmp_path):

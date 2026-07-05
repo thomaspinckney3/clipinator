@@ -15,6 +15,23 @@ def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+# Filesystem-location fields — absolute paths, OS filenames, file stems — must
+# never enter a cache fingerprint. The cache is content-addressed, so the same
+# inputs reused from a new location (e.g. after the source-centric layout pulls a
+# master to <project>/media/source.mp4, renaming it) must yield the same key and
+# reuse the cached response. These fields describe *where* a file lives, not
+# *what* it contains, so they are stripped before a manifest/transcript is
+# rendered into a prompt.
+LOCATION_KEYS = ("path", "filename", "stem")
+
+
+def without_location(value: dict[str, Any] | None) -> dict[str, Any]:
+    """A copy of a metadata dict with filesystem-location keys removed, so it can
+    be embedded in a cache fingerprint without coupling the key to where files
+    live. See LOCATION_KEYS."""
+    return {k: v for k, v in (value or {}).items() if k not in LOCATION_KEYS}
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

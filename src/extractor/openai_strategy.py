@@ -259,7 +259,9 @@ def compact_transcript(transcript: dict[str, Any]) -> dict[str, Any]:
         "provider": transcript.get("provider"),
         "model": transcript.get("model"),
         "language": transcript.get("language"),
-        "source": transcript.get("source"),
+        # Drop the source's path/filename (location) but keep its durations and
+        # truncation flag (content) so the fingerprint ignores where the file is.
+        "source": stage_cache.without_location(transcript.get("source")),
         "segments": [
             {
                 "start": segment.get("start"),
@@ -280,7 +282,9 @@ def compact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     transcript = manifest.get("transcript") or {}
     qa = transcript.get("qa") or {}
     return {
-        "video": manifest.get("video"),
+        # "video" (path/filename/stem) is intentionally omitted: it is pure
+        # filesystem location, so including it would couple this stage's cache
+        # key to where the master lives. See stage_cache.without_location.
         "media": manifest.get("media"),
         "visual": {
             "frame_interval_seconds": visual.get("frame_interval_seconds"),
@@ -300,7 +304,7 @@ def compact_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "silences": audio.get("silences"),
         },
         "transcript": {
-            "path": transcript.get("path"),
+            # "path" omitted: location, not content (see stage_cache).
             "segment_count": transcript.get("segment_count"),
             "word_count": transcript.get("word_count"),
             "qa": {
