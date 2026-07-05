@@ -180,6 +180,88 @@ class TestNleViews:
         assert (tmp_path / "edit-list.edl").exists()
 
 
+def make_outline_units():
+    # unit 0 overlaps the kept span (1-9) -> kept; unit 1 is far away -> dropped
+    return [
+        {"index": 0, "start": 0.5, "end": 3.0, "title": "Alpha", "summary": "the alpha bit"},
+        {"index": 1, "start": 50.0, "end": 55.0, "title": "Omega", "summary": "the omega bit"},
+    ]
+
+
+def build_with_outline(plan, units, duration=60.0):
+    return plan_to_otio(
+        plan, source_url="../../source.mp4", source_rate=RATE, transcript_words=[],
+        plan_rel="../../plan.json", transcript_rel="../../t.json",
+        outline_units=units, source_duration=duration,
+    )
+
+
+def outline_tracks(tl):
+    return [t for t in tl.tracks
+            if t.metadata.get(METADATA_NS, {}).get("role") == "source_outline"]
+
+
+class TestOutlineMarkers:
+    def test_track_and_markers_built(self):
+        plan = make_plan([make_clip("EX01", card=0.0, segments=[(1.0, 9.0)])])
+        tl = build_with_outline(plan, make_outline_units())
+        tracks = outline_tracks(tl)
+        assert len(tracks) == 1
+        source = list(tracks[0])[0]  # the full-source reference clip
+        markers = source.markers
+        assert [m.name for m in markers] == ["Alpha", "Omega"]
+        assert markers[0].marked_range.start_time.to_seconds() == pytest.approx(0.5, abs=FRAME)
+        assert markers[0].metadata[METADATA_NS]["summary"] == "the alpha bit"
+
+    def test_marker_color_marks_kept_vs_dropped(self):
+        plan = make_plan([make_clip("EX01", card=0.0, segments=[(1.0, 9.0)])])
+        tl = build_with_outline(plan, make_outline_units())
+        markers = list(list(outline_tracks(tl)[0])[0].markers)
+        assert markers[0].color == otio.schema.MarkerColor.GREEN  # overlaps kept 1-9
+        assert markers[0].metadata[METADATA_NS]["kept"] is True
+        assert markers[1].color == otio.schema.MarkerColor.RED     # 50-55, not kept
+        assert markers[1].metadata[METADATA_NS]["kept"] is False
+
+    def test_no_outline_no_track(self):
+        tl = build_timeline(make_plan([make_clip("EX01")]))
+        assert outline_tracks(tl) == []
+
+    def test_outline_track_skipped_on_import(self):
+        plan = make_plan([make_clip("EX01"), make_clip("EX02")])
+        tl = build_with_outline(plan, make_outline_units())
+        edits = otio_to_edits(tl)
+        # the Source outline track must not be read back as a clip
+        assert [c["clip_id"] for c in edits["clips"]] == ["EX01", "EX02"]
+
+    def test_markers_survive_otio_json_round_trip(self):
+        plan = make_plan([make_clip("EX01", card=0.0, segments=[(1.0, 9.0)])])
+        tl = build_with_outline(plan, make_outline_units())
+        tl2 = otio.adapters.read_from_string(
+            otio.adapters.write_to_string(tl, "otio_json"), "otio_json")
+        markers = list(list(outline_tracks(tl2)[0])[0].markers)
+        assert markers[0].name == "Alpha"
+        assert markers[0].metadata[METADATA_NS]["summary"] == "the alpha bit"
+        assert markers[0].color == otio.schema.MarkerColor.GREEN
+
+    def test_export_auto_discovers_outline(self, run_dir):
+        import json
+        out_dir = run_dir / "openai-runs" / "run-outline"
+        out_dir.mkdir(parents=True)
+        (out_dir / "outline-output.json").write_text(
+            json.dumps({"units": make_outline_units()}), encoding="utf-8")
+        plan_path = run_dir / "openai-runs" / "run-plan" / "plan-output.json"
+        manifest = run_dir / "renders" / "excerpt" / "draft" / "render-manifest.json"
+        import argparse
+        rc = otio_edl.run_export(argparse.Namespace(
+            plan_output=plan_path, render_manifest=manifest,
+            transcript=None, source_video=None, outline=None, output_dir=None))
+        assert rc == 0
+        tl = otio.adapters.read_from_file(
+            str(run_dir / "review" / "draft" / "edit-list.otio"), "otio_json")
+        assert len(outline_tracks(tl)) == 1
+        assert len(list(list(outline_tracks(tl)[0])[0].markers)) == 2
+
+
 class TestExportImportCLI:
     def _args(self, **kw):
         import argparse
@@ -190,7 +272,7 @@ class TestExportImportCLI:
         manifest = run_dir / "renders" / "excerpt" / "draft" / "render-manifest.json"
         rc = otio_edl.run_export(self._args(
             plan_output=plan_path, render_manifest=manifest,
-            transcript=None, source_video=None, output_dir=None))
+            transcript=None, source_video=None, outline=None, output_dir=None))
         assert rc == 0
         otio_path = run_dir / "review" / "draft" / "edit-list.otio"
         assert otio_path.exists()

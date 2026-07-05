@@ -35,6 +35,13 @@ from extractor.timebase import probe_frame_rate
 # (cut geometry only — they cannot carry our metadata). Import reads an .otio
 # back into the same edit-list overlay the TOML path uses, so both funnel
 # through edit_list.apply_edits and stay consistent.
+#
+# When the run has an `outline`, a "Source outline" track is added to the .otio: a
+# full-source reference clip carrying one Marker per content unit (title + one-line
+# summary, colored by whether the unit made the cut), so an editor can grasp the
+# whole video from the timeline without watching it. Premiere/Resolve read these
+# markers natively. The single-track EDL/FCPXML views can't hold a second overview
+# track, so they stay cut-geometry-only and omit it. It's a scannable map, not a cut.
 
 METADATA_NS = "clipinator"
 DEFAULT_FRAME_RATE = Fraction(24000, 1001)
@@ -67,6 +74,86 @@ def probe_duration(video: Path) -> float | None:
 # plan -> OTIO
 
 
+def _kept_source_ranges(plan: dict[str, Any]) -> list[tuple[float, float]]:
+    """Every source span the plan actually keeps, so the outline can mark which
+    content units made the cut."""
+    ranges: list[tuple[float, float]] = []
+    for clip in plan.get("clip_ads", []) or []:
+        for seg in clip_segments(clip):
+            ranges.append((float(seg["source_in"]), float(seg["source_out"])))
+    return ranges
+
+
+def _unit_is_kept(start: float, end: float, kept: list[tuple[float, float]]) -> bool:
+    return any(ks < end and start < ke for ks, ke in kept)
+
+
+def outline_track(
+    units: list[dict[str, Any]] | None,
+    *,
+    source_url: str,
+    source_rate: Fraction,
+    source_duration: float | None,
+    kept_ranges: list[tuple[float, float]],
+) -> otio.schema.Track:
+    """A full-source reference track whose markers summarize each content unit
+    (title + one-line gist, at true source timecodes), so an editor can grasp the
+    whole video from the timeline without watching it. It's a scannable map, not a
+    cut: markers ride in the canonical .otio only (Premiere/Resolve read them
+    natively; the single-track EDL/FCPXML views can't carry a second overview track
+    and omit it). Tagged role=source_outline so import ignores it — never a clip."""
+    track = otio.schema.Track(name="Source outline", kind=otio.schema.TrackKind.Video)
+    track.metadata[METADATA_NS] = {"role": "source_outline"}
+    units = [u for u in (units or [])
+             if isinstance(u, dict) and u.get("start") is not None and u.get("end") is not None]
+    if not units:
+        return track
+    span = source_duration or max(float(u["end"]) for u in units)
+    frame = 1.0 / float(source_rate)
+    source = otio.schema.Clip(
+        name="Full source",
+        source_range=_range(0.0, span, source_rate),
+        media_reference=otio.schema.ExternalReference(
+            target_url=source_url, available_range=_range(0.0, span, source_rate)),
+    )
+    for u in units:
+        start, end = float(u["start"]), float(u["end"])
+        kept = _unit_is_kept(start, end, kept_ranges)
+        title = str(u.get("title") or u.get("summary") or "").strip() or f"Section {u.get('index')}"
+        marker = otio.schema.Marker(
+            name=title,
+            marked_range=_range(start, max(end - start, frame), source_rate),
+            color=otio.schema.MarkerColor.GREEN if kept else otio.schema.MarkerColor.RED,
+        )
+        marker.metadata[METADATA_NS] = {
+            "index": u.get("index"),
+            "summary": str(u.get("summary") or ""),
+            "kept": kept,
+        }
+        source.markers.append(marker)
+    track.append(source)
+    return track
+
+
+def load_outline_units(run_root: Path | None, explicit: Path | None) -> list[dict[str, Any]]:
+    """The `outline` stage's content units (index/start/end/title/summary) for the
+    storyboard markers. Prefer an explicit path; else discover the run's
+    outline-output.json. Missing outline is fine — markers are just omitted."""
+    path: Path | None = None
+    if explicit is not None:
+        path = explicit.expanduser().resolve()
+    elif run_root is not None:
+        matches = sorted(run_root.glob("openai-runs/*-outline/outline-output.json"))
+        path = matches[-1] if matches else None
+    if path is None or not path.exists():
+        return []
+    try:
+        data = read_json(path)
+    except (OSError, ValueError):
+        return []
+    return [u for u in (data.get("units") or []) if isinstance(u, dict)]
+
+
 def plan_to_otio(
     plan: dict[str, Any],
     *,
@@ -75,6 +162,8 @@ def plan_to_otio(
     transcript_words: list[dict[str, Any]],
     plan_rel: str,
     transcript_rel: str | None,
+    outline_units: list[dict[str, Any]] | None = None,
+    source_duration: float | None = None,
 ) -> otio.schema.Timeline:
     timeline = otio.schema.Timeline(name=str(plan.get("video_title", "clipinator")))
     timeline.metadata[METADATA_NS] = {
@@ -119,6 +208,12 @@ def plan_to_otio(
                 media_reference=otio.schema.ExternalReference(target_url=source_url),
             ))
         timeline.tracks.append(track)
+    outline = outline_track(
+        outline_units, source_url=source_url, source_rate=source_rate,
+        source_duration=source_duration, kept_ranges=_kept_source_ranges(plan),
+    )
+    if len(outline):  # only when the run has an outline
+        timeline.tracks.append(outline)
     return timeline
 
 
@@ -165,6 +260,8 @@ def otio_to_edits(timeline: otio.schema.Timeline) -> dict[str, Any]:
     clips: list[dict[str, Any]] = []
     for track in timeline.tracks:
         tmeta = dict(track.metadata.get(METADATA_NS, {}) or {})
+        if tmeta.get("role") == "source_outline":
+            continue  # the storyboard overview track is a map, not a clip
         clip_id = str(tmeta.get("clip_id") or track.name or "")
         segments: list[dict[str, Any]] = []
         for child in track:
@@ -261,6 +358,8 @@ def run_export(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     source_rate = probe_frame_rate(source_video) or DEFAULT_FRAME_RATE
+    source_duration = probe_duration(source_video)
+    outline_units = load_outline_units(run_root, getattr(args, "outline", None))
     timeline = plan_to_otio(
         plan,
         source_url=relative_path(source_video, output_dir) or str(source_video),
@@ -268,16 +367,20 @@ def run_export(args: argparse.Namespace) -> int:
         transcript_words=words,
         plan_rel=relative_path(plan_path, output_dir) or str(plan_path),
         transcript_rel=relative_path(transcript_path, output_dir) if transcript_path else None,
+        outline_units=outline_units,
+        source_duration=source_duration,
     )
     otio_path = output_dir / "edit-list.otio"
     otio.adapters.write_to_file(timeline, str(otio_path), adapter_name="otio_json")
     nle_timeline = flatten_for_nle(
         plan, source_url=relative_path(source_video, output_dir) or str(source_video),
-        source_rate=source_rate, source_duration=probe_duration(source_video),
+        source_rate=source_rate, source_duration=source_duration,
     )
     views = write_nle_views(nle_timeline, output_dir, "edit-list")
 
     print(f"Exported {len(plan.get('clip_ads', []) or [])} clip(s) to OTIO:")
+    if outline_units:
+        print(f"  + storyboard: {len(outline_units)} content-unit markers on a Source outline track")
     print(f"  OTIO (Premiere/Resolve): {otio_path}")
     for ext, path in views.items():
         print(f"  {ext.upper()}: {path}")
@@ -345,6 +448,8 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--render-manifest", type=Path, default=None)
     export.add_argument("--transcript", type=Path, default=None)
     export.add_argument("--source-video", type=Path, default=None)
+    export.add_argument("--outline", type=Path, default=None,
+                        help="outline-output.json for storyboard markers (auto-discovered if omitted).")
     export.add_argument("--output-dir", type=Path, default=None)
     export.set_defaults(func=run_export)
 
