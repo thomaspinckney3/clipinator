@@ -77,6 +77,22 @@ class TestLocalRenderNoAPI:
         assert 4.0 <= dur <= 11.0, f"unexpected rendered duration {dur:.2f}s"
         assert Path(clips[0]["srt_path"]).exists()
 
+    def test_project_layout_from_real_render(self, local_run):
+        # Render a real clip, then build the source-centric overlay the pipeline
+        # generates post-render, and confirm the clips point at real playable files.
+        root, plan_path, tr_path, video = local_run
+        from extractor import project_layout as pl
+        manifest = root / "_renders" / "final" / "render-manifest.json"
+        render(plan_path, video, tr_path, manifest.parent)
+        plan = json.loads(plan_path.read_text())
+        clips = pl.generate_layout(root, manifest, plan, "demo-project", content_mode="excerpt",
+                                   original_master="orig.mp4", promoted_from="demo-project")
+        assert len(clips) == 1
+        ex = root / "excerpts" / clips[0]["slug"]
+        assert ffprobe_duration(ex / "final.mp4") > 1.0  # real, playable
+        assert (ex / "captions.srt").exists() and (ex / "metadata.json").exists()
+        assert json.loads((root / "project.json").read_text())["source"]["master"] == "media/source.mp4"
+
     def test_otio_round_trip_then_rerender(self, local_run):
         root, plan_path, tr_path, video = local_run
         draft = root / "renders" / "draft"

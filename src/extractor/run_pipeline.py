@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from extractor import stage_cache
+from extractor.project_layout import establish_media, generate_layout, source_slug
 from extractor.preprocess_video import (
     DEFAULT_FFMPEG_BIN,
     DEFAULT_FFMPEG_HWACCEL,
@@ -231,8 +232,8 @@ class PipelinePaths:
     def draft_render_dir(self) -> Path:
         stage_dir = f"{self.render_variant}-draft" if self.render_variant else "draft"
         if self.content_mode != "ad":
-            return self.run_root / "renders" / self.content_mode / stage_dir
-        return self.run_root / "renders" / stage_dir
+            return self.run_root / "_renders" / self.content_mode / stage_dir
+        return self.run_root / "_renders" / stage_dir
 
     @property
     def draft_render_manifest(self) -> Path:
@@ -242,8 +243,8 @@ class PipelinePaths:
     def final_render_dir(self) -> Path:
         stage_dir = f"{self.render_variant}-final" if self.render_variant else "final"
         if self.content_mode != "ad":
-            return self.run_root / "renders" / self.content_mode / stage_dir
-        return self.run_root / "renders" / stage_dir
+            return self.run_root / "_renders" / self.content_mode / stage_dir
+        return self.run_root / "_renders" / stage_dir
 
     @property
     def final_render_manifest(self) -> Path:
@@ -257,10 +258,6 @@ def utc_timestamp() -> str:
 def safe_run_id(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
     return cleaned.strip(".-") or "run"
-
-
-def default_run_root(video: Path) -> Path:
-    return video.parent / safe_stem(video)
 
 
 def command_text(args: list[str]) -> str:
@@ -700,29 +697,49 @@ def plan_max_output_tokens(clip_count: int) -> int:
 
 
 def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
-    video = args.video.expanduser().resolve()
-    if not video.exists():
-        raise FileNotFoundError(video)
+    input_video = args.video.expanduser().resolve()
+    if not input_video.exists():
+        raise FileNotFoundError(input_video)
 
     load_env_file(args.env_file)
     transcribe_provider = resolve_transcribe_provider(args.transcribe_provider)
     transcribe_model = resolve_transcribe_model(transcribe_provider, args.transcribe_model)
-    stem = safe_stem(video)
+
+    # Source-centric project layout: the run root is a project dir named for the
+    # source, and the master is pulled into <project>/media/source.mp4 so the
+    # project is self-contained on its own disk. Re-running on an already-
+    # established project (media/source.mp4) or with --output-root reuses it.
+    original_master = input_video.name
+    if args.output_root:
+        project_dir = args.output_root.expanduser().resolve()
+        video = establish_media(project_dir, input_video)
+    elif input_video.name == "source.mp4" and input_video.parent.name == "media":
+        project_dir = input_video.parent.parent
+        video = input_video
+    else:
+        base = args.library.expanduser().resolve() if args.library else input_video.parent
+        project_dir = base / source_slug(input_video)
+        video = establish_media(project_dir, input_video)
+    # run_id naming uses the human project name; but the per-stage output subdirs
+    # (video-evidence/<stem>/, visual-index/<stem>/, transcripts/<stem>.*) must use
+    # the *video's* stem, because preprocess/visual_index/transcribe derive their
+    # output paths from the media filename. Under the source-centric layout the
+    # master is always media/source.mp4, so that stem is "source" — keeping the two
+    # separate is what lets the pipeline find the files the tools actually write.
+    stem = project_dir.name
+    path_stem = safe_stem(video)
+
     run_id_parts = [stem]
     if args.content_mode != "ad":
         run_id_parts.append(args.content_mode)
     if args.run_id is not None:
         run_id_parts.append(safe_run_id(args.run_id))
     run_id_base = "-".join(run_id_parts)
-    run_root = (
-        args.output_root.expanduser().resolve()
-        if args.output_root
-        else default_run_root(video)
-    )
+    run_root = project_dir
     paths = PipelinePaths(
         video=video,
         run_root=run_root,
-        stem=stem,
+        stem=path_stem,
         run_id_base=run_id_base,
         content_mode=args.content_mode,
         transcribe_provider=transcribe_provider,
@@ -1057,6 +1074,24 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
     finally:
         write_pipeline_manifest(paths, state)
 
+    # Human-facing overlay: <excerpts|ads>/NN-title-slug/ + project.json, identical
+    # to what the archive migrator produces, so new and migrated projects match.
+    try:
+        rm = (paths.final_render_manifest if paths.final_render_manifest.exists()
+              else paths.draft_render_manifest)
+        plan_path = (paths.revised_plan_output if paths.revised_plan_output.exists()
+                     else paths.plan_output)
+        if plan_path.exists():
+            clips = generate_layout(
+                paths.run_root, rm if rm.exists() else None,
+                json.loads(plan_path.read_text()), paths.run_root.name,
+                content_mode=args.content_mode,
+                original_master=original_master, promoted_from=paths.run_root.name)
+            clips_dir = paths.run_root / f"{args.content_mode}s"
+            print(f"Clips: {len(clips)} -> {clips_dir}")
+    except Exception as exc:
+        print(f"note: project layout overlay skipped ({type(exc).__name__}: {exc})")
+
     print("\n== pipeline complete ==")
     print(f"Run root: {paths.run_root}")
     print(f"Final render manifest: {paths.final_render_manifest}")
@@ -1085,8 +1120,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Optional run directory. Defaults to one directory beside the input "
-            "video, named after the input file stem."
+            "Explicit project directory. Overrides --library. The master is pulled "
+            "into <output-root>/media/source.mp4 and extracts/ + project.json are "
+            "generated there."
+        ),
+    )
+    parser.add_argument(
+        "--library",
+        type=Path,
+        default=None,
+        help=(
+            "Library folder to create the project in, as <library>/<source-slug>/. "
+            "Defaults to the input video's own directory."
         ),
     )
     parser.add_argument(

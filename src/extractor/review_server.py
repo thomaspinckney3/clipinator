@@ -43,7 +43,8 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 DEFAULT_LIBRARY = Path.home() / "Documents" / "clipinator"
 STATIC_DIR = Path(__file__).resolve().parent / "review_static"
 SCAN_MAX_DEPTH = 7
-SCAN_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "Library", ".Trash", "review"}
+SCAN_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "Library", ".Trash", "review",
+                  "_archive", "_legacy"}
 SCAN_MAX_PROJECTS = 500
 # How refined each render variant is. The most-refined variant per run is the
 # one an editor usually wants (the final/revised cut), so it is flagged
@@ -362,16 +363,28 @@ def project_id(manifest_path: Path) -> str:
     return quote(str(manifest_path), safe="")
 
 
+# The internal render dir is "_renders"; "renders" is accepted for projects made
+# before the rename. Discovery keys off whichever appears in the manifest path.
+RENDER_DIR_NAMES = ("_renders", "renders")
+
+
+def render_dir_index(parts: tuple[str, ...]) -> int | None:
+    """Index of the render dir segment in a path, or None."""
+    for name in RENDER_DIR_NAMES:
+        if name in parts:
+            return len(parts) - 1 - parts[::-1].index(name)
+    return None
+
+
 def project_label(manifest_path: Path, manifest: dict[str, Any]) -> str:
-    # The run root is the ancestor that contains "renders":
-    # <run-root>/renders/[<mode>/]<variant>/render-manifest.json. Use the run
+    # The run root is the ancestor that contains the render dir:
+    # <run-root>/_renders/[<mode>/]<variant>/render-manifest.json. Use the run
     # root's folder name (clean, editor-chosen) regardless of where we scanned.
     parts = manifest_path.parts
     name = manifest_path.parent.parent.name
-    if "renders" in parts:
-        idx = len(parts) - 1 - parts[::-1].index("renders")
-        if idx >= 1:
-            name = parts[idx - 1]
+    idx = render_dir_index(parts)
+    if idx is not None and idx >= 1:
+        name = parts[idx - 1]
     variant = manifest_path.parent.name  # draft / final / human / ...
     return f"{name} — {variant}"
 
@@ -423,10 +436,10 @@ def video_url(path: str | None) -> str | None:
 
 
 def run_root_of(manifest_path: Path) -> Path:
-    """The run root is the ancestor containing 'renders'."""
+    """The run root is the ancestor containing the render dir (_renders / renders)."""
     parts = manifest_path.parts
-    if "renders" in parts:
-        idx = len(parts) - 1 - parts[::-1].index("renders")
+    idx = render_dir_index(parts)
+    if idx is not None:
         return Path(*parts[:idx])
     return manifest_path.parent.parent
 
@@ -1054,6 +1067,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # This is a live-editing dev tool; never let the browser cache the SPA, or
+        # edits to index.html show up as stale content until a hard refresh.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
