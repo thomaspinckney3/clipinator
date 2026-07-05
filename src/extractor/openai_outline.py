@@ -91,16 +91,23 @@ def numbered_units_text(units: list[dict[str, Any]], offset: int = 0) -> str:
 
 
 def outline_cache_key(
-    transcript_path: str, units: list[dict[str, Any]], model: str, effort: str
+    units: list[dict[str, Any]], model: str, effort: str
 ) -> str:
+    # Content-addressed: the key is a hash of the units' timings *and text*, never
+    # the transcript's path, so a relocated project reuses its outline cache
+    # (see stage_cache) — and two transcripts with matching timings but different
+    # words no longer collide, which the timings-only key allowed.
+    unit_sig = ";".join(
+        f"{float(u['start']):.2f}-{float(u['end']):.2f}:{str(u.get('text', ''))}"
+        for u in units
+    )
     sig = "|".join([
         "outline_v" + str(SCHEMA_VERSION),
-        transcript_path,
         model,
         effort,
         sha256_text(developer_instructions()),
         str(len(units)),
-        ";".join(f"{u['start']:.2f}-{u['end']:.2f}" for u in units[:6000]),
+        sha256_text(unit_sig),
     ])
     return hashlib.sha256(sig.encode("utf-8")).hexdigest()
 
@@ -240,7 +247,7 @@ def run_outline(args: argparse.Namespace) -> dict[str, Any]:
     est = preflight_cost(units, args.batch, pricing)
 
     cache_dir = None if args.no_local_cache else args.cache_dir.expanduser().resolve()
-    key = outline_cache_key(str(transcript_path), units, args.model, args.reasoning_effort)
+    key = outline_cache_key(units, args.model, args.reasoning_effort)
     cache_path = outline_cache_path(cache_dir, key) if cache_dir else None
     cache_hit = bool(cache_path and cache_path.exists() and not args.refresh_cache)
 

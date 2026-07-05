@@ -356,7 +356,9 @@ def compact_visual_index_manifest(manifest_path: Path, max_images: int) -> dict[
         )
     return {
         "schema_version": manifest.get("schema_version"),
-        "video": manifest.get("video"),
+        # "video" (path/filename/stem) omitted so the cache key does not depend on
+        # where the master lives; sheet paths stay because they are stored relative
+        # to the run root and so move with it. See stage_cache.without_location.
         "frame_interval_seconds": manifest.get("frame_interval_seconds"),
         "frame_count": manifest.get("frame_count"),
         "included_candidate_sheet_count": len(compact_sheets),
