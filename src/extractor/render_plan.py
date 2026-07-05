@@ -3166,7 +3166,12 @@ def render_segment(
     )
     segment_path = clip_dir / f"segment-{index:03d}.mp4"
     mux_video_audio(video_track, audio_track, segment_path)
-    validate_av_stream_lengths(segment_path, tolerance=0.08)
+    # Guard against gross A/V desync (a track built for the wrong duration — that
+    # manifests as whole seconds). The tolerance must stay above the pipeline's own
+    # benign jitter: the video track snaps to output-frame boundaries while the audio
+    # keeps its true length, so fps conversion (e.g. 30000/1001 -> 30) legitimately
+    # leaves them ~0.1s apart. 0.25s absorbs that rounding yet still catches real desync.
+    validate_av_stream_lengths(segment_path, tolerance=0.25)
     uses_source_dialogue = uses_dialogue(item) and not black_title_card
     audio_start = None if not uses_source_dialogue else float(item["source_start"])
     separated = any(
