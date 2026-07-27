@@ -48,13 +48,13 @@ class TestDiscovery:
 
     def test_label_uses_run_root_name(self, tmp_path):
         # whether we scan the library or point at the run root, the label uses
-        # the run-root folder name + variant (not "renders").
+        # the run-root folder name + mode + variant (not "renders").
         lib = tmp_path / "lib"
         manifest = build_run_root(lib / "My Project", variant="final")
         from_lib = rs.discover_projects(lib)[0][0]["label"]
         from_proj = rs.discover_projects(lib / "My Project")[0][0]["label"]
-        assert from_lib == "My Project — final"
-        assert from_proj == "My Project — final"
+        assert from_lib == "My Project — excerpt final"
+        assert from_proj == "My Project — excerpt final"
 
     def test_finds_multiple_variants(self, tmp_path):
         root = tmp_path / "lib" / "Proj"
@@ -62,7 +62,7 @@ class TestDiscovery:
         build_run_root(root, variant="final")
         projects, _ = rs.discover_projects(root)
         labels = sorted(p["label"] for p in projects)
-        assert labels == ["Proj — draft", "Proj — final"]
+        assert labels == ["Proj — excerpt draft", "Proj — excerpt final"]
 
     def test_only_most_refined_variant_preferred(self, tmp_path):
         root = tmp_path / "lib" / "Proj"
@@ -93,7 +93,41 @@ class TestDiscovery:
         (bad / "render-manifest.json").write_text("{}")
         projects, _ = rs.discover_projects(lib)
         assert all("node_modules" not in p["manifest_path"] for p in projects)
-        assert [p["label"] for p in projects] == ["Proj — draft"]
+        assert [p["label"] for p in projects] == ["Proj — excerpt draft"]
+
+    def test_label_names_the_content_mode(self, tmp_path):
+        # Both modes of a source live in one run root, so without the mode an
+        # editor sees two identical entries holding entirely different clips.
+        root = tmp_path / "Proj"
+        build_run_root(root, variant="final", mode="ad")
+        build_run_root(root, variant="final", mode="excerpt")
+        projects, _ = rs.discover_projects(root)
+        assert sorted(p["label"] for p in projects) == ["Proj — ad final", "Proj — excerpt final"]
+
+    def test_label_omits_an_unknown_mode(self, tmp_path):
+        # A legacy render from when "ad" went unnamed declares no mode and has no
+        # mode directory; label it plainly rather than guessing.
+        root = tmp_path / "Proj"
+        manifest = build_run_root(root, variant="draft", mode="excerpt")
+        legacy = root / "renders" / "draft"
+        legacy.mkdir(parents=True)
+        data = json.loads(manifest.read_text())
+        del data["content_mode"]
+        (legacy / "render-manifest.json").write_text(json.dumps(data))
+        labels = {p["label"] for p in rs.discover_projects(root)[0]}
+        assert "Proj — draft" in labels
+
+    def test_each_mode_keeps_its_own_most_refined_variant(self, tmp_path):
+        # excerpt reached final, ad only got to draft: the ad draft is still the
+        # best ad render and must stay visible instead of being ranked away by
+        # the excerpt final it shares a run root with.
+        root = tmp_path / "Proj"
+        build_run_root(root, variant="draft", mode="ad")
+        build_run_root(root, variant="draft", mode="excerpt")
+        build_run_root(root, variant="final", mode="excerpt")
+        preferred = {(p["content_mode"], p["variant"]) for p in rs.discover_projects(root)[0]
+                     if p["preferred"]}
+        assert preferred == {("ad", "draft"), ("excerpt", "final")}
 
 
 class TestProjectDetail:
