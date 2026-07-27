@@ -338,18 +338,24 @@ clipped to the usable video duration.
 
 ### Run Directory Layout
 
-`extract-clips` creates one run root beside the input video (or at
-`--output-root`), named after the input file stem:
+`extract-clips` creates one project directory per source video — in `--library`,
+at `--output-root`, or beside the input — named after the source. The master is
+pulled in as `media/source.mp4`, so every project is self-contained and every
+mode of that source shares one directory:
 
 ```text
-<video-stem>/
-  pipeline-manifest.json          # stage outputs, costs, cache settings for this run
+<source-slug>/
+  project.json                    # source, and the finished clips of each mode
+  pipeline-manifest.json          # stage outputs, costs, cache settings, per mode
+  media/
+    source.mp4                    # the master (hardlinked in, or copied if off-volume)
+    source.capture.json           # capture sidecar, when the source was captured
   transcripts/
-    <stem>.<provider>-<model>.json / .srt
-    <stem>.<provider>-<model>.available.json   # present only for truncated inputs
-  video-evidence/<stem>/
+    source.<provider>-<model>.json / .srt
+    source.<provider>-<model>.available.json   # present only for truncated inputs
+  video-evidence/source/
     manifest.json  manifest.md  contact-sheet.jpg  frames/  sheets/
-  visual-index/<stem>/            # 1 fps dense index from moments candidates
+  visual-index/source/            # 1 fps dense index from moments candidates
     manifest.json  frames/  sheets/
   subject-index/
     <base>-plan/manifest.json     # subject/crop analysis for the draft render
@@ -367,20 +373,32 @@ clipped to the usable video duration.
     draft/                        # human edit list for the draft plan
       edit-list.toml  edit-list.html  plan-output.human.json
     final/                        # human edit list for the revised plan
-  renders/
-    [excerpt/]draft/              # ad mode omits the content-mode directory
+  _renders/<mode>/                # machine-side render output, one dir per mode
+    draft/
       <clip-id>.draft.mp4 / .draft.srt / .draft.subtitled.mp4
       render-manifest.json
-    [excerpt/]final/              # final deliverables, no stage word in the name
+    final/                        # final renders, no stage word in the name
       <clip-id>.mp4 / .srt / .subtitled.mp4
       render-manifest.json
-    [excerpt/]human/              # renders of a human-edited plan
+    human/                        # renders of a human-edited plan
+  excerpts/  (or ads/)            # the deliverables, named for what they are
+    NN-title-slug/
+      final.mp4  final.subtitled.mp4  captions.srt  metadata.json
 ```
 
-`<base>` is the input stem, plus the content mode when it is not `ad`, plus the
-`--run-id` suffix when one is given (for example `my-video-excerpt-strategy`).
-With `--run-id`, the render directories also gain the variant prefix
-(`renders/[excerpt/]<run-id>-draft`), so variants never overwrite each other.
+The finished clips live in a folder named for the content mode — `excerpts/` or
+`ads/` — hardlinked out of `_renders/`, so a clip costs its bytes once no matter
+how many names it has. When captions are burned into the clip itself,
+`final.subtitled.mp4` is a hardlink to `final.mp4` rather than a second copy.
+
+Every mode names itself. `<base>` is the project slug plus the content mode plus
+the `--run-id` suffix when one is given (for example `my-video-excerpt-strategy`,
+`my-video-ad-strategy`), and renders go to `_renders/<mode>/`. So an ad run and
+an excerpt run of the same source sit side by side under identical rules, and
+neither can land on the other's outputs. With `--run-id`, the render directories
+also gain the variant prefix (`_renders/<mode>/<run-id>-draft`), so variants
+never overwrite each other.
+
 Each `openai-runs/<base>-<stage>/` directory also records the exact request:
 `request-manifest.json`, `source-materials.txt`, `task-prompt.txt`,
 `raw-response.json`, `usage-and-cost.json`, and a human-readable `summary.md`.

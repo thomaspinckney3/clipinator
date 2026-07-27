@@ -31,6 +31,67 @@ from typing import Any
 
 _HASH = re.compile(r"\.mp4-[0-9a-f]{32}")
 
+# Files whose job is to point at other files, and which a later run re-reads.
+# Rewriting these is what keeps a moved or renamed project wired together.
+# Everything else is left alone — in particular openai-runs/<run>/request-manifest.json,
+# task-prompt.txt and source-materials.txt, which record what was actually sent to
+# the API. critique-package.json is here because revise re-reads it, not as a record;
+# _response-cache/ is skipped because its keys are location-independent by design.
+WIRING_FILES = ("pipeline-manifest.json", "render-manifest.json", "manifest.json",
+                "critique-package.json")
+WIRING_SUFFIXES = (".concat.txt",)
+WIRING_SKIP_DIRS = {"_response-cache", "_archive", "_legacy", ".migration-backup"}
+
+
+def is_project(path: Path) -> bool:
+    """A project is a directory the pipeline has written a run manifest into."""
+    return (path / "pipeline-manifest.json").is_file()
+
+
+def find_projects(root: Path) -> list[Path]:
+    """The projects at `root` — `root` itself if it is one, else its children."""
+    root = Path(root).expanduser()
+    if is_project(root):
+        return [root]
+    return sorted(p.parent for p in root.glob("*/pipeline-manifest.json"))
+
+
+def wiring_files(project: Path) -> list[Path]:
+    """Every path-carrying file in a project, in walk order."""
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(project):
+        dirnames[:] = [d for d in dirnames if d not in WIRING_SKIP_DIRS]
+        for name in filenames:
+            if name in WIRING_FILES or name.endswith(WIRING_SUFFIXES):
+                found.append(Path(dirpath) / name)
+    return sorted(found)
+
+
+def rewriter(substitutions: dict[str, str], *, ignore_case: bool = False):
+    """A single-pass substitution over all pairs, longest key first, so no
+    replacement is applied twice or inside another's result. None if empty."""
+    if not substitutions:
+        return None
+    keys = sorted(substitutions, key=len, reverse=True)
+    flags = re.IGNORECASE if ignore_case else 0
+    pattern = re.compile("|".join(re.escape(k) for k in keys), flags)
+    lookup = {k.lower(): v for k, v in substitutions.items()} if ignore_case else substitutions
+    key_of = (lambda m: m.group(0).lower()) if ignore_case else (lambda m: m.group(0))
+    return lambda text: pattern.sub(lambda m: lookup[key_of(m)], text)
+
+
+def pending_rewrites(project: Path, substitute) -> list[tuple[Path, str]]:
+    """(file, rewritten text) for every wiring file holding a stale reference."""
+    if substitute is None:
+        return []
+    out = []
+    for path in wiring_files(project):
+        before = path.read_text(encoding="utf-8", errors="ignore")
+        after = substitute(before)
+        if after != before:
+            out.append((path, after))
+    return out
+
 
 def slug(text: str, max_words: int = 6, max_len: int = 50) -> str:
     text = _HASH.sub("", str(text))
