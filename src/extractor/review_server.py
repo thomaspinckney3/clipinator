@@ -376,17 +376,38 @@ def render_dir_index(parts: tuple[str, ...]) -> int | None:
     return None
 
 
+def content_mode_of(manifest_path: Path, manifest: dict[str, Any]) -> str | None:
+    """Which content mode produced this render: 'ad', 'excerpt', ...
+
+    The manifest's own field is authoritative. Falling back to the path covers a
+    manifest written before the field existed; None when neither says (a legacy
+    render from when 'ad' went unnamed), so the label simply omits it rather than
+    guessing a mode that may be wrong."""
+    declared = str(manifest.get("content_mode") or "").strip()
+    if declared:
+        return declared
+    parts = manifest_path.parts
+    idx = render_dir_index(parts)
+    # <run-root>/<render-dir>/<mode>/<variant>/render-manifest.json
+    if idx is not None and len(parts) - idx == 4:
+        return parts[idx + 1]
+    return None
+
+
 def project_label(manifest_path: Path, manifest: dict[str, Any]) -> str:
     # The run root is the ancestor that contains the render dir:
-    # <run-root>/_renders/[<mode>/]<variant>/render-manifest.json. Use the run
+    # <run-root>/_renders/<mode>/<variant>/render-manifest.json. Use the run
     # root's folder name (clean, editor-chosen) regardless of where we scanned.
+    # Both modes of a source share that folder, so the label must name the mode
+    # too or an editor sees two identical entries holding different clips.
     parts = manifest_path.parts
     name = manifest_path.parent.parent.name
     idx = render_dir_index(parts)
     if idx is not None and idx >= 1:
         name = parts[idx - 1]
     variant = manifest_path.parent.name  # draft / final / human / ...
-    return f"{name} — {variant}"
+    mode = content_mode_of(manifest_path, manifest)
+    return f"{name} — {mode} {variant}" if mode else f"{name} — {variant}"
 
 
 def discover_projects(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
@@ -408,6 +429,7 @@ def discover_projects(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
             "clip_count": len(manifest.get("clips", []) or []),
             "source_found": bool(source_path and source_path.exists()),
             "variant": variant,
+            "content_mode": content_mode_of(manifest_path, manifest),
             "run_root": str(run_root_of(manifest_path)),
             "preferred": True,  # refined below once all variants of a run are known
         })
@@ -418,13 +440,19 @@ def discover_projects(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
                 p = clip.get(key)
                 if p and Path(str(p)).exists():
                     allowed.add(str(Path(str(p)).resolve()))
-    # Within each run, only the most-refined variant is "preferred" (shown by
-    # default); the rest hide behind the editor's "show all variants" toggle.
-    best_rank: dict[str, int] = {}
+    # Within each run *and mode*, only the most-refined variant is "preferred"
+    # (shown by default); the rest hide behind the editor's "show all variants"
+    # toggle. Keyed by mode as well as run root because both modes share one run
+    # root — ranking them together would hide a mode whose best render is a draft
+    # behind another mode that happens to have reached final.
+    def group(p: dict[str, Any]) -> tuple[str, str]:
+        return (p["run_root"], p["content_mode"] or "")
+
+    best_rank: dict[tuple[str, str], int] = {}
     for p in projects:
-        best_rank[p["run_root"]] = max(best_rank.get(p["run_root"], -1), variant_rank(p["variant"]))
+        best_rank[group(p)] = max(best_rank.get(group(p), -1), variant_rank(p["variant"]))
     for p in projects:
-        p["preferred"] = variant_rank(p["variant"]) == best_rank[p["run_root"]]
+        p["preferred"] = variant_rank(p["variant"]) == best_rank[group(p)]
     projects.sort(key=lambda p: p["label"].lower())
     return projects, allowed
 
