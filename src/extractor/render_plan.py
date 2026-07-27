@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -395,6 +396,17 @@ def sidecar_timeline_to_caption_entries(timeline: list[dict[str, Any]]) -> list[
             continue
         entries.append({"start": start, "end": end, "text": text})
     return entries
+
+
+def link_same_content(src: Path, dst: Path) -> None:
+    """Publish `src` at `dst` when the two are the same bytes: hardlink if the
+    filesystem allows it, else copy. Replaces any existing `dst`."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.unlink(missing_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def burn_ass_captions(input_path: Path, ass_path: Path, output_path: Path) -> None:
@@ -3691,6 +3703,10 @@ def render_clip(
         caption_source = "caption_plan" if caption_entries else "none"
     output_path = output_dir / f"{clip_id}{label_suffix}.mp4"
     pre_fade_output_path = output_dir / f"{clip_id}{label_suffix}.pre-video-fade.mp4"
+    # A previous render may have left .subtitled.mp4 as a hardlink to output_path
+    # (see below). Break the link before ffmpeg truncates output_path in place,
+    # so a re-render never rewrites the old subtitled file under a reader's feet.
+    (output_dir / f"{clip_id}{label_suffix}.subtitled.mp4").unlink(missing_ok=True)
     concat_segments_with_crossfade(
         segment_paths,
         pre_fade_output_path,
@@ -3782,7 +3798,10 @@ def render_clip(
     subtitled_path = output_dir / f"{clip_id}{label_suffix}.subtitled.mp4"
     subtitles_burned = False
     if burn_captions:
-        shutil.copy2(output_path, subtitled_path)
+        # Captions are already burned into output_path, so the subtitled variant is
+        # the same bytes. Hardlink rather than copy: consumers keep the path they
+        # expect, at no extra disk (these files are write-once).
+        link_same_content(output_path, subtitled_path)
         subtitles_muxed = False
         subtitles_burned = True
     else:

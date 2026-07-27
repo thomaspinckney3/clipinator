@@ -1,8 +1,27 @@
 from extractor.render_plan import (
     apply_framing_offset,
     caption_plan_entries,
+    link_same_content,
     transcript_words_from_data,
 )
+
+
+class TestLinkSameContent:
+    """When captions are burned into the clip itself, the .subtitled.mp4 variant is
+    the same bytes — it is published as a hardlink, not a second copy of the video."""
+
+    def test_shares_one_inode(self, tmp_path):
+        src = tmp_path / "clip.mp4"; src.write_bytes(b"video")
+        dst = tmp_path / "clip.subtitled.mp4"
+        link_same_content(src, dst)
+        assert dst.read_bytes() == b"video"
+        assert dst.stat().st_ino == src.stat().st_ino
+
+    def test_replaces_a_stale_destination(self, tmp_path):
+        src = tmp_path / "clip.mp4"; src.write_bytes(b"new")
+        dst = tmp_path / "clip.subtitled.mp4"; dst.write_bytes(b"old render")
+        link_same_content(src, dst)
+        assert dst.read_bytes() == b"new"
 
 
 class TestApplyFramingOffset:
