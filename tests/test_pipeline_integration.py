@@ -139,8 +139,27 @@ def _paths(run_root: Path, mode: str):
     from extractor.run_pipeline import PipelinePaths
     return PipelinePaths(
         video=run_root / "media" / "source.mp4", run_root=run_root, stem="source",
-        run_id_base=("s" if mode == "ad" else "s-excerpt"), content_mode=mode,
+        run_id_base=f"s-{mode}", content_mode=mode,
         transcribe_provider="elevenlabs", transcribe_model="scribe_v2", render_variant=None)
+
+
+@pytest.mark.parametrize("mode", ["ad", "excerpt"])
+def test_render_dirs_are_mode_scoped_for_every_mode(tmp_path, mode):
+    # No mode is the unnamed default: ad renders live under _renders/ad/ exactly
+    # as excerpt renders live under _renders/excerpt/, so two modes of one source
+    # never share a render dir and the path tells you which mode produced it.
+    p = _paths(tmp_path / "proj", mode)
+    assert p.draft_render_dir == tmp_path / "proj" / "_renders" / mode / "draft"
+    assert p.final_render_dir == tmp_path / "proj" / "_renders" / mode / "final"
+
+
+def test_run_ids_name_their_mode(tmp_path):
+    # Stage output dirs are mode-scoped by name, so an ad run and an excerpt run
+    # of the same source cannot land in the same openai-runs/ or subject-index/ dir.
+    ad, ex = _paths(tmp_path / "p", "ad"), _paths(tmp_path / "p", "excerpt")
+    assert ad.plan_run_id == "s-ad-plan" and ex.plan_run_id == "s-excerpt-plan"
+    assert ad.plan_output.parent != ex.plan_output.parent
+    assert ad.draft_subject_index_manifest != ex.draft_subject_index_manifest
 
 
 def test_pipeline_manifest_partitions_state_by_mode(tmp_path):

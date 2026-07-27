@@ -231,9 +231,7 @@ class PipelinePaths:
     @property
     def draft_render_dir(self) -> Path:
         stage_dir = f"{self.render_variant}-draft" if self.render_variant else "draft"
-        if self.content_mode != "ad":
-            return self.run_root / "_renders" / self.content_mode / stage_dir
-        return self.run_root / "_renders" / stage_dir
+        return self.run_root / "_renders" / self.content_mode / stage_dir
 
     @property
     def draft_render_manifest(self) -> Path:
@@ -242,9 +240,7 @@ class PipelinePaths:
     @property
     def final_render_dir(self) -> Path:
         stage_dir = f"{self.render_variant}-final" if self.render_variant else "final"
-        if self.content_mode != "ad":
-            return self.run_root / "_renders" / self.content_mode / stage_dir
-        return self.run_root / "_renders" / stage_dir
+        return self.run_root / "_renders" / self.content_mode / stage_dir
 
     @property
     def final_render_manifest(self) -> Path:
@@ -754,9 +750,10 @@ def run_pipeline(args: argparse.Namespace) -> PipelinePaths:
     stem = project_dir.name
     path_stem = safe_stem(video)
 
-    run_id_parts = [stem]
-    if args.content_mode != "ad":
-        run_id_parts.append(args.content_mode)
+    # Every mode names itself, in run ids and under _renders/ alike: "ad" is a
+    # content mode like any other, not the unnamed default. Two modes of the same
+    # source therefore sit side by side under identical rules.
+    run_id_parts = [stem, args.content_mode]
     if args.run_id is not None:
         run_id_parts.append(safe_run_id(args.run_id))
     run_id_base = "-".join(run_id_parts)
@@ -1146,8 +1143,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Explicit project directory. Overrides --library. The master is pulled "
-            "into <output-root>/media/source.mp4 and extracts/ + project.json are "
-            "generated there."
+            "into <output-root>/media/source.mp4 and excerpts|ads/ + project.json "
+            "are generated there."
         ),
     )
     parser.add_argument(
