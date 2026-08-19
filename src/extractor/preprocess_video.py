@@ -868,8 +868,7 @@ def write_markdown(path: Path, manifest: dict[str, Any]) -> None:
 def transcript_summary(transcript_path: Path | None) -> dict[str, Any] | None:
     if transcript_path is None:
         return None
-    from extractor.plan_clip_ads import default_qa_args
-    from extractor.qa_transcript import build_report, read_transcript
+    from extractor.qa_transcript import build_report, default_qa_args, read_transcript
 
     data = read_transcript(transcript_path)
     report = build_report(transcript_path, default_qa_args())

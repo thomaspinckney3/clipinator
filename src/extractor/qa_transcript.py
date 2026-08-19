@@ -7,6 +7,7 @@ import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -21,6 +22,23 @@ DEFAULT_MAX_NO_SPEECH_PROB = 0.6
 DEFAULT_MAX_COMPRESSION_RATIO = 2.4
 DEFAULT_MAX_SEGMENT_SECONDS = 30.0
 DEFAULT_MAX_FINDINGS = 25
+
+
+def default_qa_args() -> SimpleNamespace:
+    """Arguments for callers that run the standard QA policy programmatically."""
+    return SimpleNamespace(
+        max_findings=DEFAULT_MAX_FINDINGS,
+        min_words_per_minute=DEFAULT_MIN_WORDS_PER_MINUTE,
+        max_words_per_minute=DEFAULT_MAX_WORDS_PER_MINUTE,
+        min_segment_wps=DEFAULT_MIN_SEGMENT_WPS,
+        max_segment_wps=DEFAULT_MAX_SEGMENT_WPS,
+        max_gap_seconds=DEFAULT_MAX_GAP_SECONDS,
+        max_tail_gap_seconds=DEFAULT_MAX_TAIL_GAP_SECONDS,
+        min_avg_logprob=DEFAULT_MIN_AVG_LOGPROB,
+        max_no_speech_prob=DEFAULT_MAX_NO_SPEECH_PROB,
+        max_compression_ratio=DEFAULT_MAX_COMPRESSION_RATIO,
+        max_segment_seconds=DEFAULT_MAX_SEGMENT_SECONDS,
+    )
 
 
 @dataclass(frozen=True)

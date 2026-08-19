@@ -17,17 +17,6 @@ ffmpeg
 ffprobe
 ```
 
-Optional tools recorded in `Brewfile` for upcoming stages:
-
-```text
-yt-dlp
-media-info
-exiftool
-imagemagick
-tesseract
-sox
-```
-
 Install Python dependencies. The project targets Python 3.13 (the
 `opentimelineio` interchange library has no working Python 3.14 build yet):
 
@@ -85,8 +74,7 @@ TRANSCRIBE_CHUNK_SECONDS=
 `.env` is ignored by git. `.env.example` is the complete, commented reference
 for every setting: per-stage model/pricing/limit families (`STRATEGY_*`,
 `MOMENTS_*`, `PLAN_*`, `CRITIQUE_*`, `REVISE_*`), transcription
-(`TRANSCRIBE_*`), Cloudflare capture (`CLOUDFLARE_*`), the video API probe
-(`VIDEO_PROBE_*`), and the local response cache mode
+(`TRANSCRIBE_*`), Cloudflare capture (`CLOUDFLARE_*`), and the local response cache mode
 (`OPENAI_RESPONSE_CACHE_MODE`). CLI flags always override `.env` values.
 
 ## Capture From Cloudflare Stream
@@ -506,39 +494,6 @@ automation:
 ```bash
 qa-transcript /Volumes/t9/extract/transcripts/*.whisper-1.json --json
 ```
-
-## Micro-Trailer Ad Planning
-
-Create local test plans for clips that advertise the full video. This stage
-summarizes the full-video promise, generates deterministic ad-angle hypotheses,
-grounds those angles in transcript windows, applies transcript QA penalties, and
-outputs edit plans using standard clip tactics. It does not make API calls.
-
-```bash
-plan-clip-ads /Volumes/t9/extract/transcripts/*.whisper-1.json \
-  --output-dir /Volumes/t9/extract/ad-plans \
-  --write-markdown
-```
-
-Each plan includes:
-
-```text
-full_video_ad_brief
-clip_ad_plans[]
-opening hook
-timestamp range
-edit methods
-audio/video sync policy
-visual requirements to verify
-QA notes
-```
-
-Current editorial default: when a candidate has a clean payoff or surprising
-line, lead with it as the first spoken beat. Use a title/tagline card first if
-needed, then jump into the payoff, then backfill context.
-
-If there is no clear payoff, treat the candidate as weak or reject it. The
-pipeline should not try to fix a payoff-free clip with faster cuts or captions.
 
 ## Prompt Templates
 
@@ -1133,52 +1088,4 @@ PYTHONPATH=src python -m extractor.render_plan \
   --plan-output /Volumes/t9/extract/openai-runs/<revise-run>/plan-output.json \
   --output-dir /Volumes/t9/extract/renders/<revise-render> \
   --use-plan-render-settings
-```
-
-## Experimental Video API Probe
-
-Probe whether provider APIs accept MP4 files as model inputs. This is separate
-from the critique stage so failed provider experiments do not disturb the working
-storyboard review path. The probe creates a small local MP4 sample by default,
-then estimates a conservative upper-bound cost before any API call.
-
-OpenAI dry run:
-
-```bash
-PYTHONPATH=src python -m extractor.video_api_probe \
-  --provider openai \
-  --video /Volumes/t9/extract/renders/space-school-underwater-fixed/renders-tight/clip_ad_01_underwater_spacewalk_payoff_first_tight.draft.mp4 \
-  --dry-run
-```
-
-OpenAI real probe after reviewing the estimate:
-
-```bash
-PYTHONPATH=src python -m extractor.video_api_probe \
-  --provider openai \
-  --video /Volumes/t9/extract/renders/space-school-underwater-fixed/renders-tight/clip_ad_01_underwater_spacewalk_payoff_first_tight.draft.mp4 \
-  --approve-api-cost 0.50
-```
-
-Anthropic dry run:
-
-```bash
-PYTHONPATH=src python -m extractor.video_api_probe \
-  --provider anthropic \
-  --video /Volumes/t9/extract/renders/space-school-underwater-fixed/renders-tight/clip_ad_01_underwater_spacewalk_payoff_first_tight.draft.mp4 \
-  --dry-run
-```
-
-Anthropic requires `ANTHROPIC_API_KEY` in `.env` before a real probe can run.
-The default Anthropic mode uploads the MP4 through the beta Files API and then
-tries to reference it as a document block. Use `--anthropic-mode
-base64-document` to test direct base64 message input instead.
-
-Outputs include:
-
-```text
-request-manifest.json
-provider-result.json
-usage-and-cost.json
-summary.md
 ```
